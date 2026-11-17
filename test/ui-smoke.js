@@ -36,20 +36,23 @@ async function main() {
   const mint = Keypair.generate().publicKey.toBase58();
   const now = Date.now();
   // Coin with reserves moved by two recorded trades (buy 1.5 SOL, buy 0.5 SOL).
+  // trading_enabled=1 so the real trade panel renders.
   const tok1 = (800000000 * 1.5) / 31.5;
   const tok2 = ((800000000 - tok1) * 0.5) / 32;
   db.prepare(
     `INSERT INTO coins
        (mint_address, name, ticker, description, logo_url, creator_wallet, tx_signature,
-        sol_reserve, token_reserve, created_at)
-     VALUES (?, 'Smoke Cat', 'SMOKE', 'UI smoke test coin', NULL, ?, ?, 32, ?, ?)`
-  ).run(mint, WALLET_A, 'z'.repeat(88), 800000000 - tok1 - tok2, now - 60000);
+        sol_reserve, token_reserve, trading_enabled, funding_tx_signature, created_at)
+     VALUES (?, 'Smoke Cat', 'SMOKE', 'UI smoke test coin', NULL, ?, ?, 32, ?, 1, ?, ?)`
+  ).run(mint, WALLET_A, 'z'.repeat(88), 800000000 - tok1 - tok2, 'f'.repeat(88), now - 60000);
   const insertTrade = db.prepare(
-    `INSERT INTO trades (mint_address, wallet, side, sol_amount, token_amount, price, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO trades
+       (mint_address, wallet, side, sol_amount, token_amount, price,
+        user_tx_signature, pool_tx_signature, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  insertTrade.run(mint, WALLET_A, 'buy', 1.5, tok1, 1.5 / tok1, now - 30000);
-  insertTrade.run(mint, WALLET_A, 'buy', 0.5, tok2, 0.5 / tok2, now - 10000);
+  insertTrade.run(mint, WALLET_A, 'buy', 1.5, tok1, 1.5 / tok1, 'a'.repeat(88), 'A'.repeat(88), now - 30000);
+  insertTrade.run(mint, WALLET_A, 'buy', 0.5, tok2, 0.5 / tok2, 'b'.repeat(88), 'B'.repeat(88), now - 10000);
   console.log('seeded smoke coin', mint);
 
   let dom;
@@ -91,6 +94,13 @@ async function main() {
     );
     assert(document.querySelector('#searchInput'), 'feed search input renders');
     assert(document.querySelector('#sortSelect'), 'feed sort select renders');
+    // Footer shows the pool wallet address (loaded from /api/pool).
+    const poolAddr = await waitFor(() => {
+      const el = document.querySelector('#poolAddress a');
+      return el ? el.textContent : null;
+    }, 15000, 'pool address in footer');
+    assert(poolAddr.includes('…'), `footer shows pool address (${poolAddr.trim()})`);
+    assert(document.body.textContent.includes('dompet pool kustodian'), 'footer discloses the custodial pool wallet');
 
     // Coin detail: chart, stats, trade panel, PnL prompt, trades table.
     window.location.hash = `#/coin/${mint}`;
@@ -101,7 +111,8 @@ async function main() {
     assert(document.body.textContent.includes('Terverifikasi on-chain'), 'detail shows verified badge');
     assert(document.body.textContent.includes('explorer.solana.com') || document.querySelector('a[href*="explorer.solana.com"]'), 'detail links to Solana Explorer');
     assert(document.querySelector('.trade-box'), 'buy/sell panel renders');
-    assert(document.body.textContent.includes('SIMULASI'), 'trade panel labeled SIMULASI');
+    assert(document.body.textContent.includes('DEVNET ASLI'), 'trade panel labeled DEVNET ASLI');
+    assert(document.body.textContent.includes('dompet pool'), 'trade panel discloses the pool wallet');
     await waitFor(
       () => document.querySelectorAll('#tradesTable tbody tr').length === 2,
       15000,
@@ -114,6 +125,11 @@ async function main() {
     // Chart range buttons and trade filter tabs exist.
     assert(document.querySelector('[data-range="10"]'), 'chart range filter renders');
     assert(document.querySelector('[data-tab="Punyaku"]'), 'trade filter tabs render');
+    // Trade table shows both real transaction signatures with Explorer links.
+    assert(
+      document.querySelectorAll('#tradesTable a[href*="explorer.solana.com/tx/"]').length >= 4,
+      'trade table links user + pool tx signatures to Explorer'
+    );
 
     // Portfolio (no wallet connected): connect prompt renders.
     window.location.hash = '#/portfolio';

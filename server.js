@@ -20,6 +20,12 @@ app.use(express.json({ limit: '2mb' }));
 // API
 app.use('/api', api);
 
+// Unknown API routes: JSON 404 (the frontend expects JSON errors, and
+// unmatched POSTs would otherwise fall through to Express's HTML 404).
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'Endpoint tidak ditemukan.' });
+});
+
 // Solana browser libraries ship as one committed bundle
 // (public/vendor-solana.js, built by build.js with esbuild), served with the
 // rest of the static frontend — no third-party CDN needed at runtime.

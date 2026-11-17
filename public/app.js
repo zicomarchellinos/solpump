@@ -10,11 +10,27 @@ const EXPLORER = 'https://explorer.solana.com';
 const state = {
   wallet: localStorage.getItem('solpump-wallet') || null,
   balanceSol: null,
+  poolAddress: null,
+  onchainBalances: {}, // mintAddress -> live on-chain token balance
   coinCache: null, // last loaded coin detail
   chartRange: 0, // 0 = all, else last N trades
   tradeTab: 'Semua',
   tradeSide: 'buy',
 };
+
+// A mint that succeeded on-chain but whose registration failed: kept so the
+// user can retry registration without minting (and paying rent) again.
+function loadPendingMint() {
+  try {
+    return JSON.parse(localStorage.getItem('solpump-pending-mint') || 'null');
+  } catch {
+    return null;
+  }
+}
+function savePendingMint(p) {
+  if (p) localStorage.setItem('solpump-pending-mint', JSON.stringify(p));
+  else localStorage.removeItem('solpump-pending-mint');
+}
 
 // ---------- Helpers ----------
 function esc(s) {
@@ -116,6 +132,34 @@ function logoHtml(coin, cls = 'coin-logo') {
   return `<div class="coin-avatar">${esc(initials)}</div>`;
 }
 
+function txLink(sig, label) {
+  if (!sig) return '<span class="muted">—</span>';
+  return `<a class="mono" href="${EXPLORER}/tx/${esc(sig)}?cluster=devnet" target="_blank" rel="noopener" title="${esc(sig)}">${esc(label || shortAddr(sig))} ↗</a>`;
+}
+
+async function loadPoolAddress() {
+  if (state.poolAddress) return state.poolAddress;
+  try {
+    state.poolAddress = await getPoolAddress();
+  } catch {
+    state.poolAddress = null;
+  }
+  return state.poolAddress;
+}
+
+// Refresh the wallet's live on-chain SPL balances (one RPC call).
+async function refreshOnchainBalances() {
+  if (!state.wallet || !solanaLibsReady()) {
+    state.onchainBalances = {};
+    return;
+  }
+  try {
+    state.onchainBalances = await getAllTokenBalances(state.wallet);
+  } catch {
+    state.onchainBalances = {};
+  }
+}
+
 // ---------- Wallet (Phantom) ----------
 function solanaLibsReady() {
   return typeof window.solanaWeb3 !== 'undefined' && typeof window.splToken !== 'undefined';
@@ -134,9 +178,10 @@ async function refreshBalance() {
 }
 
 async function connectWallet() {
-  const phantom = getPhantom();
+  // The extension can inject after our scripts run; wait briefly for it.
+  const phantom = (await waitForPhantom(3000)) || getPhantom();
   if (!phantom) {
-    toast('Phantom tidak ditemukan. Instal ekstensi Phantom dulu.');
+    toast('Phantom tidak ditemukan. Instal ekstensi Phantom dulu (di HP, buka situs ini dari browser di dalam aplikasi Phantom).');
     window.open('https://phantom.app/', '_blank', 'noopener');
     return;
   }
@@ -145,11 +190,21 @@ async function connectWallet() {
     state.wallet = resp.publicKey.toString();
     localStorage.setItem('solpump-wallet', state.wallet);
     await refreshBalance();
+    await refreshOnchainBalances();
+    // Sanity-check our devnet endpoint (genesis hash). The wallet's own
+    // selected network cannot be read from a website — the create page
+    // tells the user to switch Phantom to Devnet explicitly.
+    try {
+      const ok = await verifyDevnetRpc();
+      if (!ok) toast('Peringatan: endpoint RPC bukan devnet. Laporkan ke pengelola situs.');
+    } catch {
+      // Non-fatal: the mint flow re-checks before signing.
+    }
     renderHeader();
     route();
     toast('Dompet terhubung.');
   } catch (err) {
-    toast(`Gagal menghubungkan dompet: ${err.message}`);
+    toast(`Gagal menghubungkan dompet: ${friendlyError(err)}`);
   }
 }
 
@@ -211,9 +266,9 @@ async function renderFeed() {
   const view = document.getElementById('view');
   view.innerHTML = `
     <div class="hero">
-      <div class="badge-sim">SIMULASI TRADING — MINTING ASLI DI DEVNET</div>
+      <div class="badge-live">● TRADING ASLI DI DEVNET</div>
       <h1>Buat coin-mu sendiri di Solana devnet</h1>
-      <p>Isi nama, ticker, dan logo — satu tanda tangan di Phantom me-mint token SPL beneran di devnet. Lalu perdagangkan di kurva bonding simulasi dan lacak untung-ruginya.</p>
+      <p>Isi nama, ticker, dan logo — satu tanda tangan di Phantom me-mint token SPL beneran di devnet. Trading memakai SOL devnet asli lewat dompet pool.</p>
       <a class="btn btn-primary" href="#/create">+ Buat Coin</a>
     </div>
     <div class="toolbar">
@@ -278,15 +333,14 @@ function coinCard(c) {
     <div class="card coin-card" data-mint="${esc(c.mintAddress)}">
       <div class="coin-head">
         ${logoHtml(c)}
-        <div>
+        <div class="coin-id">
           <div class="coin-name">${esc(c.name)}</div>
           <div class="coin-ticker">$${esc(c.ticker)}</div>
         </div>
+        ${c.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
       </div>
-      <div class="coin-stats">
-        <span>Harga <b>${fmtPrice(c.price)} SOL</b></span>
-        <span class="${chg}"><b>${fmtPct(c.changePct)}</b></span>
-      </div>
+      ${c.description ? `<p class="coin-desc">${esc(c.description)}</p>` : ''}
+      <div class="coin-price"><b>${fmtPrice(c.price)} SOL</b> <span class="${chg}">${fmtPct(c.changePct)}</span></div>
       <div class="coin-stats">
         <span>Market cap <b>${fmtSol(c.marketCapSol)} SOL</b></span>
         <span>Vol <b>${fmtSol(c.volumeSol)}</b></span>
@@ -301,10 +355,10 @@ function coinCard(c) {
 // ---------- Create coin ----------
 async function renderCreate() {
   const view = document.getElementById('view');
-  const phantom = getPhantom();
   view.innerHTML = `
     <h1>Buat Coin</h1>
-    <p class="muted">Minting asli di Solana devnet: suplai 1.000.000.000 token, 6 desimal, otoritas mint langsung dicabut. Nama, ticker, dan logo tersimpan di registry situs ini.</p>
+    <p class="muted">Minting asli di Solana devnet: suplai 1.000.000.000 token, 6 desimal, otoritas mint langsung dicabut. Nama, ticker, dan logo tersimpan di registry situs ini. Setelah mint, kamu akan diminta satu tanda tangan lagi untuk memindahkan 800.000.000 token ke dompet pool agar coin bisa diperdagangkan (200.000.000 token tetap di dompetmu).</p>
+    <div id="pendingMintBox"></div>
     <div class="card">
       <div class="field">
         <label for="coinName">Nama coin</label>
@@ -358,36 +412,111 @@ async function renderCreate() {
     reader.readAsDataURL(file);
   });
 
+  renderPendingMint();
   updateWalletStatus();
   document.getElementById('mintBtn').addEventListener('click', () => doMint(logoData));
 
-  function updateWalletStatus() {
+  // A mint that landed on-chain but failed to register: offer a retry
+  // instead of making the user mint (and pay rent) all over again.
+  function renderPendingMint() {
+    const box = document.getElementById('pendingMintBox');
+    const pending = loadPendingMint();
+    if (!pending) {
+      box.innerHTML = '';
+      return;
+    }
+    box.innerHTML = `
+      <div class="card" style="border-color:var(--gold)">
+        <h2 style="margin-top:0">Mint tertunda: $${esc(pending.ticker)}</h2>
+        <p>Coin ini <strong>sudah berhasil di-mint di devnet</strong> (${esc(shortAddr(pending.mintAddress))}), tapi pendaftarannya gagal: ${esc(pending.error || 'tidak diketahui')}. Kamu tidak perlu mint ulang — coba daftarkan lagi.</p>
+        <p>
+          <button class="btn btn-primary" id="retryRegisterBtn">Coba daftarkan lagi</button>
+          <button class="btn" id="dropPendingBtn">Buang</button>
+        </p>
+      </div>`;
+    document.getElementById('retryRegisterBtn').onclick = async () => {
+      const btn = document.getElementById('retryRegisterBtn');
+      btn.disabled = true;
+      try {
+        await apiPost('/api/coins/register', {
+          mintAddress: pending.mintAddress,
+          name: pending.name,
+          ticker: pending.ticker,
+          description: pending.description,
+          creatorWallet: pending.creatorWallet,
+          txSignature: pending.txSignature,
+          fundingTxSignature: pending.fundingTxSignature || undefined,
+          image: pending.image || undefined,
+        });
+        savePendingMint(null);
+        toast(`Coin $${pending.ticker} berhasil didaftarkan!`);
+        location.hash = `#/coin/${pending.mintAddress}`;
+      } catch (err) {
+        toast(`Pendaftaran masih gagal: ${err.message}`);
+        btn.disabled = false;
+      }
+    };
+    document.getElementById('dropPendingBtn').onclick = () => {
+      savePendingMint(null);
+      renderPendingMint();
+    };
+  }
+
+  async function updateWalletStatus() {
     const el = document.getElementById('walletStatus');
-    if (!phantom) {
+    // Re-detect on every render: the extension can inject late, and the
+    // cached value from page load may be stale.
+    const detected = getPhantom();
+    if (!detected) {
       el.innerHTML = `
         <div class="alert alert-info">
           <strong>Phantom tidak terdeteksi.</strong> Instal ekstensi Phantom di browser ini untuk membuat coin.
-          <div style="margin-top:8px"><a class="btn btn-sm" href="https://phantom.app/" target="_blank" rel="noopener">Unduh Phantom</a></div>
+          <div class="small" style="margin-top:6px">Di HP: ekstensi tidak tersedia — buka situs ini dari <strong>browser di dalam aplikasi Phantom</strong>.</div>
+          <div style="margin-top:8px">
+            <a class="btn btn-sm" href="https://phantom.app/" target="_blank" rel="noopener">Unduh Phantom</a>
+            <button class="btn btn-sm" id="recheckPhantom">Periksa lagi</button>
+          </div>
         </div>`;
+      document.getElementById('recheckPhantom').onclick = () => updateWalletStatus();
       return;
     }
     if (!state.wallet) {
       el.innerHTML = `
         <div class="alert alert-info">
-          <strong>Dompet belum terhubung.</strong> Hubungkan Phantom dulu — pastikan jaringannya <strong>Devnet</strong>.
+          <strong>Dompet belum terhubung.</strong> Hubungkan Phantom dulu.
+          <div class="small" style="margin-top:6px">Pastikan Phantom di jaringan <strong>Devnet</strong>: buka Phantom → Pengaturan → Developer Settings → Change Network → Devnet. Website tidak bisa mengubah jaringan Phantom secara otomatis.</div>
           <div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="connectFromCreate">Hubungkan Phantom</button></div>
         </div>`;
       document.getElementById('connectFromCreate').onclick = connectWallet;
       return;
     }
-    const bal = state.balanceSol;
-    const low = bal !== null && bal < 0.01;
+    // Fresh balance + exact mint cost, right now — never trust the value
+    // from connect time (the user may have just topped up at the faucet).
+    let bal = state.balanceSol;
+    let cost = null;
+    if (solanaLibsReady()) {
+      try {
+        bal = await getDevnetBalanceSol(state.wallet);
+        state.balanceSol = bal;
+        cost = await getMintCostSol();
+      } catch {
+        // Keep the cached balance; the mint flow will surface the RPC error.
+      }
+    }
+    const need = cost ? cost.totalSol : 0.01;
+    const low = bal !== null && bal < need;
     el.innerHTML = `
       <div class="alert ${low ? 'alert-error' : 'alert-success'}">
         <strong>Dompet:</strong> <span class="mono">${esc(state.wallet)}</span><br>
         <strong>Saldo devnet:</strong> ${bal === null ? '…' : `${fmtSol(bal)} SOL`}
-        ${low ? `<br>Saldo terlalu rendah untuk minting (butuh ~0,01 SOL untuk sewa akun + biaya). Ambil SOL devnet gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.` : ''}
+        ${cost ? `• Butuh ~${fmtSol(need)} SOL untuk minting (sewa akun ${fmtSol(cost.mintRentSol + cost.ataRentSol)} + biaya)` : ''}
+        ${low ? `<br>Saldo kurang ${fmtSol(need - bal)} SOL. Ambil SOL devnet gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>, lalu periksa ulang saldo di bawah.` : ''}
+        <div style="margin-top:8px"><button class="btn btn-sm" id="refreshBalBtn">Periksa ulang saldo</button></div>
+      </div>
+      <div class="alert alert-info">
+        <strong>Jaringan:</strong> pastikan Phantom di <strong>Devnet</strong> sebelum mint (Pengaturan → Developer Settings → Change Network → Devnet). Kalau Phantom di Mainnet, minting akan gagal karena kamu tidak punya SOL devnet.
       </div>`;
+    document.getElementById('refreshBalBtn').onclick = () => updateWalletStatus();
   }
 
   async function doMint(logo) {
@@ -398,27 +527,40 @@ async function renderCreate() {
     const stepsEl = document.getElementById('mintSteps');
     const btn = document.getElementById('mintBtn');
     errEl.innerHTML = '';
+    const fail = (msg) => {
+      errEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
+      stepsEl.innerHTML = '';
+      btn.disabled = false;
+    };
 
     if (!name || !ticker) {
-      errEl.innerHTML = '<div class="alert alert-error">Nama dan ticker wajib diisi.</div>';
-      return;
-    }
-    if (!state.wallet) {
-      errEl.innerHTML = '<div class="alert alert-error">Hubungkan dompet Phantom dulu.</div>';
+      fail('Nama dan ticker wajib diisi.');
       return;
     }
     if (!solanaLibsReady()) {
-      errEl.innerHTML =
-        '<div class="alert alert-error">Library Solana gagal dimuat. Muat ulang halaman dan coba lagi.</div>';
+      fail('Library Solana gagal dimuat. Muat ulang halaman dan coba lagi.');
       return;
     }
-    if (state.balanceSol !== null && state.balanceSol < 0.01) {
-      errEl.innerHTML =
-        '<div class="alert alert-error">Saldo devnet terlalu rendah. Ambil SOL gratis dulu di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</div>';
+    // Re-detect Phantom fresh (late injection) and re-check everything
+    // right now — never trust connect-time state.
+    const phantom = (await waitForPhantom(3000)) || getPhantom();
+    if (!phantom) {
+      fail('Phantom tidak terdeteksi. Instal ekstensi Phantom (di HP, buka situs ini dari browser di dalam aplikasi Phantom).');
+      return;
+    }
+    if (!state.wallet) {
+      fail('Hubungkan dompet Phantom dulu.');
       return;
     }
 
-    const steps = ['Membangun transaksi mint', 'Tanda tangan di Phantom', 'Mengirim ke devnet', 'Memverifikasi & mendaftarkan coin'];
+    const steps = [
+      'Memeriksa dompet & saldo',
+      'Membangun + simulasi transaksi mint',
+      'Tanda tangan mint di Phantom',
+      'Mengirim & konfirmasi mint',
+      'Transfer 800M token ke pool (funding)',
+      'Memverifikasi & mendaftarkan coin',
+    ];
     const paint = (activeIdx, doneUntil) => {
       stepsEl.innerHTML = `<ul class="steps">${steps
         .map((s, i) => {
@@ -429,28 +571,128 @@ async function renderCreate() {
         .join('')}</ul>`;
     };
     btn.disabled = true;
+
+    let mintAddress = null;
+    let mintSignature = null;
+    let fundingSignature = null;
     try {
+      // 0. Fresh balance + exact cost + devnet endpoint check.
       paint(0, -1);
-      const { transaction, mintKeypair, mintAddress } = await buildMintTransaction(state.wallet);
+      let cost;
+      try {
+        const [bal, c, rpcOk] = await Promise.all([
+          getDevnetBalanceSol(state.wallet),
+          getMintCostSol(),
+          verifyDevnetRpc(),
+        ]);
+        state.balanceSol = bal;
+        cost = c;
+        if (!rpcOk) throw new Error('Endpoint RPC bukan devnet — laporkan ke pengelola situs.');
+      } catch (err) {
+        fail(`Gagal memeriksa dompet: ${esc(friendlyError(err))}`);
+        return;
+      }
+      // Mint + funding need rent for the mint, two ATAs, and fees.
+      const needTotal = cost.totalSol + 0.003;
+      if (state.balanceSol < needTotal) {
+        fail(
+          `Saldo devnet ${fmtSol(state.balanceSol)} SOL kurang dari ~${fmtSol(needTotal)} SOL yang dibutuhkan (mint + funding). Ambil SOL gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>, lalu periksa ulang saldo di atas.`
+        );
+        return;
+      }
+
+      // 1. Build the mint transaction and simulate it BEFORE signing.
       paint(1, 0);
-      const signature = await signAndSendMint(getPhantom(), transaction, mintKeypair);
+      const built = await buildMintTransaction(state.wallet);
+      mintAddress = built.mintAddress;
+      const sim = await simulateTransaction(built.transaction);
+      if (!sim.ok) {
+        fail(`Transaksi mint tidak lolos simulasi devnet — belum ada yang ditandatangani.<br><span class="mono small">${esc(sim.error)}</span>`);
+        return;
+      }
+
+      // 2-3. Sign with Phantom (fresh blockhash) and broadcast.
+      paint(2, 1);
+      mintSignature = await signAndSendMint(phantom, built.transaction, built.mintKeypair);
       paint(3, 2);
-      await apiPost('/api/coins/register', {
-        mintAddress,
-        name,
-        ticker,
-        description,
-        creatorWallet: state.wallet,
-        txSignature: signature,
-        image: logo,
-      });
-      paint(3, 3);
+
+      // 4. Funding: move 800M tokens to the pool so the coin can trade.
+      // Skippable — without it the coin still lists, but trading is off.
+      paint(4, 3);
+      const poolAddress = await loadPoolAddress();
+      if (poolAddress) {
+        try {
+          const funding = await buildFundingTransaction(state.wallet, mintAddress, poolAddress);
+          const fundSim = await simulateTransaction(funding.transaction);
+          if (!fundSim.ok) throw new Error(fundSim.error);
+          fundingSignature = await signAndSend(phantom, funding.transaction);
+        } catch (fundErr) {
+          // Ask instead of failing the whole mint: the coin exists on-chain.
+          const skip = window.confirm(
+            `Transfer funding 800M token ke pool gagal (${friendlyError(fundErr)}).\n\n` +
+              'Klik OK untuk tetap mendaftarkan coin TANPA trading (bisa di-funding nanti dari halaman coin), atau Batal untuk berhenti di sini.'
+          );
+          if (!skip) {
+            fail(
+              `Mint berhasil on-chain (${txLink(mintSignature)}), tapi funding dibatalkan. Coin belum terdaftar — kamu bisa mendaftarkannya nanti dengan tombol di bawah setelah funding berhasil.`
+            );
+            savePendingMint({
+              mintAddress,
+              name,
+              ticker,
+              description,
+              creatorWallet: state.wallet,
+              txSignature: mintSignature,
+              fundingTxSignature: null,
+              image: logo,
+              error: 'funding dibatalkan',
+            });
+            renderPendingMint();
+            return;
+          }
+          fundingSignature = null;
+        }
+      }
+
+      // 5. Register (server verifies mint + funding on-chain).
+      paint(5, 4);
+      try {
+        await apiPost('/api/coins/register', {
+          mintAddress,
+          name,
+          ticker,
+          description,
+          creatorWallet: state.wallet,
+          txSignature: mintSignature,
+          fundingTxSignature: fundingSignature || undefined,
+          image: logo,
+        });
+      } catch (regErr) {
+        // The mint is on-chain — save it so the user can retry registration
+        // without minting again.
+        savePendingMint({
+          mintAddress,
+          name,
+          ticker,
+          description,
+          creatorWallet: state.wallet,
+          txSignature: mintSignature,
+          fundingTxSignature: fundingSignature || null,
+          image: logo,
+          error: regErr.message,
+        });
+        renderPendingMint();
+        fail(
+          `Mint berhasil on-chain (${txLink(mintSignature)}), tapi pendaftaran gagal: ${esc(regErr.message)}. Gunakan tombol "Coba daftarkan lagi" di atas — tidak perlu mint ulang.`
+        );
+        return;
+      }
+      savePendingMint(null);
+      paint(5, 5);
       toast(`Coin $${ticker} berhasil dibuat!`);
       location.hash = `#/coin/${mintAddress}`;
     } catch (err) {
-      errEl.innerHTML = `<div class="alert alert-error">Mint gagal: ${esc(err.message)}</div>`;
-      stepsEl.innerHTML = '';
-      btn.disabled = false;
+      fail(`Mint gagal: ${esc(friendlyError(err))}`);
     }
   }
 }
@@ -481,8 +723,14 @@ async function renderCoin(mintAddress) {
           <div class="small muted">Dibuat ${fmtDate(coin.createdAt)} oleh <span class="mono">${esc(shortAddr(coin.creatorWallet))}</span></div>
         </div>
         <span class="badge badge-ok" style="margin-left:auto">✓ Terverifikasi on-chain</span>
+        ${coin.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
       </div>
       ${coin.description ? `<p>${esc(coin.description)}</p>` : ''}
+      ${coin.tradingEnabled ? '' : `
+      <div class="alert alert-info" id="fundingBox">
+        <strong>Trading belum aktif.</strong> Kreator belum memindahkan 800.000.000 token ke dompet pool, jadi coin ini belum bisa diperdagangkan.
+        ${state.wallet === coin.creatorWallet ? '<div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="fundPoolBtn">Fund pool sekarang (800M token)</button></div><div id="fundResult"></div>' : ''}
+      </div>`}
       <div class="proof">
         <div class="row"><span class="k">Alamat mint</span>
           <span class="mono">${esc(shortAddr(coin.mintAddress))}</span>
@@ -534,8 +782,8 @@ async function renderCoin(mintAddress) {
 
     <div class="grid-2">
       <div class="card trade-box">
-        <h2 style="margin-top:0">Beli / Jual <span class="badge badge-sim">SIMULASI</span></h2>
-        <p class="small muted">Trading ini simulasi — tidak ada transaksi on-chain dan tidak memakai SOL asli.</p>
+        <h2 style="margin-top:0">Beli / Jual <span class="badge badge-live">DEVNET ASLI</span></h2>
+        <p class="small muted">Trading asli di devnet: SOL dan token beneran berpindah on-chain lewat dompet pool kustodian (<span id="tradePoolAddr">…</span>). Devnet hanya untuk percobaan — SOL di sini token testnet gratis tanpa nilai uang.</p>
         <div class="tabs">
           <button class="btn btn-sm ${state.tradeSide === 'buy' ? 'active' : ''}" data-side="buy">Beli</button>
           <button class="btn btn-sm ${state.tradeSide === 'sell' ? 'active' : ''}" data-side="sell">Jual</button>
@@ -562,6 +810,45 @@ async function renderCoin(mintAddress) {
       navigator.clipboard.writeText(b.dataset.copy).then(() => toast('Disalin.'));
     });
   });
+
+  // Pool address in the trade panel disclosure.
+  loadPoolAddress().then(() => {
+    const el = document.getElementById('tradePoolAddr');
+    if (el && state.poolAddress) {
+      el.innerHTML = `<a class="mono" href="${EXPLORER}/address/${esc(state.poolAddress)}?cluster=devnet" target="_blank" rel="noopener">${esc(shortAddr(state.poolAddress))} ↗</a>`;
+    } else if (el) {
+      el.textContent = 'tidak tersedia';
+    }
+  });
+
+  // Creator funding: enable trading later for an unfunded coin.
+  const fundBtn = document.getElementById('fundPoolBtn');
+  if (fundBtn) {
+    fundBtn.addEventListener('click', async () => {
+      const resEl = document.getElementById('fundResult');
+      fundBtn.disabled = true;
+      try {
+        if (!solanaLibsReady()) throw new Error('Library Solana gagal dimuat.');
+        const phantom = (await waitForPhantom(3000)) || getPhantom();
+        if (!phantom) throw new Error('Phantom tidak terdeteksi.');
+        const poolAddress = await loadPoolAddress();
+        if (!poolAddress) throw new Error('Alamat pool tidak tersedia.');
+        resEl.innerHTML = '<p class="muted">Membangun transaksi funding…</p>';
+        const funding = await buildFundingTransaction(state.wallet, coin.mintAddress, poolAddress);
+        const sim = await simulateTransaction(funding.transaction);
+        if (!sim.ok) throw new Error(sim.error);
+        resEl.innerHTML = '<p class="muted">Tanda tangani transfer funding di Phantom…</p>';
+        const sig = await signAndSend(phantom, funding.transaction);
+        resEl.innerHTML = '<p class="muted">Memverifikasi funding on-chain…</p>';
+        await apiPost(`/api/coins/${coin.mintAddress}/fund`, { fundingTxSignature: sig });
+        toast('Pool ter-funding — trading aktif!');
+        renderCoin(mintAddress);
+      } catch (err) {
+        resEl.innerHTML = `<div class="alert alert-error">Funding gagal: ${esc(friendlyError(err))}</div>`;
+        fundBtn.disabled = false;
+      }
+    });
+  }
 
   // Chart range buttons
   view.querySelectorAll('[data-range]').forEach((b) => {
@@ -591,6 +878,8 @@ async function renderCoin(mintAddress) {
   });
 
   renderChartEl(document.getElementById('chartWrap'), chart, state.chartRange);
+  // Live on-chain balances before the trade form renders (MAX uses them).
+  await refreshOnchainBalances();
   renderTradeForm();
   renderPnlCard();
   renderTradesTable();
@@ -598,9 +887,15 @@ async function renderCoin(mintAddress) {
   function renderTradeForm() {
     const form = document.getElementById('tradeForm');
     const pnl = walletPnl;
-    const holdings = pnl ? pnl.holdings : 0;
+    // Live on-chain holdings (the user may also hold minted tokens, which
+    // the trade history does not know about).
+    const liveHoldings = state.onchainBalances[coin.mintAddress] || 0;
+    if (!coin.tradingEnabled) {
+      form.innerHTML = `<p class="muted">Trading belum aktif untuk coin ini — kreator belum memindahkan 800.000.000 token ke pool.</p>`;
+      return;
+    }
     if (!state.wallet) {
-      form.innerHTML = `<p class="muted">Hubungkan dompet Phantom untuk trading (simulasi).</p>
+      form.innerHTML = `<p class="muted">Hubungkan dompet Phantom untuk trading di devnet.</p>
         <button class="btn btn-primary" id="connectTrade">Hubungkan Phantom</button>`;
       document.getElementById('connectTrade').onclick = connectWallet;
       return;
@@ -615,7 +910,8 @@ async function renderCoin(mintAddress) {
           </div>
           <div class="estimate" id="buyEstimate"></div>
         </div>
-        <button class="btn btn-buy" id="buyBtn">Beli $${esc(coin.ticker)} (Simulasi)</button>`;
+        <button class="btn btn-buy" id="buyBtn">Beli $${esc(coin.ticker)}</button>
+        <p class="small muted" style="margin-top:8px">Kamu akan menandatangani transfer SOL asli ke dompet pool, lalu pool mengirim token ke dompetmu.</p>`;
       const input = document.getElementById('buySol');
       const update = () => {
         const sol = Number(input.value);
@@ -643,11 +939,12 @@ async function renderCoin(mintAddress) {
           <label>Jumlah ${esc(coin.ticker)}</label>
           <input id="sellTokens" type="number" min="0" step="any" placeholder="1000000">
           <div class="quick">
-            <button class="btn" id="maxSell">MAX (${fmtTokens(holdings)})</button>
+            <button class="btn" id="maxSell">MAX (${fmtTokens(liveHoldings)})</button>
           </div>
           <div class="estimate" id="sellEstimate"></div>
         </div>
-        <button class="btn btn-sell" id="sellBtn">Jual $${esc(coin.ticker)} (Simulasi)</button>`;
+        <button class="btn btn-sell" id="sellBtn">Jual $${esc(coin.ticker)}</button>
+        <p class="small muted" style="margin-top:8px">Kamu akan menandatangani transfer token asli ke dompet pool, lalu pool mengirim SOL ke dompetmu.</p>`;
       const input = document.getElementById('sellTokens');
       const update = () => {
         const tokens = Number(input.value);
@@ -659,7 +956,7 @@ async function renderCoin(mintAddress) {
       };
       input.addEventListener('input', update);
       document.getElementById('maxSell').addEventListener('click', () => {
-        input.value = holdings;
+        input.value = liveHoldings;
         update();
       });
       document.getElementById('sellBtn').addEventListener('click', async () => {
@@ -671,31 +968,75 @@ async function renderCoin(mintAddress) {
     if (pnl && pnl.totalTrades > 0) {
       form.insertAdjacentHTML(
         'beforeend',
-        `<p class="small" style="margin-top:10px">Posisimu: <b>${fmtTokens(pnl.holdings)} ${esc(
+        `<p class="small" style="margin-top:10px">Saldo on-chain: <b>${fmtTokens(liveHoldings)} ${esc(
           coin.ticker
-        )}</b> (${fmtSol(pnl.currentValueSol)} SOL) •
-        PnL <b class="${pnl.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(pnl.totalPnlSol)} (${fmtPct(
+        )}</b> • PnL <b class="${pnl.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(pnl.totalPnlSol)} (${fmtPct(
           pnl.roiPct
         )})</b></p>`
       );
     }
   }
 
+  // Real trade flow: prepare (quote + balance pre-checks, server-side) ->
+  // build the user's leg -> simulate -> sign in Phantom -> send + confirm
+  // -> server verifies the leg on-chain, completes the pool leg, records.
   async function submitTrade(side, amounts) {
     const resEl = document.getElementById('tradeResult');
+    const btn = document.getElementById(side === 'buy' ? 'buyBtn' : 'sellBtn');
+    const setBusy = (msg) => {
+      if (btn) btn.disabled = true;
+      resEl.innerHTML = `<p class="muted">${esc(msg)}</p>`;
+    };
+    const fail = (msg) => {
+      if (btn) btn.disabled = false;
+      resEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
+    };
     try {
-      const res = await apiPost('/api/trades', {
+      if (!solanaLibsReady()) throw new Error('Library Solana gagal dimuat. Muat ulang halaman.');
+      const phantom = (await waitForPhantom(3000)) || getPhantom();
+      if (!phantom) throw new Error('Phantom tidak terdeteksi.');
+      const poolAddress = await loadPoolAddress();
+      if (!poolAddress) throw new Error('Alamat pool tidak tersedia.');
+
+      // 1. Prepare: quote + pool/user balance checks BEFORE signing.
+      setBusy('Memeriksa kuota & saldo pool…');
+      const prepared = await apiPost('/api/trades/prepare', {
         mintAddress: coin.mintAddress,
         wallet: state.wallet,
         side,
         ...amounts,
       });
+
+      // 2. Build the user's leg and simulate it before asking to sign.
+      setBusy('Membangun transaksi…');
+      const built =
+        side === 'buy'
+          ? await buildBuyTransaction(state.wallet, coin.mintAddress, poolAddress, prepared.solAmount)
+          : await buildSellTransaction(state.wallet, coin.mintAddress, poolAddress, prepared.tokenAmount);
+      const sim = await simulateTransaction(built.transaction);
+      if (!sim.ok) throw new Error(`Simulasi gagal: ${sim.error}`);
+
+      // 3. Sign + send + confirm the user's leg.
+      setBusy('Tanda tangani transaksi di Phantom…');
+      const userSig = await signAndSend(phantom, built.transaction);
+
+      // 4. Server verifies the leg on-chain, completes the pool leg, records.
+      setBusy('Memverifikasi & menyelesaikan trade…');
+      const res = await apiPost(`/api/trades/${side}`, {
+        mintAddress: coin.mintAddress,
+        wallet: state.wallet,
+        ...(side === 'buy' ? { solAmount: prepared.solAmount } : { tokenAmount: prepared.tokenAmount }),
+        userTxSignature: userSig,
+      });
       resEl.innerHTML = `<div class="alert alert-success">${side === 'buy' ? 'Beli' : 'Jual'} berhasil: ${fmtTokens(
         res.trade.tokenAmount
-      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPrice(res.trade.price)} SOL.</div>`;
-      setTimeout(() => renderCoin(mintAddress), 600);
+      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPrice(res.trade.price)} SOL.<br>
+      Transaksimu: ${txLink(res.trade.userTxSignature)} • Transaksi pool: ${txLink(res.trade.poolTxSignature)}</div>`;
+      await refreshBalance();
+      await refreshOnchainBalances();
+      setTimeout(() => renderCoin(mintAddress), 800);
     } catch (err) {
-      resEl.innerHTML = `<div class="alert alert-error">Gagal: ${esc(err.message)}</div>`;
+      fail(`Gagal: ${esc(friendlyError(err))}`);
     }
   }
 
@@ -708,7 +1049,8 @@ async function renderCoin(mintAddress) {
     }
     if (!walletPnl || walletPnl.totalTrades === 0) {
       card.innerHTML = `<h2 style="margin-top:0">Profit / Loss</h2>
-        <p class="muted">Belum ada transaksi simulasi di coin ini. Beli dulu untuk mulai melacak PnL.</p>`;
+        <p class="muted">Belum ada transaksi di coin ini. Beli dulu untuk mulai melacak PnL.</p>
+        <p class="small">Saldo on-chain di dompetmu: <b>${fmtTokens(state.onchainBalances[coin.mintAddress] || 0)} ${esc(coin.ticker)}</b></p>`;
       return;
     }
     const p = walletPnl;
@@ -720,7 +1062,8 @@ async function renderCoin(mintAddress) {
         }</span>
       </h2>
       <div class="pnl-grid">
-        <div class="stat"><div class="label">Holdings</div><div class="value">${fmtTokens(p.holdings)}</div></div>
+        <div class="stat"><div class="label">Holdings (dari trading)</div><div class="value">${fmtTokens(p.holdings)}</div></div>
+        <div class="stat"><div class="label">Saldo On-chain di Dompet</div><div class="value">${fmtTokens(state.onchainBalances[coin.mintAddress] || 0)}</div></div>
         <div class="stat"><div class="label">Harga Rata-rata Beli</div><div class="value">${fmtPrice(p.avgBuyPrice)} SOL</div></div>
         <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtSol(p.costBasisSol)} SOL</div></div>
         <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtSol(p.currentValueSol)} SOL</div></div>
@@ -729,7 +1072,7 @@ async function renderCoin(mintAddress) {
         <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtSignedSol(p.totalPnlSol)}</div></div>
         <div class="stat"><div class="label">ROI</div><div class="value ${cls}">${fmtPct(p.roiPct)}</div></div>
       </div>
-      <p class="small muted" style="margin-top:10px">Metode average-cost, dihitung server dari transaksi simulasi yang tercatat.</p>`;
+      <p class="small muted" style="margin-top:10px">Metode average-cost, dihitung server dari transaksi devnet yang tercatat.</p>`;
   }
 
   function renderTradesTable() {
@@ -750,7 +1093,7 @@ async function renderCoin(mintAddress) {
     }
     wrap.innerHTML = `
       <table>
-        <thead><tr><th>Waktu</th><th>Jenis</th><th>Token</th><th>SOL</th><th>Harga</th><th>Dompet</th></tr></thead>
+        <thead><tr><th>Waktu</th><th>Jenis</th><th>Token</th><th>SOL</th><th>Harga</th><th>Dompet</th><th>Tx Kamu</th><th>Tx Pool</th></tr></thead>
         <tbody>
           ${rows
             .map(
@@ -763,6 +1106,8 @@ async function renderCoin(mintAddress) {
                 <td>${fmtSol(t.solAmount)}</td>
                 <td>${fmtPrice(t.price)}</td>
                 <td class="mono">${esc(shortAddr(t.wallet))}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
+                <td>${txLink(t.userTxSignature)}</td>
+                <td>${txLink(t.poolTxSignature)}</td>
               </tr>`
             )
             .join('')}
@@ -779,7 +1124,7 @@ function renderChartEl(wrap, points, range) {
   }
   if (pts.length < 2) {
     wrap.innerHTML =
-      '<p class="muted" style="padding:40px 0;text-align:center">Belum ada transaksi — grafik muncul setelah ada trading simulasi.</p>';
+      '<p class="muted" style="padding:40px 0;text-align:center">Belum ada transaksi — grafik muncul setelah ada trading.</p>';
     return;
   }
   const W = 1000;
@@ -864,7 +1209,7 @@ async function renderPortfolio() {
     view.innerHTML += `
       <div class="card empty">
         <h2>Hubungkan dompet dulu</h2>
-        <p>Portofolio menampilkan posisi trading simulasi dari dompet yang terhubung.</p>
+        <p>Portofolio menampilkan posisi trading devnet dari dompet yang terhubung.</p>
         <p><button class="btn btn-primary" id="connectPf">Hubungkan Phantom</button></p>
       </div>`;
     document.getElementById('connectPf').onclick = connectWallet;
@@ -873,7 +1218,10 @@ async function renderPortfolio() {
   view.innerHTML += '<p class="muted">Memuat portofolio…</p>';
   let data;
   try {
-    data = await apiGet(`/api/portfolio?wallet=${encodeURIComponent(state.wallet)}`);
+    [data] = await Promise.all([
+      apiGet(`/api/portfolio?wallet=${encodeURIComponent(state.wallet)}`),
+      refreshOnchainBalances(),
+    ]);
   } catch (err) {
     view.innerHTML += `<div class="alert alert-error">Gagal memuat portofolio: ${esc(err.message)}</div>`;
     return;
@@ -882,7 +1230,7 @@ async function renderPortfolio() {
   const cls = s.totalPnlSol >= 0 ? 'profit' : 'loss';
   view.innerHTML = `
     <h1>Portofolio Saya</h1>
-    <p class="muted">Dompet <span class="mono">${esc(state.wallet)}</span> • Semua angka dari trading simulasi.</p>
+    <p class="muted">Dompet <span class="mono">${esc(state.wallet)}</span> • Semua angka dari trading devnet yang tercatat. Kolom "Saldo On-chain" dibaca langsung dari devnet.</p>
     <div class="card">
       <div class="stat-grid">
         <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtSignedSol(s.totalPnlSol)} (${fmtPct(s.totalPnlPct)})</div></div>
@@ -899,15 +1247,16 @@ async function renderPortfolio() {
       <h2 style="margin-top:0">Posisi per Coin</h2>
       ${
         data.positions.length === 0
-          ? '<p class="muted">Belum ada posisi. Mulai trading (simulasi) di salah satu coin.</p>'
+          ? '<p class="muted">Belum ada posisi. Mulai trading di salah satu coin.</p>'
           : `<div class="table-wrap"><table>
-              <thead><tr><th>Coin</th><th>Holdings</th><th>Harga Rata-rata</th><th>Nilai</th><th>PnL</th><th>ROI</th><th></th></tr></thead>
+              <thead><tr><th>Coin</th><th>Holdings</th><th>Saldo On-chain</th><th>Harga Rata-rata</th><th>Nilai</th><th>PnL</th><th>ROI</th><th></th></tr></thead>
               <tbody>
                 ${data.positions
                   .map(
                     (p) => `<tr>
                       <td><a href="#/coin/${esc(p.mintAddress)}"><b>${esc(p.name)}</b> <span class="muted">$${esc(p.ticker)}</span></a></td>
                       <td>${fmtTokens(p.holdings)}</td>
+                      <td>${fmtTokens(state.onchainBalances[p.mintAddress] || 0)}</td>
                       <td>${fmtPrice(p.avgBuyPrice)} SOL</td>
                       <td>${fmtSol(p.currentValueSol)} SOL</td>
                       <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(p.totalPnlSol)}</td>
@@ -923,31 +1272,47 @@ async function renderPortfolio() {
 }
 
 // ---------- Boot ----------
-if (getPhantom()) {
-  getPhantom().on('disconnect', () => {
+// Attach Phantom listeners once the extension has injected (it can arrive
+// after our scripts run). Runs on DOMContentLoaded and again on window load.
+let phantomWired = false;
+async function wirePhantom() {
+  if (phantomWired) return;
+  const phantom = await waitForPhantom(4000);
+  if (!phantom) return;
+  phantomWired = true;
+  phantom.on('disconnect', () => {
     state.wallet = null;
     state.balanceSol = null;
+    state.onchainBalances = {};
     localStorage.removeItem('solpump-wallet');
     renderHeader();
     route();
   });
   // Reconnect silently if the wallet was already trusted.
   if (state.wallet) {
-    getPhantom()
-      .connect({ onlyIfTrusted: true })
-      .then(async (resp) => {
-        state.wallet = resp.publicKey.toString();
-        await refreshBalance();
-        renderHeader();
-        route();
-      })
-      .catch(() => {
-        state.wallet = null;
-        localStorage.removeItem('solpump-wallet');
-        renderHeader();
-      });
+    try {
+      const resp = await phantom.connect({ onlyIfTrusted: true });
+      state.wallet = resp.publicKey.toString();
+      await refreshBalance();
+      await refreshOnchainBalances();
+      renderHeader();
+      route();
+    } catch {
+      state.wallet = null;
+      localStorage.removeItem('solpump-wallet');
+      renderHeader();
+    }
   }
 }
+
+loadPoolAddress().then(() => {
+  const el = document.getElementById('poolAddress');
+  if (el && state.poolAddress) {
+    el.innerHTML = `<a class="mono" href="${EXPLORER}/address/${esc(state.poolAddress)}?cluster=devnet" target="_blank" rel="noopener">${esc(shortAddr(state.poolAddress))} ↗</a>`;
+  }
+});
+wirePhantom();
+window.addEventListener('load', wirePhantom);
 
 renderHeader();
 route();

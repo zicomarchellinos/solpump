@@ -1,8 +1,9 @@
 'use strict';
-// Bonding-curve math for solpump's SIMULATED trading.
-// Constant-product curve (x * y = k), no fee — the same style of math the
-// pump.fun-style simulation uses. Nothing here touches the chain: real
-// minting happens client-side via Phantom; trades only exist in our DB.
+// Bonding-curve math for solpump's real devnet trading.
+// Constant-product curve (x * y = k), no fee. Nothing here touches the
+// chain: minting happens client-side via Phantom, and trades are settled
+// through the server pool wallet (see src/pool.js); the curve only prices
+// how much of the other asset each leg delivers.
 //
 // Virtual reserves at launch: 30 SOL against 800,000,000 tokens (80% of the
 // 1,000,000,000-token supply sits on the curve). The curve is "complete"
@@ -14,6 +15,8 @@ const TOTAL_SUPPLY = 1_000_000_000;
 const GRADUATION_SOL = 85;
 const DECIMALS = 6;
 const MINT_SUPPLY_RAW = 1_000_000_000_000_000n; // 1B tokens * 10^6
+const FUNDING_TOKENS = 800_000_000; // tokens the creator moves to the pool
+const FUNDING_TOKENS_RAW = 800_000_000_000_000n; // 800M tokens * 10^6
 
 const INITIAL_PRICE = VIRTUAL_SOL / VIRTUAL_TOKENS; // SOL per token
 
@@ -146,6 +149,8 @@ module.exports = {
   GRADUATION_SOL,
   DECIMALS,
   MINT_SUPPLY_RAW,
+  FUNDING_TOKENS,
+  FUNDING_TOKENS_RAW,
   INITIAL_PRICE,
   currentPrice,
   marketCapSol,
