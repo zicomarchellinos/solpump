@@ -1,9 +1,11 @@
 'use strict';
 // UI smoke test: loads the real frontend in jsdom against a running server,
-// walks the feed -> coin detail -> portfolio -> create views and asserts the
-// key elements render. Requires the server running
-// (default http://localhost:3100). Seeds one test coin + trades directly in
-// the local DB, then removes all test data. Run with:
+// walks the feed -> coin detail -> creator profile -> portfolio -> create
+// views and asserts the key elements render. Requires the server running
+// (default http://localhost:3100). Seeds one test coin + trades + a callout
+// directly in the local DB, then removes all test data. Also unit-checks
+// the price formatter: plain decimals everywhere, never scientific
+// notation. Run with:
 //   node test/ui-smoke.js [baseUrl]
 
 const path = require('path');
@@ -47,12 +49,17 @@ async function main() {
   ).run(mint, WALLET_A, 'z'.repeat(88), 800000000 - tok1 - tok2, 'f'.repeat(88), now - 60000);
   const insertTrade = db.prepare(
     `INSERT INTO trades
-       (mint_address, wallet, side, sol_amount, token_amount, price,
+       (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
         user_tx_signature, pool_tx_signature, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  insertTrade.run(mint, WALLET_A, 'buy', 1.5, tok1, 1.5 / tok1, 'a'.repeat(88), 'A'.repeat(88), now - 30000);
-  insertTrade.run(mint, WALLET_A, 'buy', 0.5, tok2, 0.5 / tok2, 'b'.repeat(88), 'B'.repeat(88), now - 10000);
+  insertTrade.run(mint, WALLET_A, 'buy', 1.5, tok1, 1.5 / tok1, 0.015, 'a'.repeat(88), 'A'.repeat(88), now - 30000);
+  insertTrade.run(mint, WALLET_A, 'buy', 0.5, tok2, 0.5 / tok2, 0.005, 'b'.repeat(88), 'B'.repeat(88), now - 10000);
+  // One callout by the verified buyer (entry = avg buy price of both buys).
+  db.prepare(
+    `INSERT INTO callouts (mint_address, wallet, text, entry_price, holdings_at_post, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(mint, WALLET_A, 'SMOKE masih awal, gas!', 2.0 / (tok1 + tok2), tok1 + tok2, now - 5000);
   console.log('seeded smoke coin', mint);
 
   let dom;
@@ -94,6 +101,19 @@ async function main() {
     );
     assert(document.querySelector('#searchInput'), 'feed search input renders');
     assert(document.querySelector('#sortSelect'), 'feed sort select renders');
+    assert(document.body.textContent.includes('Market cap'), 'coin card shows market cap');
+    assert(document.querySelector('.coin-card .addr-link'), 'coin card links the creator profile');
+    // Price formatting: plain decimals, never scientific notation — unit
+    // checks against the page's own fmtPrice, plus a sweep over tiny prices.
+    assert(window.fmtPrice(4.1e-8) === '0,000000041', `fmtPrice(4.1e-8) = ${window.fmtPrice(4.1e-8)}`);
+    assert(window.fmtPrice(3.75e-8) === '0,0000000375', `fmtPrice(3.75e-8) = ${window.fmtPrice(3.75e-8)}`);
+    assert(window.fmtPrice(0.000123456) === '0,000123', `fmtPrice(0.000123456) = ${window.fmtPrice(0.000123456)}`);
+    assert(window.fmtPrice(1.5) === '1,5', `fmtPrice(1.5) = ${window.fmtPrice(1.5)}`);
+    assert(window.fmtPrice(0) === '0', 'fmtPrice(0) = 0');
+    for (const p of [1e-9, 9.99e-9, 1.23456789e-8, 5e-7, 9.9999e-5, 0.001, 12.345]) {
+      const out = window.fmtPrice(p);
+      assert(!/[eE][-+]?\d/.test(out) && !out.includes('×10'), `fmtPrice(${p}) has no scientific notation: ${out}`);
+    }
     // Footer shows the pool wallet address (loaded from /api/pool).
     const poolAddr = await waitFor(() => {
       const el = document.querySelector('#poolAddress a');
@@ -108,11 +128,17 @@ async function main() {
     await waitFor(() => document.querySelector('#chartSvg'), 15000, 'price chart SVG');
     assert(document.body.textContent.includes('Grafik Harga'), 'detail shows price chart heading');
     assert(document.body.textContent.includes('Market Cap'), 'detail shows market cap stat');
+    // Market cap appears in the chart header too (next to the price).
+    const chartCard = document.querySelector('#chartWrap').closest('.card');
+    assert(chartCard.textContent.includes('Market Cap'), 'chart header shows market cap next to the price');
     assert(document.body.textContent.includes('Terverifikasi on-chain'), 'detail shows verified badge');
     assert(document.body.textContent.includes('explorer.solana.com') || document.querySelector('a[href*="explorer.solana.com"]'), 'detail links to Solana Explorer');
     assert(document.querySelector('.trade-box'), 'buy/sell panel renders');
     assert(document.body.textContent.includes('DEVNET ASLI'), 'trade panel labeled DEVNET ASLI');
     assert(document.body.textContent.includes('dompet pool'), 'trade panel discloses the pool wallet');
+    assert(document.body.textContent.includes('creator fee'), 'trade panel discloses the 1% creator fee');
+    assert(document.querySelector('#feeCard'), 'creator fee card renders');
+    assert(document.body.textContent.includes('Fee Kreator'), 'fee card shows creator fee totals');
     await waitFor(
       () => document.querySelectorAll('#tradesTable tbody tr').length === 2,
       15000,
@@ -122,6 +148,10 @@ async function main() {
       document.body.textContent.includes('Riwayat Transaksi'),
       'detail shows transaction history'
     );
+    assert(
+      document.querySelector('#tradesTable').textContent.includes('Fee Kreator'),
+      'trade table has a fee column'
+    );
     // Chart range buttons and trade filter tabs exist.
     assert(document.querySelector('[data-range="10"]'), 'chart range filter renders');
     assert(document.querySelector('[data-tab="Punyaku"]'), 'trade filter tabs render');
@@ -130,6 +160,20 @@ async function main() {
       document.querySelectorAll('#tradesTable a[href*="explorer.solana.com/tx/"]').length >= 4,
       'trade table links user + pool tx signatures to Explorer'
     );
+    // Callouts: the seeded callout renders with its verified-buyer marker.
+    assert(document.querySelector('#calloutsCard'), 'callouts section renders');
+    assert(
+      document.body.textContent.includes('Pembeli terverifikasi'),
+      'callout shows the verified-buyer marker'
+    );
+    assert(
+      document.body.textContent.includes('SMOKE masih awal, gas!'),
+      'callout text renders'
+    );
+    // No scientific notation anywhere on the rendered detail page.
+    const bodyText = document.body.textContent;
+    assert(!bodyText.includes('×10'), 'detail page has no ×10^ scientific notation');
+    assert(!/\de[-+]\d/.test(bodyText), 'detail page has no e-notation prices');
 
     // Portfolio (no wallet connected): connect prompt renders.
     window.location.hash = '#/portfolio';
@@ -141,6 +185,23 @@ async function main() {
     );
     assert(true, 'portfolio shows connect prompt without a wallet');
 
+    // Creator profile: coins, fees, followers, callouts.
+    window.location.hash = `#/creator/${WALLET_A}`;
+    window.dispatchEvent(new window.HashChangeEvent('hashchange'));
+    await waitFor(
+      () => document.body.textContent.includes('Coin yang Dibuat'),
+      15000,
+      'creator profile'
+    );
+    assert(document.body.textContent.includes('Smoke Cat'), 'creator profile lists their coin');
+    assert(document.body.textContent.includes('Pengikut'), 'creator profile shows followers');
+    assert(document.body.textContent.includes('Mengikuti'), 'creator profile shows following');
+    assert(document.body.textContent.includes('Fee Kreator'), 'creator profile shows fee totals');
+    assert(
+      document.body.textContent.includes('SMOKE masih awal, gas!'),
+      'creator profile lists their callout'
+    );
+
     // Create view: form renders with Phantom guidance (no extension here).
     window.location.hash = '#/create';
     window.dispatchEvent(new window.HashChangeEvent('hashchange'));
@@ -151,11 +212,17 @@ async function main() {
       document.body.textContent.includes('Phantom tidak terdeteksi'),
       'create view shows Phantom guidance without the extension'
     );
+    assert(document.querySelector('#devnetConfirm'), 'create form has the Devnet confirmation checkbox');
+    assert(
+      document.body.textContent.includes('Phantom harus di jaringan Devnet'),
+      'create form reminds that Phantom must be on Devnet'
+    );
 
     console.log('\nALL UI SMOKE CHECKS PASSED');
   } finally {
     if (dom) dom.window.close();
     db.prepare('DELETE FROM trades WHERE mint_address = ?').run(mint);
+    db.prepare('DELETE FROM callouts WHERE mint_address = ?').run(mint);
     db.prepare('DELETE FROM coins WHERE mint_address = ?').run(mint);
     const left = db.prepare('SELECT COUNT(*) AS n FROM coins').get().n;
     console.log(`test data cleaned; coins remaining in DB: ${left}`);

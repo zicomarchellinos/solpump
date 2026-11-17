@@ -194,15 +194,35 @@ async function signAndSend(phantom, tx, extraSigners = []) {
   return sendAndConfirm(signed, { blockhash, lastValidBlockHeight });
 }
 
+// Plain-text hint appended to the errors that usually mean Phantom is on
+// the wrong network: a website cannot read or switch Phantom's network, so
+// when Phantom is on Mainnet its own simulation fails and its balance reads
+// as ~0 even though the site's devnet check passed. Keep it plain text
+// (no links/markup) — toasts render it with textContent.
+const DEVNET_NETWORK_HINT =
+  ' Periksa juga jaringan Phantom: harus di Devnet (Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih Devnet). Kalau Phantom di Mainnet, transaksi devnet selalu gagal meski saldo devnet-mu cukup.';
+
 // Friendly Indonesian messages for the errors users actually hit.
 function friendlyError(err) {
   const msg = (err && err.message) || String(err);
   if (/user rejected/i.test(msg)) return 'Kamu membatalkan tanda tangan di Phantom.';
   if (/insufficient funds|insufficient lamports/i.test(msg)) {
-    return 'Saldo SOL devnet tidak cukup untuk transaksi ini. Ambil SOL gratis di faucet.solana.com.';
+    return (
+      'Saldo SOL devnet tidak cukup untuk transaksi ini. Ambil SOL gratis di faucet.solana.com.' +
+      DEVNET_NETWORK_HINT
+    );
+  }
+  if (/failed to simulate|simulation failed|simulasi gagal/i.test(msg)) {
+    return (
+      'Phantom tidak bisa mensimulasikan transaksi ini. Biasanya karena Phantom di jaringan yang salah (Mainnet, bukan Devnet) atau dompet aktif di Phantom tidak punya SOL devnet.' +
+      DEVNET_NETWORK_HINT
+    );
   }
   if (/blockhash not found/i.test(msg)) {
-    return 'Transaksi kedaluwarsa sebelum ditandatangani (blockhash tidak ditemukan). Coba lagi — transaksi baru akan dibuat.';
+    return (
+      'Transaksi kedaluwarsa sebelum ditandatangani (blockhash tidak ditemukan). Coba lagi — transaksi baru akan dibuat.' +
+      DEVNET_NETWORK_HINT
+    );
   }
   if (/429|rate limit/i.test(msg)) {
     return 'RPC devnet sedang sibuk (rate limit). Tunggu sebentar lalu coba lagi.';
@@ -211,6 +231,21 @@ function friendlyError(err) {
     return 'Gagal terhubung ke RPC devnet. Periksa koneksimu lalu coba lagi.';
   }
   return msg;
+}
+
+// Sign a short UTF-8 message with Phantom (for wallet-proved actions such
+// as follow/unfollow — no transaction, no fee). Returns the signature as
+// base64. The server rebuilds the expected message and verifies the
+// signature against the wallet address.
+async function signFollowMessage(phantom, message) {
+  const encoded = new TextEncoder().encode(message);
+  const signed = await phantom.signMessage(encoded, 'utf8');
+  // Phantom returns { signature: Uint8Array, publicKey }. Convert to base64
+  // without btoa (binary-safe for arbitrary bytes).
+  const bytes = signed.signature;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 // ---------- Mint ----------

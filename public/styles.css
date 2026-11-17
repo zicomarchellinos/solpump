@@ -76,6 +76,42 @@ a:hover { text-decoration: underline; }
   align-items: center;
 }
 .wallet-chip .bal { color: var(--gold); font-weight: 700; }
+/* The chip is a link to the wallet's own profile — keep it reading as a
+   chip, not a green anchor. */
+a.wallet-chip { color: var(--text); }
+a.wallet-chip:hover { border-color: var(--green); }
+
+/* Address links to creator profiles. */
+.addr-link { color: var(--green); }
+.addr-link:hover { text-decoration: underline; }
+
+/* Devnet confirmation checkbox on the create form. */
+.check-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  margin: 12px 0; font-size: 0.9rem; cursor: pointer;
+}
+.check-row input { margin-top: 3px; accent-color: var(--green); }
+
+/* Follower / following lists on creator profiles. */
+.follow-list { list-style: none; padding: 0; margin: 0; }
+.follow-list li { padding: 8px 0; border-bottom: 1px solid var(--border); }
+.follow-list li:last-child { border-bottom: none; }
+
+/* Generic flex row (claim rows on the profile page). */
+.row { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+
+/* Callouts (social trade calls). */
+.callout {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card2);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.callout:last-child { margin-bottom: 0; }
+.callout-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.callout-text { margin: 10px 0; white-space: pre-wrap; word-break: break-word; }
+.callout-meta { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); }
 
 /* ---- Layout ---- */
 .container { max-width: 1200px; margin: 0 auto; padding: 16px 20px; }

@@ -233,6 +233,20 @@ async function main() {
     friendlyError(new Error('something weird')) === 'something weird',
     'unknown errors pass through unchanged'
   );
+  // The errors that usually mean Phantom is on the wrong network (Mainnet
+  // instead of Devnet) must point the user at the network fix.
+  assert(
+    /Devnet/.test(friendlyError(new Error('Failed to simulate the results of this request.'))),
+    'simulation failure hints at the Devnet network check'
+  );
+  assert(
+    /Devnet/.test(friendlyError(new Error('insufficient lamports'))),
+    'insufficient funds also hints at the Devnet network check'
+  );
+  assert(
+    /Devnet/.test(friendlyError(new Error('Blockhash not found'))),
+    'blockhash failure also hints at the Devnet network check'
+  );
 
   console.log('\nALL MINT-FLOW CHECKS PASSED');
 }

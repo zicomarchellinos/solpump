@@ -18,6 +18,17 @@ const MINT_SUPPLY_RAW = 1_000_000_000_000_000n; // 1B tokens * 10^6
 const FUNDING_TOKENS = 800_000_000; // tokens the creator moves to the pool
 const FUNDING_TOKENS_RAW = 800_000_000_000_000n; // 800M tokens * 10^6
 
+// Creator fee: 1% of every trade's SOL volume accrues to the coin's
+// creator, claimable later from the pool wallet. Single constant so the
+// rate can be changed in one place. On a buy the buyer pays the full SOL
+// amount (the fee is part of what they pay); on a sell the fee is deducted
+// from what the seller receives (seller gets solAmount - fee).
+const CREATOR_FEE_BPS = 100; // basis points: 100 = 1%
+
+function creatorFeeSol(solAmount) {
+  return (solAmount * CREATOR_FEE_BPS) / 10000;
+}
+
 const INITIAL_PRICE = VIRTUAL_SOL / VIRTUAL_TOKENS; // SOL per token
 
 function currentPrice(coin) {
@@ -63,11 +74,13 @@ function computeStats(coin, trades) {
   let high = INITIAL_PRICE;
   let low = INITIAL_PRICE;
   let volumeSol = 0;
+  let totalFeesSol = 0;
   const traders = new Set();
   for (const t of trades) {
     if (t.price > high) high = t.price;
     if (t.price < low) low = t.price;
     volumeSol += t.sol_amount;
+    totalFeesSol += t.fee_sol || 0;
     traders.add(t.wallet);
   }
   return {
@@ -77,6 +90,7 @@ function computeStats(coin, trades) {
     high,
     low,
     volumeSol,
+    totalFeesSol,
     txCount: trades.length,
     uniqueTraders: traders.size,
     progressPct: curveProgressPct(coin),
@@ -97,23 +111,31 @@ function chartPoints(coin, trades) {
 // `trades` must be in chronological order (oldest first).
 // Returns holdings, average buy price, cost basis, current value,
 // realized + unrealized PnL, total PnL and ROI vs total bought.
+// Fee handling: on a buy the trader paid the full sol_amount (the 1%
+// creator fee is part of what they paid, so the cost basis is the full
+// amount); on a sell the trader actually received sol_amount - fee_sol,
+// so realized PnL and totalSellSol use the NET proceeds.
 function computePnl(trades, price) {
   let holdings = 0;
   let cost = 0; // cost basis of the current holdings
   let realized = 0;
   let totalBuySol = 0;
   let totalSellSol = 0;
+  let totalFeesPaidSol = 0;
   for (const t of trades) {
+    const fee = t.fee_sol || 0;
+    totalFeesPaidSol += fee;
     if (t.side === 'buy') {
       holdings += t.token_amount;
       cost += t.sol_amount;
       totalBuySol += t.sol_amount;
     } else {
+      const netProceeds = t.sol_amount - fee;
       const avgCost = holdings > 0 ? cost / holdings : 0;
-      realized += t.sol_amount - avgCost * t.token_amount;
+      realized += netProceeds - avgCost * t.token_amount;
       cost -= avgCost * t.token_amount;
       holdings -= t.token_amount;
-      totalSellSol += t.sol_amount;
+      totalSellSol += netProceeds;
     }
   }
   // Guard against float dust on fully-sold positions.
@@ -138,6 +160,7 @@ function computePnl(trades, price) {
     isProfit: totalPnl >= 0,
     totalBuySol,
     totalSellSol,
+    totalFeesPaidSol,
     totalTrades: trades.length,
   };
 }
@@ -151,6 +174,8 @@ module.exports = {
   MINT_SUPPLY_RAW,
   FUNDING_TOKENS,
   FUNDING_TOKENS_RAW,
+  CREATOR_FEE_BPS,
+  creatorFeeSol,
   INITIAL_PRICE,
   currentPrice,
   marketCapSol,

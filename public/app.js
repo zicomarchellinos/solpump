@@ -1,8 +1,9 @@
 'use strict';
 // solpump frontend: hash-routed single-page app.
 // Views: feed (#/), create (#/create), coin detail (#/coin/<mint>),
-// portfolio (#/portfolio). All trading is SIMULATED; only minting is real
-// (on Solana devnet, via Phantom).
+// creator profile (#/creator/<wallet>), portfolio (#/portfolio).
+// Minting AND trading are real on Solana devnet via Phantom + the pool
+// wallet; every trade takes a 1% creator fee (see src/bonding.js).
 
 const EXPLORER = 'https://explorer.solana.com';
 
@@ -16,6 +17,8 @@ const state = {
   chartRange: 0, // 0 = all, else last N trades
   tradeTab: 'Semua',
   tradeSide: 'buy',
+  following: new Set(), // wallets the connected wallet follows
+  feedFollowingOnly: false, // feed filter: only coins by followed creators
 };
 
 // A mint that succeeded on-chain but whose registration failed: kept so the
@@ -54,11 +57,18 @@ function fmtSol(x) {
 }
 
 // Token prices are tiny (SOL per token); show enough precision to be useful.
+// ALWAYS plain decimal notation — never scientific notation ("×10^-8" /
+// "e-8"): tiny prices render as e.g. 0,000000041 (Indonesian decimal comma,
+// like the rest of the site). Keeps 4 significant digits, then trims
+// trailing zeros so 0,0000000410 displays as 0,000000041.
 function fmtPrice(x) {
   const n = Number(x);
   if (!Number.isFinite(n) || n === 0) return '0';
   if (n >= 0.0001) return n.toLocaleString('id-ID', { maximumFractionDigits: 6 });
-  return n.toExponential(2).replace('e', '×10^');
+  const decimals = Math.min(-Math.floor(Math.log10(n)) + 3, 20);
+  const fixed = n.toFixed(decimals);
+  const trimmed = fixed.replace(/\.?0+$/, '') || '0';
+  return trimmed.replace('.', ',');
 }
 
 function fmtTokens(x) {
@@ -137,6 +147,43 @@ function txLink(sig, label) {
   return `<a class="mono" href="${EXPLORER}/tx/${esc(sig)}?cluster=devnet" target="_blank" rel="noopener" title="${esc(sig)}">${esc(label || shortAddr(sig))} ↗</a>`;
 }
 
+// Link to a creator/trader profile. Inside clickable cards the caller must
+// stopPropagation on the link's click (see coinCard wiring).
+function creatorLink(addr, label) {
+  if (!addr) return '';
+  return `<a class="addr-link mono" href="#/creator/${esc(addr)}" title="${esc(addr)}">${esc(label || shortAddr(addr))}</a>`;
+}
+
+// Canonical follow message — must match src/signverify.js on the server.
+// The server rebuilds the expected message and verifies the signature.
+function followMessage(action, followingWallet) {
+  return `solpump:${action}:${followingWallet}`;
+}
+
+// One callout (social trade call). Entry price + holdings were computed
+// server-side from the trader's real trades; PnL is live vs the current
+// price. Prices use fmtPrice (plain decimals, never scientific notation);
+// PnL uses the same green=profit / pink=loss styling as the PnL card.
+function calloutHtml(c, { showCoin = false } = {}) {
+  const cls = c.pnlSol >= 0 ? 'profit' : 'loss';
+  return `
+    <div class="callout">
+      <div class="callout-head">
+        ${creatorLink(c.wallet)}
+        <span class="badge badge-ok">✓ Pembeli terverifikasi</span>
+        ${showCoin ? `<a href="#/coin/${esc(c.mintAddress)}"><b>$${esc(c.coinTicker)}</b></a>` : ''}
+        <span class="muted small" style="margin-left:auto">${fmtTime(c.createdAt)}</span>
+      </div>
+      <p class="callout-text">${esc(c.text)}</p>
+      <div class="callout-meta small">
+        <span>Entry <b>${fmtPrice(c.entryPrice)} SOL</b></span>
+        <span>Dipergang <b>${fmtTokens(c.holdingsAtPost)}</b></span>
+        <span>Harga kini <b>${fmtPrice(c.currentPrice)} SOL</b></span>
+        <span>PnL <b class="${cls}">${fmtSignedSol(c.pnlSol)} (${fmtPct(c.pnlPct)})</b></span>
+      </div>
+    </div>`;
+}
+
 async function loadPoolAddress() {
   if (state.poolAddress) return state.poolAddress;
   try {
@@ -177,6 +224,47 @@ async function refreshBalance() {
   }
 }
 
+// Load the wallets the connected wallet follows (for the feed filter and
+// follow buttons). Silent on failure — following is a nicety, not a blocker.
+async function loadFollowing() {
+  state.following = new Set();
+  if (!state.wallet) return;
+  try {
+    const data = await apiGet(`/api/follows/${encodeURIComponent(state.wallet)}`);
+    state.following = new Set(data.following || []);
+  } catch {
+    state.following = new Set();
+  }
+}
+
+// Sync the site's wallet state with the account currently active in
+// Phantom. A user can switch accounts inside Phantom at any time; without
+// this, the site would check the OLD account's devnet balance while
+// Phantom signs with the NEW (possibly empty) account — the classic cause
+// of a "Not enough SOL" popup after a passing balance check. connect()
+// is silent when the site is already connected. Returns false when the
+// account could not be determined.
+async function syncWalletAccount() {
+  const phantom = (await waitForPhantom(3000)) || getPhantom();
+  if (!phantom) return false;
+  try {
+    const resp = await phantom.connect();
+    const current = resp.publicKey.toString();
+    if (current !== state.wallet) {
+      state.wallet = current;
+      localStorage.setItem('solpump-wallet', current);
+      await loadFollowing();
+      toast(`Dompet aktif di Phantom berubah — sekarang ${shortAddr(current)}.`);
+    }
+    await refreshBalance();
+    await refreshOnchainBalances();
+    renderHeader();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function connectWallet() {
   // The extension can inject after our scripts run; wait briefly for it.
   const phantom = (await waitForPhantom(3000)) || getPhantom();
@@ -191,6 +279,7 @@ async function connectWallet() {
     localStorage.setItem('solpump-wallet', state.wallet);
     await refreshBalance();
     await refreshOnchainBalances();
+    await loadFollowing();
     // Sanity-check our devnet endpoint (genesis hash). The wallet's own
     // selected network cannot be read from a website — the create page
     // tells the user to switch Phantom to Devnet explicitly.
@@ -213,6 +302,8 @@ function disconnectWallet() {
   if (phantom) phantom.disconnect().catch(() => {});
   state.wallet = null;
   state.balanceSol = null;
+  state.following = new Set();
+  state.feedFollowingOnly = false;
   localStorage.removeItem('solpump-wallet');
   renderHeader();
   route();
@@ -221,13 +312,24 @@ function disconnectWallet() {
 function renderHeader() {
   const box = document.getElementById('walletBox');
   if (state.wallet) {
+    // Live devnet balance, prominent: re-read from devnet RPC on connect
+    // and after every confirmed transaction (mint / funding / trade /
+    // claim). The refresh button re-reads it on demand; the address links
+    // to the wallet's own profile page.
     box.innerHTML = `
-      <span class="wallet-chip">
+      <a class="wallet-chip" href="#/creator/${esc(state.wallet)}" title="Profil saya">
         <span class="mono">${esc(shortAddr(state.wallet))}</span>
-        <span class="bal">${state.balanceSol === null ? '…' : `${fmtSol(state.balanceSol)} SOL`}</span>
-      </span>
+        <span class="bal" title="Saldo SOL devnet (dibaca langsung dari devnet)">${state.balanceSol === null ? '…' : `${fmtSol(state.balanceSol)} SOL`}</span>
+      </a>
+      <button class="btn btn-sm btn-ghost" id="refreshBalHeaderBtn" title="Periksa ulang saldo devnet">↻</button>
       <button class="btn btn-sm" id="disconnectBtn">Putuskan</button>`;
     document.getElementById('disconnectBtn').onclick = disconnectWallet;
+    document.getElementById('refreshBalHeaderBtn').onclick = async () => {
+      const btn = document.getElementById('refreshBalHeaderBtn');
+      if (btn) btn.disabled = true;
+      await refreshBalance();
+      renderHeader();
+    };
   } else {
     box.innerHTML = `<button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>`;
     document.getElementById('connectBtn').onclick = connectWallet;
@@ -252,6 +354,8 @@ function route() {
   if (hash === '#/portfolio') return renderPortfolio();
   const m = hash.match(/^#\/coin\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (m) return renderCoin(m[1]);
+  const c = hash.match(/^#\/creator\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
+  if (c) return renderCreator(c[1]);
   document.getElementById('view').innerHTML =
     '<div class="card"><p>Halaman tidak ditemukan.</p><a href="#/">Kembali ke Beranda</a></div>';
 }
@@ -280,7 +384,11 @@ async function renderFeed() {
         <option value="volume" ${feedSort === 'volume' ? 'selected' : ''}>Volume</option>
         <option value="change" ${feedSort === 'change' ? 'selected' : ''}>Perubahan harga</option>
       </select>
+      ${state.wallet && state.following.size > 0
+        ? `<button class="btn btn-sm ${state.feedFollowingOnly ? 'active' : ''}" id="followingToggle" title="Hanya coin dan callout dari kreator yang kamu ikuti">Mengikuti (${state.following.size})</button>`
+        : ''}
     </div>
+    <div id="followingCallouts"></div>
     <div id="coinList"><p class="muted">Memuat coin…</p></div>`;
 
   const searchInput = document.getElementById('searchInput');
@@ -297,17 +405,51 @@ async function renderFeed() {
     feedSort = sortSelect.value;
     loadCoins();
   });
+  const followingToggle = document.getElementById('followingToggle');
+  if (followingToggle) {
+    followingToggle.addEventListener('click', () => {
+      state.feedFollowingOnly = !state.feedFollowingOnly;
+      followingToggle.classList.toggle('active', state.feedFollowingOnly);
+      loadCoins();
+    });
+  }
   loadCoins();
 
   async function loadCoins() {
     const list = document.getElementById('coinList');
     if (!list) return;
+    // When the Following filter is active, show callouts from followed
+    // traders above the coin list.
+    const calloutsBox = document.getElementById('followingCallouts');
+    if (state.feedFollowingOnly && state.wallet && calloutsBox) {
+      try {
+        const cd = await apiGet(`/api/callouts?following=${encodeURIComponent(state.wallet)}`);
+        calloutsBox.innerHTML = cd.callouts.length
+          ? `<div class="card"><h2 style="margin-top:0">Callout dari yang Kamu Ikuti</h2>${cd.callouts
+              .map((c) => calloutHtml(c, { showCoin: true }))
+              .join('')}</div>`
+          : '';
+      } catch {
+        calloutsBox.innerHTML = '';
+      }
+    } else if (calloutsBox) {
+      calloutsBox.innerHTML = '';
+    }
     try {
       const params = new URLSearchParams({ sort: feedSort });
       if (feedSearch.trim()) params.set('search', feedSearch.trim());
+      if (state.feedFollowingOnly && state.wallet) {
+        params.set('following', state.wallet);
+      }
       const data = await apiGet(`/api/coins?${params}`);
       if (!data.coins.length) {
-        list.innerHTML = `
+        list.innerHTML = state.feedFollowingOnly
+          ? `
+          <div class="card empty">
+            <h2>Belum ada coin dari kreator yang kamu ikuti</h2>
+            <p>Kreator yang kamu ikuti belum membuat coin, atau filter ini aktif. Matikan filter "Mengikuti" untuk melihat semua coin.</p>
+          </div>`
+          : `
           <div class="card empty">
             <h2>Belum ada coin</h2>
             <p>Feed masih kosong — coin muncul setelah ada mint asli yang terverifikasi di devnet.</p>
@@ -320,6 +462,10 @@ async function renderFeed() {
         card.addEventListener('click', () => {
           location.hash = `#/coin/${card.dataset.mint}`;
         });
+      });
+      // Creator links inside cards must not trigger the card's navigation.
+      list.querySelectorAll('.coin-card .addr-link').forEach((a) => {
+        a.addEventListener('click', (e) => e.stopPropagation());
       });
     } catch (err) {
       list.innerHTML = `<div class="alert alert-error">Gagal memuat coin: ${esc(err.message)}</div>`;
@@ -348,7 +494,7 @@ function coinCard(c) {
       <div class="progress" title="Progres kurva bonding: ${c.progressPct.toFixed(1)}%">
         <div style="width:${c.progressPct.toFixed(1)}%"></div>
       </div>
-      <div class="small muted" style="margin-top:4px">Kurva bonding ${c.progressPct.toFixed(1)}% • ${c.txCount} tx</div>
+      <div class="small muted" style="margin-top:4px">Kurva bonding ${c.progressPct.toFixed(1)}% • ${c.txCount} tx • oleh ${creatorLink(c.creatorWallet)}</div>
     </div>`;
 }
 
@@ -381,6 +527,16 @@ async function renderCreate() {
       <div id="walletStatus"></div>
       <div id="mintSteps"></div>
       <div id="mintError"></div>
+      <div class="alert alert-info" style="margin-top:8px">
+        <strong>⚠️ Phantom harus di jaringan Devnet.</strong> Website tidak bisa membaca atau mengubah jaringan Phantom.
+        Buka Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih <strong>Devnet</strong>.
+        Kalau Phantom di Mainnet, minting akan gagal dengan "Failed to simulate" / "Not enough SOL" di Phantom
+        meski saldo devnet-mu cukup — karena Phantom memeriksa jaringan yang salah.
+      </div>
+      <label class="check-row">
+        <input type="checkbox" id="devnetConfirm">
+        <span>Saya sudah memastikan Phantom di jaringan <strong>Devnet</strong> dan akun aktifnya adalah akun yang punya SOL devnet.</span>
+      </label>
       <button class="btn btn-primary" id="mintBtn" style="margin-top:8px">Buat Coin &amp; Mint di Devnet</button>
     </div>`;
 
@@ -484,7 +640,7 @@ async function renderCreate() {
       el.innerHTML = `
         <div class="alert alert-info">
           <strong>Dompet belum terhubung.</strong> Hubungkan Phantom dulu.
-          <div class="small" style="margin-top:6px">Pastikan Phantom di jaringan <strong>Devnet</strong>: buka Phantom → Pengaturan → Developer Settings → Change Network → Devnet. Website tidak bisa mengubah jaringan Phantom secara otomatis.</div>
+          <div class="small" style="margin-top:6px">Pastikan Phantom di jaringan <strong>Devnet</strong>: buka Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih Devnet. Website tidak bisa mengubah jaringan Phantom secara otomatis — kalau Phantom di Mainnet, minting akan gagal dengan "Failed to simulate" / "Not enough SOL".</div>
           <div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="connectFromCreate">Hubungkan Phantom</button></div>
         </div>`;
       document.getElementById('connectFromCreate').onclick = connectWallet;
@@ -514,7 +670,7 @@ async function renderCreate() {
         <div style="margin-top:8px"><button class="btn btn-sm" id="refreshBalBtn">Periksa ulang saldo</button></div>
       </div>
       <div class="alert alert-info">
-        <strong>Jaringan:</strong> pastikan Phantom di <strong>Devnet</strong> sebelum mint (Pengaturan → Developer Settings → Change Network → Devnet). Kalau Phantom di Mainnet, minting akan gagal karena kamu tidak punya SOL devnet.
+        <strong>Jaringan:</strong> pastikan Phantom di <strong>Devnet</strong> sebelum mint (Pengaturan → Developer Settings → Testnet Mode → Devnet). Kalau Phantom di Mainnet, minting akan gagal dengan "Failed to simulate" / "Not enough SOL" — Phantom memeriksa saldo Mainnet-mu, bukan saldo devnet.
       </div>`;
     document.getElementById('refreshBalBtn').onclick = () => updateWalletStatus();
   }
@@ -537,6 +693,10 @@ async function renderCreate() {
       fail('Nama dan ticker wajib diisi.');
       return;
     }
+    if (!document.getElementById('devnetConfirm').checked) {
+      fail('Centang dulu konfirmasi Devnet di atas — pastikan Phantom di jaringan Devnet sebelum minting, supaya tidak gagal dengan "Failed to simulate".');
+      return;
+    }
     if (!solanaLibsReady()) {
       fail('Library Solana gagal dimuat. Muat ulang halaman dan coba lagi.');
       return;
@@ -550,6 +710,15 @@ async function renderCreate() {
     }
     if (!state.wallet) {
       fail('Hubungkan dompet Phantom dulu.');
+      return;
+    }
+    // Sync with the account currently active in Phantom: the user may have
+    // switched accounts since connecting, and Phantom signs with the active
+    // one — checking the old account's balance would let a doomed mint
+    // through to the popup.
+    const synced = await syncWalletAccount();
+    if (!synced) {
+      fail('Tidak bisa membaca akun aktif di Phantom. Buka Phantom dan coba lagi.');
       return;
     }
 
@@ -615,6 +784,10 @@ async function renderCreate() {
       paint(2, 1);
       mintSignature = await signAndSendMint(phantom, built.transaction, built.mintKeypair);
       paint(3, 2);
+      // The mint is confirmed on-chain — re-read the balance now so the
+      // header shows the rent + fees actually spent.
+      await refreshBalance();
+      renderHeader();
 
       // 4. Funding: move 800M tokens to the pool so the coin can trade.
       // Skippable — without it the coin still lists, but trading is off.
@@ -622,10 +795,23 @@ async function renderCreate() {
       const poolAddress = await loadPoolAddress();
       if (poolAddress) {
         try {
+          // Re-check the balance after the mint: the mint just spent rent
+          // + fees, and funding needs its own ATA rent + fee. Never open
+          // a Phantom popup for a funding tx that cannot pay its fee.
+          const balAfterMint = await getDevnetBalanceSol(state.wallet);
+          state.balanceSol = balAfterMint;
+          const fundingNeed = 0.003; // pool ATA rent (~0.002 SOL) + fee buffer
+          if (balAfterMint < fundingNeed) {
+            throw new Error(
+              `Saldo devnet tersisa ${fmtSol(balAfterMint)} SOL setelah mint — kurang dari ~${fmtSol(fundingNeed)} SOL untuk funding. Ambil SOL gratis di faucet.solana.com, lalu funding dari halaman coin.`
+            );
+          }
           const funding = await buildFundingTransaction(state.wallet, mintAddress, poolAddress);
           const fundSim = await simulateTransaction(funding.transaction);
           if (!fundSim.ok) throw new Error(fundSim.error);
           fundingSignature = await signAndSend(phantom, funding.transaction);
+          await refreshBalance();
+          renderHeader();
         } catch (fundErr) {
           // Ask instead of failing the whole mint: the coin exists on-chain.
           const skip = window.confirm(
@@ -711,8 +897,9 @@ async function renderCoin(mintAddress) {
     return;
   }
   state.coinCache = data;
-  const { coin, stats, chart, trades, walletPnl, walletTrades } = data;
+  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, walletPnl, walletTrades } = data;
   const chg = stats.changePct >= 0 ? 'profit' : 'loss';
+  const isCreator = state.wallet && state.wallet === coin.creatorWallet;
 
   view.innerHTML = `
     <div class="card">
@@ -720,10 +907,13 @@ async function renderCoin(mintAddress) {
         ${logoHtml(coin)}
         <div>
           <div class="coin-name" style="font-size:1.3rem">${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span></div>
-          <div class="small muted">Dibuat ${fmtDate(coin.createdAt)} oleh <span class="mono">${esc(shortAddr(coin.creatorWallet))}</span></div>
+          <div class="small muted">Dibuat ${fmtDate(coin.createdAt)} oleh ${creatorLink(coin.creatorWallet)}</div>
         </div>
         <span class="badge badge-ok" style="margin-left:auto">✓ Terverifikasi on-chain</span>
         ${coin.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
+        ${state.wallet && !isCreator
+          ? `<button class="btn btn-sm" id="followCreatorBtn">${viewerFollowsCreator ? '✓ Mengikuti' : '+ Ikuti kreator'}</button>`
+          : ''}
       </div>
       ${coin.description ? `<p>${esc(coin.description)}</p>` : ''}
       ${coin.tradingEnabled ? '' : `
@@ -744,11 +934,28 @@ async function renderCoin(mintAddress) {
       </div>
     </div>
 
+    <div class="card" id="feeCard">
+      <h2 style="margin-top:0">Fee Kreator <span class="badge badge-ok">${creatorFeePct}% dari setiap trade</span></h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="label">Total fee terkumpul</div><div class="value">${fmtSol(creatorFees.totalEarnedSol)} SOL</div></div>
+        <div class="stat"><div class="label">Sudah diklaim</div><div class="value">${fmtSol(creatorFees.totalClaimedSol)} SOL</div></div>
+        <div class="stat"><div class="label">Bisa diklaim</div><div class="value">${fmtSol(creatorFees.unclaimedSol)} SOL</div></div>
+      </div>
+      ${isCreator
+        ? `<div style="margin-top:12px">
+            <button class="btn btn-primary" id="claimFeesBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>Klaim ${fmtSol(creatorFees.unclaimedSol)} SOL</button>
+            <div id="claimResult" style="margin-top:8px"></div>
+            <p class="small muted">Fee dikirim dari dompet pool ke dompetmu sebagai transaksi devnet asli. Klaim tercatat di riwayat transaksi.</p>
+          </div>`
+        : `<p class="small muted" style="margin-top:12px">1% dari volume SOL setiap beli dan jual masuk ke kreator ${creatorLink(coin.creatorWallet)}.</p>`}
+    </div>
+
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
         <h2 style="margin:0">Grafik Harga</h2>
-        <div><span style="font-size:1.2rem;font-weight:800">${fmtPrice(stats.price)} SOL</span>
-        <span class="${chg}"> ${fmtPct(stats.changePct)}</span></div>
+        <div style="text-align:right"><span style="font-size:1.2rem;font-weight:800">${fmtPrice(stats.price)} SOL</span>
+        <span class="${chg}"> ${fmtPct(stats.changePct)}</span>
+        <div class="small muted">Market Cap <b style="color:var(--text)">${fmtSol(stats.marketCapSol)} SOL</b></div></div>
       </div>
       <div class="range-btns" style="margin-top:12px">
         ${[0, 10, 25, 50]
@@ -770,6 +977,7 @@ async function renderCoin(mintAddress) {
         <div class="stat"><div class="label">Tertinggi</div><div class="value">${fmtPrice(stats.high)} SOL</div></div>
         <div class="stat"><div class="label">Terendah</div><div class="value">${fmtPrice(stats.low)} SOL</div></div>
         <div class="stat"><div class="label">Volume</div><div class="value">${fmtSol(stats.volumeSol)} SOL</div></div>
+        <div class="stat"><div class="label">Fee Kreator Terkumpul</div><div class="value">${fmtSol(stats.totalFeesSol)} SOL</div></div>
         <div class="stat"><div class="label">Transaksi</div><div class="value">${stats.txCount}</div></div>
         <div class="stat"><div class="label">Trader Unik</div><div class="value">${stats.uniqueTraders}</div></div>
         <div class="stat"><div class="label">Suplai</div><div class="value">1.000.000.000</div></div>
@@ -784,6 +992,7 @@ async function renderCoin(mintAddress) {
       <div class="card trade-box">
         <h2 style="margin-top:0">Beli / Jual <span class="badge badge-live">DEVNET ASLI</span></h2>
         <p class="small muted">Trading asli di devnet: SOL dan token beneran berpindah on-chain lewat dompet pool kustodian (<span id="tradePoolAddr">…</span>). Devnet hanya untuk percobaan — SOL di sini token testnet gratis tanpa nilai uang.</p>
+        <p class="small"><b>${creatorFeePct}% creator fee</b> dari volume SOL setiap trade masuk ke kreator ${creatorLink(coin.creatorWallet)} — saat beli sudah termasuk dalam SOL yang kamu bayar, saat jual dipotong dari SOL yang kamu terima.</p>
         <div class="tabs">
           <button class="btn btn-sm ${state.tradeSide === 'buy' ? 'active' : ''}" data-side="buy">Beli</button>
           <button class="btn btn-sm ${state.tradeSide === 'sell' ? 'active' : ''}" data-side="sell">Jual</button>
@@ -802,6 +1011,17 @@ async function renderCoin(mintAddress) {
           .join('')}
       </div>
       <div class="table-wrap" id="tradesTable"></div>
+    </div>
+
+    <div class="card" id="calloutsCard">
+      <h2 style="margin-top:0">Callout (${(callouts || []).length})</h2>
+      <p class="small muted">Post singkat dari trader yang benar-benar membeli coin ini — entry price dan holdings dihitung dari transaksi devnet asli mereka, PnL-nya live mengikuti harga.</p>
+      <div id="calloutForm"></div>
+      <div id="calloutList">
+        ${(callouts || []).length === 0
+          ? '<p class="muted">Belum ada callout untuk coin ini.</p>'
+          : (callouts || []).map((c) => calloutHtml(c)).join('')}
+      </div>
     </div>`;
 
   // Copy buttons
@@ -810,6 +1030,38 @@ async function renderCoin(mintAddress) {
       navigator.clipboard.writeText(b.dataset.copy).then(() => toast('Disalin.'));
     });
   });
+
+  // Follow/unfollow the creator from the coin page.
+  const followBtn = document.getElementById('followCreatorBtn');
+  if (followBtn) {
+    followBtn.addEventListener('click', async () => {
+      followBtn.disabled = true;
+      await toggleFollow(coin.creatorWallet, viewerFollowsCreator);
+      renderCoin(mintAddress);
+    });
+  }
+
+  // Creator claims accrued fees from the pool wallet.
+  const claimBtn = document.getElementById('claimFeesBtn');
+  if (claimBtn) {
+    claimBtn.addEventListener('click', async () => {
+      const resEl = document.getElementById('claimResult');
+      claimBtn.disabled = true;
+      resEl.innerHTML = '<p class="muted">Mengirim klaim dari pool…</p>';
+      try {
+        const res = await apiPost(`/api/coins/${coin.mintAddress}/claim-fees`, {
+          wallet: state.wallet,
+        });
+        resEl.innerHTML = `<div class="alert alert-success">Berhasil mengklaim ${fmtSol(res.claim.amountSol)} SOL! Transaksi: ${txLink(res.claim.txSignature)}</div>`;
+        await refreshBalance();
+        renderHeader();
+        setTimeout(() => renderCoin(mintAddress), 1200);
+      } catch (err) {
+        resEl.innerHTML = `<div class="alert alert-error">Klaim gagal: ${esc(friendlyError(err))}</div>`;
+        claimBtn.disabled = false;
+      }
+    });
+  }
 
   // Pool address in the trade panel disclosure.
   loadPoolAddress().then(() => {
@@ -831,6 +1083,17 @@ async function renderCoin(mintAddress) {
         if (!solanaLibsReady()) throw new Error('Library Solana gagal dimuat.');
         const phantom = (await waitForPhantom(3000)) || getPhantom();
         if (!phantom) throw new Error('Phantom tidak terdeteksi.');
+        // Sync with the account currently active in Phantom, then check
+        // its fresh devnet balance against the funding cost (pool ATA rent
+        // + fee) — never open a popup for a tx that cannot pay its fee.
+        if (!(await syncWalletAccount())) {
+          throw new Error('Tidak bisa membaca akun aktif di Phantom.');
+        }
+        if (state.balanceSol !== null && state.balanceSol < 0.003) {
+          throw new Error(
+            `Saldo devnet ${fmtSol(state.balanceSol)} SOL kurang dari ~0,003 SOL untuk funding. Ambil SOL gratis di faucet.solana.com.`
+          );
+        }
         const poolAddress = await loadPoolAddress();
         if (!poolAddress) throw new Error('Alamat pool tidak tersedia.');
         resEl.innerHTML = '<p class="muted">Membangun transaksi funding…</p>';
@@ -839,6 +1102,8 @@ async function renderCoin(mintAddress) {
         if (!sim.ok) throw new Error(sim.error);
         resEl.innerHTML = '<p class="muted">Tanda tangani transfer funding di Phantom…</p>';
         const sig = await signAndSend(phantom, funding.transaction);
+        await refreshBalance();
+        renderHeader();
         resEl.innerHTML = '<p class="muted">Memverifikasi funding on-chain…</p>';
         await apiPost(`/api/coins/${coin.mintAddress}/fund`, { fundingTxSignature: sig });
         toast('Pool ter-funding — trading aktif!');
@@ -883,6 +1148,55 @@ async function renderCoin(mintAddress) {
   renderTradeForm();
   renderPnlCard();
   renderTradesTable();
+  renderCalloutForm();
+
+  // Callout form: only wallets with a real buy of this coin may post
+  // (the server re-verifies from the trade records).
+  function renderCalloutForm() {
+    const form = document.getElementById('calloutForm');
+    if (!state.wallet) {
+      form.innerHTML = `<p class="muted">Hubungkan dompet untuk membuat callout.</p>`;
+      return;
+    }
+    const hasBuy = (walletTrades || []).some((t) => t.side === 'buy');
+    if (!hasBuy) {
+      form.innerHTML = `<p class="muted">Kamu belum membeli coin ini — beli dulu untuk membuat callout (hanya pembeli terverifikasi yang bisa posting).</p>`;
+      return;
+    }
+    form.innerHTML = `
+      <div class="field">
+        <textarea id="calloutText" rows="2" maxlength="280" placeholder="Call coin ini… (maks 280 karakter)"></textarea>
+        <div class="small muted" style="text-align:right"><span id="calloutCount">0</span>/280</div>
+      </div>
+      <button class="btn btn-primary" id="postCalloutBtn">Posting Callout</button>
+      <div id="calloutResult" style="margin-top:8px"></div>`;
+    const input = document.getElementById('calloutText');
+    const count = document.getElementById('calloutCount');
+    input.addEventListener('input', () => {
+      count.textContent = input.value.length;
+    });
+    document.getElementById('postCalloutBtn').addEventListener('click', async () => {
+      const text = input.value.trim();
+      const resEl = document.getElementById('calloutResult');
+      const btn = document.getElementById('postCalloutBtn');
+      if (!text) {
+        toast('Tulis callout-mu dulu.');
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await apiPost(`/api/coins/${coin.mintAddress}/callouts`, {
+          wallet: state.wallet,
+          text,
+        });
+        toast('Callout diposting!');
+        renderCoin(mintAddress);
+      } catch (err) {
+        resEl.innerHTML = `<div class="alert alert-error">Gagal posting: ${esc(friendlyError(err))}</div>`;
+        btn.disabled = false;
+      }
+    });
+  }
 
   function renderTradeForm() {
     const form = document.getElementById('tradeForm');
@@ -918,7 +1232,8 @@ async function renderCoin(mintAddress) {
         const est = document.getElementById('buyEstimate');
         if (sol > 0) {
           const tokens = (coin.tokenReserve * sol) / (coin.solReserve + sol);
-          est.textContent = `≈ ${fmtTokens(tokens)} ${coin.ticker} (harga eksekusi ≈ ${fmtPrice(sol / tokens)} SOL)`;
+          const fee = (sol * creatorFeePct) / 100;
+          est.textContent = `≈ ${fmtTokens(tokens)} ${coin.ticker} (harga eksekusi ≈ ${fmtPrice(sol / tokens)} SOL) • Fee kreator ${creatorFeePct}%: ${fmtSol(fee)} SOL`;
         } else est.textContent = '';
       };
       input.addEventListener('input', update);
@@ -951,7 +1266,8 @@ async function renderCoin(mintAddress) {
         const est = document.getElementById('sellEstimate');
         if (tokens > 0) {
           const sol = (coin.solReserve * tokens) / (coin.tokenReserve + tokens);
-          est.textContent = `≈ ${fmtSol(sol)} SOL (harga eksekusi ≈ ${fmtPrice(sol / tokens)} SOL)`;
+          const fee = (sol * creatorFeePct) / 100;
+          est.textContent = `≈ ${fmtSol(sol - fee)} SOL diterima setelah fee kreator ${creatorFeePct}% (${fmtSol(fee)} SOL) • Harga eksekusi ≈ ${fmtPrice(sol / tokens)} SOL`;
         } else est.textContent = '';
       };
       input.addEventListener('input', update);
@@ -995,6 +1311,11 @@ async function renderCoin(mintAddress) {
       if (!solanaLibsReady()) throw new Error('Library Solana gagal dimuat. Muat ulang halaman.');
       const phantom = (await waitForPhantom(3000)) || getPhantom();
       if (!phantom) throw new Error('Phantom tidak terdeteksi.');
+      // Sync with the account currently active in Phantom so the quote and
+      // balance checks apply to the account that will actually sign.
+      if (!(await syncWalletAccount())) {
+        throw new Error('Tidak bisa membaca akun aktif di Phantom.');
+      }
       const poolAddress = await loadPoolAddress();
       if (!poolAddress) throw new Error('Alamat pool tidak tersedia.');
 
@@ -1028,11 +1349,16 @@ async function renderCoin(mintAddress) {
         ...(side === 'buy' ? { solAmount: prepared.solAmount } : { tokenAmount: prepared.tokenAmount }),
         userTxSignature: userSig,
       });
+      const receivedNote =
+        side === 'sell'
+          ? ` Kamu menerima ${fmtSol(res.netSolAmount)} SOL setelah fee kreator ${fmtSol(res.trade.feeSol)} SOL.`
+          : ` Termasuk fee kreator ${fmtSol(res.trade.feeSol)} SOL.`;
       resEl.innerHTML = `<div class="alert alert-success">${side === 'buy' ? 'Beli' : 'Jual'} berhasil: ${fmtTokens(
         res.trade.tokenAmount
-      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPrice(res.trade.price)} SOL.<br>
+      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPrice(res.trade.price)} SOL.${receivedNote}<br>
       Transaksimu: ${txLink(res.trade.userTxSignature)} • Transaksi pool: ${txLink(res.trade.poolTxSignature)}</div>`;
       await refreshBalance();
+      renderHeader();
       await refreshOnchainBalances();
       setTimeout(() => renderCoin(mintAddress), 800);
     } catch (err) {
@@ -1071,49 +1397,255 @@ async function renderCoin(mintAddress) {
         <div class="stat"><div class="label">Realized PnL</div><div class="value ${p.realizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(p.realizedPnlSol)}</div></div>
         <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtSignedSol(p.totalPnlSol)}</div></div>
         <div class="stat"><div class="label">ROI</div><div class="value ${cls}">${fmtPct(p.roiPct)}</div></div>
+        <div class="stat"><div class="label">Fee Kreator Dibayar</div><div class="value">${fmtSol(p.totalFeesPaidSol || 0)} SOL</div></div>
       </div>
-      <p class="small muted" style="margin-top:10px">Metode average-cost, dihitung server dari transaksi devnet yang tercatat.</p>`;
+      <p class="small muted" style="margin-top:10px">Metode average-cost, dihitung server dari transaksi devnet yang tercatat. Jual dihitung dari SOL bersih setelah fee kreator 1%.</p>`;
   }
 
   function renderTradesTable() {
     const wrap = document.getElementById('tradesTable');
-    let rows = trades;
-    if (state.tradeTab === 'Beli') rows = trades.filter((t) => t.side === 'buy');
-    else if (state.tradeTab === 'Jual') rows = trades.filter((t) => t.side === 'sell');
+    // Fee claims are shown in the same history (newest first) on the
+    // "Semua" and "Punyaku" tabs; they are not trades, so the Beli/Jual
+    // filters exclude them.
+    const claims = (feeClaims || []).map((c) => ({
+      kind: 'claim',
+      createdAt: c.createdAt,
+      amountSol: c.amountSol,
+      wallet: c.creatorWallet,
+      txSignature: c.txSignature,
+    }));
+    let rows = trades.map((t) => ({ kind: 'trade', ...t }));
+    if (state.tradeTab === 'Beli') rows = rows.filter((t) => t.side === 'buy');
+    else if (state.tradeTab === 'Jual') rows = rows.filter((t) => t.side === 'sell');
     else if (state.tradeTab === 'Punyaku') {
       if (!state.wallet) {
         wrap.innerHTML = '<p class="muted">Hubungkan dompet untuk melihat transaksimu.</p>';
         return;
       }
-      rows = walletTrades;
+      rows = walletTrades.map((t) => ({ kind: 'trade', ...t }));
+      if (state.wallet === coin.creatorWallet) {
+        rows = rows.concat(claims);
+      }
+    } else {
+      rows = rows.concat(claims);
     }
+    rows.sort((a, b) => b.createdAt - a.createdAt);
     if (!rows.length) {
       wrap.innerHTML = '<p class="muted">Belum ada transaksi.</p>';
       return;
     }
     wrap.innerHTML = `
       <table>
-        <thead><tr><th>Waktu</th><th>Jenis</th><th>Token</th><th>SOL</th><th>Harga</th><th>Dompet</th><th>Tx Kamu</th><th>Tx Pool</th></tr></thead>
+        <thead><tr><th>Waktu</th><th>Jenis</th><th>Token</th><th>SOL</th><th>Fee Kreator</th><th>Harga</th><th>Dompet</th><th>Tx Kamu</th><th>Tx Pool</th></tr></thead>
         <tbody>
           ${rows
-            .map(
-              (t) => `<tr>
+            .map((t) => {
+              if (t.kind === 'claim') {
+                return `<tr>
+                <td>${fmtTime(t.createdAt)}</td>
+                <td><span class="badge badge-ok">Klaim Fee</span></td>
+                <td class="muted">—</td>
+                <td>${fmtSol(t.amountSol)}</td>
+                <td class="muted">—</td>
+                <td class="muted">—</td>
+                <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
+                <td class="muted">—</td>
+                <td>${txLink(t.txSignature)}</td>
+              </tr>`;
+              }
+              return `<tr>
                 <td>${fmtTime(t.createdAt)}</td>
                 <td><span class="badge ${t.side === 'buy' ? 'badge-buy' : 'badge-sell'}">${
                   t.side === 'buy' ? 'Beli' : 'Jual'
                 }</span></td>
                 <td>${fmtTokens(t.tokenAmount)}</td>
                 <td>${fmtSol(t.solAmount)}</td>
+                <td>${fmtSol(t.feeSol || 0)}</td>
                 <td>${fmtPrice(t.price)}</td>
-                <td class="mono">${esc(shortAddr(t.wallet))}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
+                <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
                 <td>${txLink(t.userTxSignature)}</td>
                 <td>${txLink(t.poolTxSignature)}</td>
-              </tr>`
-            )
+              </tr>`;
+            })
             .join('')}
         </tbody>
       </table>`;
   }
+}
+
+// ---------- Follow / unfollow ----------
+// Follow state is keyed by wallet address and stored server-side. The
+// follower proves ownership by signing a canonical message with Phantom
+// (no transaction, no fee) — the server verifies the Ed25519 signature.
+async function toggleFollow(targetWallet, currentlyFollowing) {
+  if (!state.wallet) {
+    toast('Hubungkan dompet dulu untuk mengikuti.');
+    return;
+  }
+  if (targetWallet === state.wallet) {
+    toast('Kamu tidak bisa mengikuti dirimu sendiri.');
+    return;
+  }
+  const phantom = (await waitForPhantom(3000)) || getPhantom();
+  if (!phantom) {
+    toast('Phantom tidak terdeteksi.');
+    return;
+  }
+  if (typeof phantom.signMessage !== 'function') {
+    toast('Phantom-mu tidak mendukung penandatanganan pesan. Perbarui Phantom ke versi terbaru.');
+    return;
+  }
+  const action = currentlyFollowing ? 'unfollow' : 'follow';
+  try {
+    const message = followMessage(action, targetWallet);
+    toast('Tanda tangani pesan di Phantom untuk membuktikan dompetmu (tanpa biaya).');
+    const signature = await signFollowMessage(phantom, message);
+    const res = await apiPost('/api/follows', {
+      followerWallet: state.wallet,
+      followingWallet: targetWallet,
+      action,
+      message,
+      signature,
+    });
+    if (res.following) state.following.add(targetWallet);
+    else state.following.delete(targetWallet);
+    toast(
+      res.following
+        ? `Mengikuti ${shortAddr(targetWallet)}. Coin mereka muncul di filter "Mengikuti" di Beranda.`
+        : `Berhenti mengikuti ${shortAddr(targetWallet)}.`
+    );
+  } catch (err) {
+    toast(`Gagal: ${friendlyError(err)}`);
+  }
+}
+
+// Claim accrued creator fees for one coin (from the creator's own profile).
+async function claimFeesForCoin(mintAddress, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiPost(`/api/coins/${mintAddress}/claim-fees`, { wallet: state.wallet });
+    toast(`Berhasil mengklaim ${fmtSol(res.claim.amountSol)} SOL!`);
+    await refreshBalance();
+    renderHeader();
+    route();
+  } catch (err) {
+    toast(`Klaim gagal: ${friendlyError(err)}`);
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------- Creator profile ----------
+async function renderCreator(walletAddress) {
+  const view = document.getElementById('view');
+  view.innerHTML = '<p class="muted">Memuat profil…</p>';
+  let data;
+  try {
+    const params = state.wallet ? `?viewer=${encodeURIComponent(state.wallet)}` : '';
+    data = await apiGet(`/api/creators/${encodeURIComponent(walletAddress)}${params}`);
+  } catch (err) {
+    view.innerHTML = `<div class="alert alert-error">Gagal memuat profil: ${esc(err.message)}</div>
+      <p><a href="#/">Kembali ke Beranda</a></p>`;
+    return;
+  }
+  const isSelf = data.isSelf;
+  const initials = walletAddress.slice(0, 2).toUpperCase();
+
+  const followListHtml = (list, emptyText) => {
+    if (!list.length) return `<p class="muted">${emptyText}</p>`;
+    return `<ul class="follow-list">${list
+      .map(
+        (w) => `<li>${creatorLink(w)}${w === state.wallet ? ' <span class="muted">(kamu)</span>' : ''}</li>`
+      )
+      .join('')}</ul>`;
+  };
+
+  view.innerHTML = `
+    <div class="card">
+      <div class="coin-head">
+        <div class="coin-avatar" style="width:56px;height:56px;font-size:1.3rem">${esc(initials)}</div>
+        <div>
+          <div class="coin-name" style="font-size:1.3rem">${esc(shortAddr(walletAddress))}</div>
+          <div class="small muted mono" style="word-break:break-all">${esc(walletAddress)}</div>
+        </div>
+        <span class="badge ${isSelf ? 'badge-ok' : 'badge-live'}" style="margin-left:auto">${isSelf ? 'Ini profilmu' : 'Kreator / Trader'}</span>
+        ${state.wallet && !isSelf
+          ? `<button class="btn btn-sm ${data.isFollowing ? '' : 'btn-primary'}" id="profileFollowBtn">${data.isFollowing ? '✓ Mengikuti' : '+ Ikuti'}</button>`
+          : ''}
+      </div>
+      <div class="stat-grid" style="margin-top:16px">
+        <div class="stat"><div class="label">Coin Dibuat</div><div class="value">${data.coins.length}</div></div>
+        <div class="stat"><div class="label">Total Volume Trading</div><div class="value">${fmtSol(data.totalVolumeSol)} SOL</div></div>
+        <div class="stat"><div class="label">Fee Kreator Terkumpul</div><div class="value">${fmtSol(data.totalFeesEarnedSol)} SOL</div></div>
+        <div class="stat"><div class="label">Fee Sudah Diklaim</div><div class="value">${fmtSol(data.totalFeesClaimedSol)} SOL</div></div>
+        <div class="stat"><div class="label">Fee Bisa Diklaim</div><div class="value">${fmtSol(data.totalFeesUnclaimedSol)} SOL</div></div>
+        <div class="stat"><div class="label">Pengikut</div><div class="value">${data.followerCount}</div></div>
+        <div class="stat"><div class="label">Mengikuti</div><div class="value">${data.followingCount}</div></div>
+      </div>
+      <p style="margin-top:12px"><a href="${EXPLORER}/address/${esc(walletAddress)}?cluster=devnet" target="_blank" rel="noopener">Lihat di Solana Explorer ↗</a></p>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Coin yang Dibuat (${data.coins.length})</h2>
+      ${data.coins.length === 0
+        ? '<p class="muted">Dompet ini belum membuat coin.</p>'
+        : `<div class="coin-grid">${data.coins.map(coinCard).join('')}</div>`}
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Callout (${(data.callouts || []).length})</h2>
+      ${(data.callouts || []).length === 0
+        ? '<p class="muted">Belum ada callout dari dompet ini.</p>'
+        : (data.callouts || []).map((c) => calloutHtml(c, { showCoin: true })).join('')}
+    </div>
+
+    ${isSelf && data.coins.some((c) => c.feesUnclaimedSol > 0)
+      ? `<div class="card">
+          <h2 style="margin-top:0">Klaim Fee Kreator</h2>
+          <p class="small muted">Fee dikirim dari dompet pool ke dompetmu sebagai transaksi devnet asli.</p>
+          ${data.coins
+            .filter((c) => c.feesUnclaimedSol > 0)
+            .map(
+              (c) => `<div class="row" style="margin-top:8px">
+                <span><b>$${esc(c.ticker)}</b> — ${fmtSol(c.feesUnclaimedSol)} SOL bisa diklaim</span>
+                <button class="btn btn-sm btn-primary" data-claim="${esc(c.mintAddress)}">Klaim ${fmtSol(c.feesUnclaimedSol)} SOL</button>
+              </div>`
+            )
+            .join('')}
+        </div>`
+      : ''}
+
+    <div class="grid-2">
+      <div class="card">
+        <h2 style="margin-top:0">Pengikut (${data.followerCount})</h2>
+        ${followListHtml(data.followers, 'Belum ada pengikut.')}
+      </div>
+      <div class="card">
+        <h2 style="margin-top:0">Mengikuti (${data.followingCount})</h2>
+        ${followListHtml(data.following, 'Belum mengikuti siapa pun.')}
+      </div>
+    </div>`;
+
+  // Coin cards navigate to the detail page; creator links inside stay local.
+  view.querySelectorAll('.coin-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      location.hash = `#/coin/${card.dataset.mint}`;
+    });
+  });
+  view.querySelectorAll('.coin-card .addr-link').forEach((a) => {
+    a.addEventListener('click', (e) => e.stopPropagation());
+  });
+
+  const followBtn = document.getElementById('profileFollowBtn');
+  if (followBtn) {
+    followBtn.addEventListener('click', async () => {
+      followBtn.disabled = true;
+      await toggleFollow(walletAddress, data.isFollowing);
+      renderCreator(walletAddress);
+    });
+  }
+  view.querySelectorAll('[data-claim]').forEach((b) => {
+    b.addEventListener('click', () => claimFeesForCoin(b.dataset.claim, b));
+  });
 }
 
 // ---------- Chart (SVG area chart with time axis + tooltip) ----------
@@ -1284,7 +1816,32 @@ async function wirePhantom() {
     state.wallet = null;
     state.balanceSol = null;
     state.onchainBalances = {};
+    state.following = new Set();
+    state.feedFollowingOnly = false;
     localStorage.removeItem('solpump-wallet');
+    renderHeader();
+    route();
+  });
+  // The user can switch accounts inside Phantom at any time. Without this
+  // listener the site keeps checking the OLD account's devnet balance while
+  // Phantom signs with the NEW one — the classic cause of a "Not enough
+  // SOL" popup after a passing balance check.
+  phantom.on('accountChanged', async (publicKey) => {
+    if (!publicKey) {
+      state.wallet = null;
+      state.balanceSol = null;
+      state.onchainBalances = {};
+      state.following = new Set();
+      state.feedFollowingOnly = false;
+      localStorage.removeItem('solpump-wallet');
+    } else {
+      state.wallet = publicKey.toString();
+      localStorage.setItem('solpump-wallet', state.wallet);
+      await refreshBalance();
+      await refreshOnchainBalances();
+      await loadFollowing();
+      toast(`Akun Phantom berubah ke ${shortAddr(state.wallet)} — saldo diperbarui.`);
+    }
     renderHeader();
     route();
   });
@@ -1295,6 +1852,7 @@ async function wirePhantom() {
       state.wallet = resp.publicKey.toString();
       await refreshBalance();
       await refreshOnchainBalances();
+      await loadFollowing();
       renderHeader();
       route();
     } catch {

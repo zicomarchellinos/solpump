@@ -1,8 +1,10 @@
 'use strict';
 // solpump API. Trading is REAL devnet trading through the server pool wallet
 // (see src/pool.js) — no custom on-chain program:
-//   GET  /api/coins                 list coins
-//   GET  /api/coins/:mint           coin detail (chart, stats, trades, PnL)
+//   GET  /api/coins                 list coins (?following=<wallet> filters
+//                                   to coins by followed creators)
+//   GET  /api/coins/:mint           coin detail (chart, stats, trades, PnL,
+//                                   creator fees + fee claims)
 //   GET  /api/portfolio             wallet portfolio (from recorded trades)
 //   GET  /api/pool                  pool wallet address (public)
 //   POST /api/trades/prepare        quote + pool/user balance pre-checks
@@ -10,6 +12,21 @@
 //   POST /api/trades/sell           settle a sell after the user's token tx
 //   POST /api/coins/register        register a verified mint (+ funding)
 //   POST /api/coins/:mint/fund      enable trading after a funding transfer
+//   POST /api/coins/:mint/claim-fees  creator claims accrued 1% trade fees
+//   GET  /api/creators/:wallet      creator profile (coins, volume, fees,
+//                                   followers/following, callouts)
+//   GET  /api/follows/:wallet       a wallet's followers + following lists
+//   POST /api/follows               follow/unfollow (signature-proved)
+//   GET  /api/coins/:mint/callouts  callouts for a coin (newest first)
+//   POST /api/coins/:mint/callouts  post a callout (verified buyers only)
+//   GET  /api/callouts              latest callouts (?following=<wallet>
+//                                   filters to followed traders)
+//
+// Creator fee: 1% of every trade's SOL volume (CREATOR_FEE_BPS in
+// src/bonding.js) accrues to the coin's creator. The fee stays in the pool
+// wallet (buys add the full SOL, sells pay out net of the fee), so the
+// invariant poolSolActual = solReserve + unclaimedFees always holds and a
+// claim can always be paid out of the pool.
 //
 // Every trade settles in two on-chain legs: the user's leg (signed by the
 // user in Phantom) is verified on-chain first, then the pool's leg (signed
@@ -30,6 +47,10 @@ const {
 } = require('./verify');
 const { getAssociatedTokenAddress } = require('@solana/spl-token');
 const { PublicKey } = require('@solana/web3.js');
+const { followMessage, verifyWalletSignature } = require('./signverify');
+
+const CREATOR_FEE_PCT = bonding.CREATOR_FEE_BPS / 100; // 1
+const CALLOUT_MAX_CHARS = 280;
 
 const router = express.Router();
 
@@ -105,10 +126,117 @@ function publicTrade(row) {
     solAmount: row.sol_amount,
     tokenAmount: row.token_amount,
     price: row.price,
+    feeSol: row.fee_sol || 0,
     userTxSignature: row.user_tx_signature || null,
     poolTxSignature: row.pool_tx_signature || null,
     createdAt: row.created_at,
   };
+}
+
+function publicFeeClaim(row) {
+  return {
+    id: row.id,
+    mintAddress: row.mint_address,
+    creatorWallet: row.creator_wallet,
+    amountSol: row.amount_sol,
+    txSignature: row.tx_signature,
+    createdAt: row.created_at,
+  };
+}
+
+// Creator-fee totals for one coin: earned (1% of all trade SOL volume),
+// claimed (paid out so far), and unclaimed (claimable now).
+function coinFeeTotals(mintAddress) {
+  const earned =
+    db
+      .prepare('SELECT COALESCE(SUM(fee_sol), 0) AS s FROM trades WHERE mint_address = ?')
+      .get(mintAddress).s || 0;
+  const claimed =
+    db
+      .prepare('SELECT COALESCE(SUM(amount_sol), 0) AS s FROM fee_claims WHERE mint_address = ?')
+      .get(mintAddress).s || 0;
+  return { totalEarnedSol: earned, totalClaimedSol: claimed, unclaimedSol: Math.max(0, earned - claimed) };
+}
+
+function coinFeeClaims(mintAddress) {
+  return db
+    .prepare('SELECT * FROM fee_claims WHERE mint_address = ? ORDER BY created_at DESC, id DESC')
+    .all(mintAddress)
+    .map(publicFeeClaim);
+}
+
+// Callout helpers. A callout's live PnL is derived at read time from the
+// entry price + holdings recorded at posting (both computed server-side
+// from real trades) against the coin's current price.
+function publicCallout(row, coinRow) {
+  const price = bonding.currentPrice(coinRow);
+  const pnlSol = (price - row.entry_price) * row.holdings_at_post;
+  const pnlPct =
+    row.entry_price > 0 ? ((price - row.entry_price) / row.entry_price) * 100 : 0;
+  return {
+    id: row.id,
+    mintAddress: row.mint_address,
+    wallet: row.wallet,
+    text: row.text,
+    entryPrice: row.entry_price,
+    holdingsAtPost: row.holdings_at_post,
+    currentPrice: price,
+    pnlSol,
+    pnlPct,
+    isProfit: pnlSol >= 0,
+    createdAt: row.created_at,
+  };
+}
+
+// Attach coin name/ticker to callouts that span coins (profiles, feeds).
+function withCoinMeta(callout, coinRow) {
+  return {
+    ...callout,
+    coinName: coinRow.name,
+    coinTicker: coinRow.ticker,
+  };
+}
+
+function coinCallouts(mintAddress) {
+  const coinRow = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mintAddress);
+  if (!coinRow) return [];
+  return db
+    .prepare('SELECT * FROM callouts WHERE mint_address = ? ORDER BY created_at DESC, id DESC')
+    .all(mintAddress)
+    .map((row) => publicCallout(row, coinRow));
+}
+
+// A wallet's buy history for a coin: total SOL spent, total tokens bought,
+// and buy count. Entry price = total SOL / total tokens (average buy price
+// from real trades — never user-supplied).
+function walletBuyStats(mintAddress, wallet) {
+  return db
+    .prepare(
+      `SELECT COALESCE(SUM(sol_amount), 0) AS sol,
+              COALESCE(SUM(token_amount), 0) AS tokens,
+              COUNT(*) AS n
+       FROM trades WHERE mint_address = ? AND wallet = ? AND side = 'buy'`
+    )
+    .get(mintAddress, wallet);
+}
+
+// Follow helpers.
+function isFollowing(followerWallet, followingWallet) {
+  return !!db
+    .prepare('SELECT 1 FROM follows WHERE follower_wallet = ? AND following_wallet = ?')
+    .get(followerWallet, followingWallet);
+}
+
+function followLists(wallet) {
+  const followers = db
+    .prepare('SELECT follower_wallet AS wallet FROM follows WHERE following_wallet = ? ORDER BY created_at DESC')
+    .all(wallet)
+    .map((r) => r.wallet);
+  const following = db
+    .prepare('SELECT following_wallet AS wallet FROM follows WHERE follower_wallet = ? ORDER BY created_at DESC')
+    .all(wallet)
+    .map((r) => r.wallet);
+  return { followers, following, followerCount: followers.length, followingCount: following.length };
 }
 
 function signatureAlreadyUsed(signature) {
@@ -130,7 +258,7 @@ function recordFailedTrade({ mintAddress, wallet, side, solAmount, tokenAmount, 
   ).run(mintAddress, wallet, side, solAmount, tokenAmount, userTxSignature, error, Date.now());
 }
 
-function recordTradeAndReserves({ mintAddress, wallet, side, solAmount, tokenAmount, price, userTxSignature, poolTxSignature, row }) {
+function recordTradeAndReserves({ mintAddress, wallet, side, solAmount, tokenAmount, price, feeSol, userTxSignature, poolTxSignature, row }) {
   const now = Date.now();
   const apply = db.transaction(() => {
     const newSol = side === 'buy' ? row.sol_reserve + solAmount : row.sol_reserve - solAmount;
@@ -144,11 +272,11 @@ function recordTradeAndReserves({ mintAddress, wallet, side, solAmount, tokenAmo
     const info = db
       .prepare(
         `INSERT INTO trades
-           (mint_address, wallet, side, sol_amount, token_amount, price,
+           (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
             user_tx_signature, pool_tx_signature, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(mintAddress, wallet, side, solAmount, tokenAmount, price, userTxSignature, poolTxSignature, now);
+      .run(mintAddress, wallet, side, solAmount, tokenAmount, price, feeSol || 0, userTxSignature, poolTxSignature, now);
     return info.lastInsertRowid;
   });
   return { tradeId: apply(), now };
@@ -162,12 +290,32 @@ router.get('/pool', (req, res) => {
 
 // ---- GET /api/coins ----
 // Query: ?search= (name/ticker) &sort=newest|price|marketcap|volume|change
+//   &creator=<wallet> (only that creator's coins)
+//   &following=<wallet> (only coins by creators that wallet follows)
 router.get('/coins', (req, res) => {
   const search = String(req.query.search || '').trim().toLowerCase();
   const sort = String(req.query.sort || 'newest');
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 60));
+  const creator = typeof req.query.creator === 'string' ? req.query.creator : null;
+  const following = typeof req.query.following === 'string' ? req.query.following : null;
+  if (creator && !BASE58_RE.test(creator)) {
+    return badRequest(res, 'Parameter creator tidak valid.');
+  }
+  if (following && !BASE58_RE.test(following)) {
+    return badRequest(res, 'Parameter following tidak valid.');
+  }
 
   let rows = db.prepare('SELECT * FROM coins ORDER BY created_at DESC').all();
+  if (creator) rows = rows.filter((c) => c.creator_wallet === creator);
+  if (following) {
+    const followed = new Set(
+      db
+        .prepare('SELECT following_wallet FROM follows WHERE follower_wallet = ?')
+        .all(following)
+        .map((r) => r.following_wallet)
+    );
+    rows = rows.filter((c) => followed.has(c.creator_wallet));
+  }
   if (search) {
     rows = rows.filter(
       (c) =>
@@ -212,6 +360,7 @@ router.get('/coins/:mint', (req, res) => {
       high: coin.high,
       low: coin.low,
       volumeSol: coin.volumeSol,
+      totalFeesSol: coin.totalFeesSol,
       txCount: coin.txCount,
       uniqueTraders: coin.uniqueTraders,
       progressPct: coin.progressPct,
@@ -222,6 +371,13 @@ router.get('/coins/:mint', (req, res) => {
       .reverse()
       .slice(0, 100)
       .map(publicTrade),
+    // Creator-fee claims for this coin (shown in the transaction history).
+    feeClaims: coinFeeClaims(row.mint_address),
+    creatorFees: coinFeeTotals(row.mint_address),
+    creatorFeePct: CREATOR_FEE_PCT,
+    viewerFollowsCreator: wallet ? isFollowing(wallet, row.creator_wallet) : false,
+    // Callouts (verified buyers only), newest first, with live PnL.
+    callouts: coinCallouts(row.mint_address),
     walletPnl: null,
     walletTrades: [],
   };
@@ -392,8 +548,11 @@ router.post('/trades/prepare', async (req, res) => {
           `Saldo token tidak cukup: dompetmu memegang ${userTokens.toLocaleString('id-ID')} ${row.ticker} on-chain.`
         );
       }
+      // The pool pays out net of the creator fee, so it only needs the
+      // net amount (+ its own tx-fee headroom) on hand.
+      const netSol = solAmount - bonding.creatorFeeSol(solAmount);
       const poolSol = (await pool.getPoolSolBalance()) / LAMPORTS_PER_SOL;
-      const needed = solAmount + pool.FEE_BUFFER_LAMPORTS / LAMPORTS_PER_SOL;
+      const needed = netSol + pool.FEE_BUFFER_LAMPORTS / LAMPORTS_PER_SOL;
       if (poolSol < needed) {
         return badRequest(
           res,
@@ -405,6 +564,7 @@ router.post('/trades/prepare', async (req, res) => {
     return res.status(502).json({ error: `Gagal memeriksa saldo on-chain: ${err.message}` });
   }
 
+  const feeSol = bonding.creatorFeeSol(solAmount);
   res.json({
     mintAddress,
     wallet,
@@ -412,6 +572,11 @@ router.post('/trades/prepare', async (req, res) => {
     solAmount,
     tokenAmount,
     price: solAmount / tokenAmount,
+    // 1% creator fee on the SOL volume. On a buy the buyer pays the full
+    // solAmount (fee included); on a sell the seller receives netSolAmount.
+    feeSol,
+    feePct: CREATOR_FEE_PCT,
+    netSolAmount: side === 'sell' ? solAmount - feeSol : solAmount,
     poolAddress: pool.getPoolAddress(),
   });
 });
@@ -483,8 +648,11 @@ router.post('/trades/buy', async (req, res) => {
         };
       }
 
-      // 4. Record the trade + update reserves atomically.
+      // 4. Record the trade + update reserves atomically. The 1% creator
+      // fee accrues from the full SOL the buyer paid; it stays in the pool
+      // until the creator claims it.
       const price = solAmount / exactTokens;
+      const feeSol = bonding.creatorFeeSol(solAmount);
       const { tradeId, now } = recordTradeAndReserves({
         mintAddress,
         wallet,
@@ -492,11 +660,12 @@ router.post('/trades/buy', async (req, res) => {
         solAmount,
         tokenAmount: exactTokens,
         price,
+        feeSol,
         userTxSignature,
         poolTxSignature: poolSignature,
         row: fresh,
       });
-      return { status: 200, tradeId, now, solAmount, tokenAmount: exactTokens, price, poolSignature };
+      return { status: 200, tradeId, now, solAmount, tokenAmount: exactTokens, price, feeSol, poolSignature };
     });
 
     if (result.status !== 200) {
@@ -515,6 +684,7 @@ router.post('/trades/buy', async (req, res) => {
         sol_amount: result.solAmount,
         token_amount: result.tokenAmount,
         price: result.price,
+        fee_sol: result.feeSol,
         user_tx_signature: userTxSignature,
         pool_tx_signature: result.poolSignature,
         created_at: result.now,
@@ -569,8 +739,12 @@ router.post('/trades/sell', async (req, res) => {
       }
 
       // 2. Market-order quote at current reserves; pool must hold the SOL.
+      // The seller receives the quote NET of the 1% creator fee — the fee
+      // stays in the pool and accrues to the creator.
       const solAmount = bonding.quoteSell(fresh, tokenAmount);
-      const lamports = toLamports(solAmount);
+      const feeSol = bonding.creatorFeeSol(solAmount);
+      const netSol = solAmount - feeSol;
+      const lamports = toLamports(netSol);
       if (lamports <= 0) {
         return { status: 400, error: 'Jumlah terlalu kecil untuk kurva saat ini.' };
       }
@@ -582,7 +756,7 @@ router.post('/trades/sell', async (req, res) => {
         };
       }
 
-      // 3. Pool sends the SOL; on failure record it and tell the user.
+      // 3. Pool sends the net SOL; on failure record it and tell the user.
       const exactSol = lamports / LAMPORTS_PER_SOL;
       let poolSignature;
       try {
@@ -603,21 +777,24 @@ router.post('/trades/sell', async (req, res) => {
         };
       }
 
-      // 4. Record the trade + update reserves atomically.
+      // 4. Record the trade + update reserves atomically. sol_amount is
+      // the gross curve amount (for price/reserves); the fee is stored
+      // separately and PnL uses the net proceeds.
       const exactTokens = Number(tokenRaw) / 1e6;
-      const price = exactSol / exactTokens;
+      const price = solAmount / exactTokens;
       const { tradeId, now } = recordTradeAndReserves({
         mintAddress,
         wallet,
         side: 'sell',
-        solAmount: exactSol,
+        solAmount,
         tokenAmount: exactTokens,
         price,
+        feeSol,
         userTxSignature,
         poolTxSignature: poolSignature,
         row: fresh,
       });
-      return { status: 200, tradeId, now, solAmount: exactSol, tokenAmount: exactTokens, price, poolSignature };
+      return { status: 200, tradeId, now, solAmount, netSolAmount: exactSol, tokenAmount: exactTokens, price, feeSol, poolSignature };
     });
 
     if (result.status !== 200) {
@@ -636,10 +813,12 @@ router.post('/trades/sell', async (req, res) => {
         sol_amount: result.solAmount,
         token_amount: result.tokenAmount,
         price: result.price,
+        fee_sol: result.feeSol,
         user_tx_signature: userTxSignature,
         pool_tx_signature: result.poolSignature,
         created_at: result.now,
       }),
+      netSolAmount: result.netSolAmount,
       coin,
       walletPnl: bonding.computePnl(mine, coin.price),
     });
@@ -801,6 +980,314 @@ router.post('/coins/:mint/fund', async (req, res) => {
   ).run(fundingTxSignature, row.mint_address);
   const updated = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(row.mint_address);
   res.json({ coin: publicCoin(updated, coinTradesAsc(row.mint_address)) });
+});
+
+// ---- GET /api/coins/:mint/callouts ----
+// Callouts for one coin, newest first, with live PnL vs the current price.
+router.get('/coins/:mint/callouts', (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  res.json({ mintAddress: row.mint_address, callouts: coinCallouts(row.mint_address) });
+});
+
+// ---- POST /api/coins/:mint/callouts ----
+// Publish a callout (max 280 chars) for a coin. Only a wallet with a real
+// BUY record for this coin may post — verified from the trades table, so
+// every callout carries a "pembeli terverifikasi" marker honestly. Entry
+// price (average buy price) and holdings at posting time are computed
+// server-side from real trades; the client cannot supply prices.
+router.post('/coins/:mint/callouts', (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  const { wallet, text } = req.body || {};
+  if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  if (typeof text !== 'string' || !text.trim()) {
+    return badRequest(res, 'Callout tidak boleh kosong.');
+  }
+  if (text.length > CALLOUT_MAX_CHARS) {
+    return badRequest(res, `Callout maksimal ${CALLOUT_MAX_CHARS} karakter.`);
+  }
+  const buys = walletBuyStats(row.mint_address, wallet);
+  if (buys.n === 0 || buys.tokens <= 0) {
+    return res.status(403).json({
+      error: 'Hanya trader yang pernah membeli coin ini yang bisa membuat callout. Beli dulu, baru posting.',
+    });
+  }
+  const entryPrice = buys.sol / buys.tokens;
+  const price = bonding.currentPrice(row);
+  const holdings = bonding.computePnl(walletTradesAsc(row.mint_address, wallet), price).holdings;
+  const info = db
+    .prepare(
+      `INSERT INTO callouts
+         (mint_address, wallet, text, entry_price, holdings_at_post, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .run(row.mint_address, wallet, text.trim(), entryPrice, holdings, Date.now());
+  const created = db.prepare('SELECT * FROM callouts WHERE id = ?').get(info.lastInsertRowid);
+  res.status(201).json({ callout: publicCallout(created, row) });
+});
+
+// ---- GET /api/callouts ----
+// Latest callouts across all coins (newest first, max 50).
+//   ?following=<wallet> — only callouts by traders that wallet follows
+//   ?wallet=<wallet> — only callouts by one wallet
+router.get('/callouts', (req, res) => {
+  const following = typeof req.query.following === 'string' ? req.query.following : null;
+  const wallet = typeof req.query.wallet === 'string' ? req.query.wallet : null;
+  if (following && !BASE58_RE.test(following)) {
+    return badRequest(res, 'Parameter following tidak valid.');
+  }
+  if (wallet && !BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Parameter wallet tidak valid.');
+  }
+  let rows;
+  if (following) {
+    rows = db
+      .prepare(
+        `SELECT c.* FROM callouts c
+         JOIN follows f ON f.following_wallet = c.wallet
+         WHERE f.follower_wallet = ?
+         ORDER BY c.created_at DESC, c.id DESC LIMIT 50`
+      )
+      .all(following);
+  } else if (wallet) {
+    rows = db
+      .prepare('SELECT * FROM callouts WHERE wallet = ? ORDER BY created_at DESC, id DESC LIMIT 50')
+      .all(wallet);
+  } else {
+    rows = db
+      .prepare('SELECT * FROM callouts ORDER BY created_at DESC, id DESC LIMIT 50')
+      .all();
+  }
+  const coinRows = new Map();
+  const out = rows
+    .map((row) => {
+      if (!coinRows.has(row.mint_address)) {
+        coinRows.set(
+          row.mint_address,
+          db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(row.mint_address)
+        );
+      }
+      const coinRow = coinRows.get(row.mint_address);
+      if (!coinRow) return null;
+      return withCoinMeta(publicCallout(row, coinRow), coinRow);
+    })
+    .filter(Boolean);
+  res.json({ callouts: out });
+});
+
+// ---- POST /api/coins/:mint/claim-fees ----
+// The coin's creator claims their accrued 1% trade fees as a real devnet
+// SOL transfer from the pool wallet. Body: { wallet } — the caller must be
+// the creator; the payout always goes to the creator address stored in the
+// DB, never to a client-supplied destination, so claiming needs no
+// signature (the worst a stranger can do is trigger a payout to the
+// rightful creator). Claiming 0 is blocked. Serialized with trades via
+// the trade lock because it moves pool SOL.
+router.post('/coins/:mint/claim-fees', async (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  const { wallet } = req.body || {};
+  if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  if (wallet !== row.creator_wallet) {
+    return res.status(403).json({ error: 'Hanya kreator coin ini yang bisa mengklaim fee-nya.' });
+  }
+  const totals = coinFeeTotals(row.mint_address);
+  if (totals.unclaimedSol <= 0) {
+    return badRequest(res, 'Tidak ada fee untuk diklaim — belum ada trading yang menghasilkan fee, atau semuanya sudah diklaim.');
+  }
+
+  try {
+    const result = await withTradeLock(async () => {
+      // Re-compute inside the lock: a trade may have landed meanwhile.
+      const fresh = coinFeeTotals(row.mint_address);
+      if (fresh.unclaimedSol <= 0) {
+        return { status: 400, error: 'Tidak ada fee untuk diklaim.' };
+      }
+      const lamports = Math.floor(fresh.unclaimedSol * LAMPORTS_PER_SOL);
+      if (lamports <= 0) {
+        return { status: 400, error: 'Fee yang belum diklaim terlalu kecil untuk ditransfer.' };
+      }
+      const poolSolLamports = await pool.getPoolSolBalance();
+      if (poolSolLamports < lamports + pool.FEE_BUFFER_LAMPORTS) {
+        return {
+          status: 400,
+          error: `Pool kekurangan SOL untuk membayar klaim ini (pool memegang ${(poolSolLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL, butuh ${(lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL + biaya). Coba lagi nanti.`,
+        };
+      }
+      const signature = await pool.sendSol(row.creator_wallet, lamports);
+      const amountSol = lamports / LAMPORTS_PER_SOL;
+      const info = db
+        .prepare(
+          `INSERT INTO fee_claims
+             (mint_address, creator_wallet, amount_sol, tx_signature, created_at)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(row.mint_address, row.creator_wallet, amountSol, signature, Date.now());
+      return { status: 200, claimId: info.lastInsertRowid, amountSol, signature };
+    });
+
+    if (result.status !== 200) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.json({
+      claim: {
+        id: result.claimId,
+        mintAddress: row.mint_address,
+        creatorWallet: row.creator_wallet,
+        amountSol: result.amountSol,
+        txSignature: result.signature,
+        createdAt: Date.now(),
+      },
+      creatorFees: coinFeeTotals(row.mint_address),
+    });
+  } catch (err) {
+    res.status(502).json({ error: `Gagal mengklaim fee: ${err.message}` });
+  }
+});
+
+// ---- GET /api/creators/:wallet ----
+// Public creator/trader profile: coins created, total trading volume,
+// creator fees earned/claimed/unclaimed, followers + following.
+// Query ?viewer=<wallet> adds isFollowing (viewer follows this creator)
+// and isSelf.
+router.get('/creators/:wallet', (req, res) => {
+  const wallet = req.params.wallet;
+  if (!BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  const viewer = typeof req.query.viewer === 'string' ? req.query.viewer : null;
+
+  const coinRows = db
+    .prepare('SELECT * FROM coins WHERE creator_wallet = ? ORDER BY created_at DESC')
+    .all(wallet);
+  const coins = coinRows.map((row) => {
+    const coin = publicCoin(row, coinTradesAsc(row.mint_address));
+    const fees = coinFeeTotals(row.mint_address);
+    coin.feesClaimedSol = fees.totalClaimedSol;
+    coin.feesUnclaimedSol = fees.unclaimedSol;
+    return coin;
+  });
+
+  let totalVolumeSol = 0;
+  let totalFeesEarnedSol = 0;
+  for (const c of coins) {
+    totalVolumeSol += c.volumeSol;
+    totalFeesEarnedSol += c.totalFeesSol;
+  }
+  const totalFeesClaimedSol =
+    db
+      .prepare(
+        `SELECT COALESCE(SUM(amount_sol), 0) AS s FROM fee_claims
+          WHERE mint_address IN (SELECT mint_address FROM coins WHERE creator_wallet = ?)`
+      )
+      .get(wallet).s || 0;
+
+  const { followers, following, followerCount, followingCount } = followLists(wallet);
+
+  // The wallet's callouts, newest first, with live PnL + coin info.
+  const calloutRows = db
+    .prepare('SELECT * FROM callouts WHERE wallet = ? ORDER BY created_at DESC, id DESC')
+    .all(wallet);
+  const calloutCoinRows = new Map();
+  const callouts = calloutRows
+    .map((row) => {
+      if (!calloutCoinRows.has(row.mint_address)) {
+        calloutCoinRows.set(
+          row.mint_address,
+          db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(row.mint_address)
+        );
+      }
+      const coinRow = calloutCoinRows.get(row.mint_address);
+      if (!coinRow) return null;
+      return withCoinMeta(publicCallout(row, coinRow), coinRow);
+    })
+    .filter(Boolean);
+
+  res.json({
+    wallet,
+    coins,
+    callouts,
+    totalVolumeSol,
+    totalFeesEarnedSol,
+    totalFeesClaimedSol,
+    totalFeesUnclaimedSol: Math.max(0, totalFeesEarnedSol - totalFeesClaimedSol),
+    followerCount,
+    followingCount,
+    followers,
+    following,
+    isFollowing: viewer ? isFollowing(viewer, wallet) : false,
+    isSelf: viewer === wallet,
+  });
+});
+
+// ---- GET /api/follows/:wallet ----
+// A wallet's followers + following lists (addresses) and counts.
+router.get('/follows/:wallet', (req, res) => {
+  const wallet = req.params.wallet;
+  if (!BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  const lists = followLists(wallet);
+  res.json({ wallet, ...lists });
+});
+
+// ---- POST /api/follows ----
+// Follow or unfollow a wallet. Body:
+//   { followerWallet, followingWallet, action: 'follow'|'unfollow',
+//     message, signature }
+// The follower must prove wallet ownership: `message` must be exactly the
+// canonical message for this action + target, and `signature` (base64)
+// must verify against the follower's address (Ed25519). A wallet cannot
+// follow itself. Follow/unfollow are idempotent.
+router.post('/follows', (req, res) => {
+  const { followerWallet, followingWallet, action, message, signature } = req.body || {};
+  if (typeof followerWallet !== 'string' || !BASE58_RE.test(followerWallet)) {
+    return badRequest(res, 'Alamat dompet follower tidak valid.');
+  }
+  if (typeof followingWallet !== 'string' || !BASE58_RE.test(followingWallet)) {
+    return badRequest(res, 'Alamat dompet yang diikuti tidak valid.');
+  }
+  if (action !== 'follow' && action !== 'unfollow') {
+    return badRequest(res, 'action harus "follow" atau "unfollow".');
+  }
+  if (followerWallet === followingWallet) {
+    return badRequest(res, 'Kamu tidak bisa mengikuti dirimu sendiri.');
+  }
+  if (message !== followMessage(action, followingWallet)) {
+    return res.status(401).json({ error: 'Pesan tanda tangan tidak sesuai dengan aksi ini.' });
+  }
+  if (
+    !verifyWalletSignature({
+      walletAddress: followerWallet,
+      message,
+      signatureBase64: signature,
+    })
+  ) {
+    return res.status(401).json({ error: 'Tanda tangan tidak valid untuk dompet ini.' });
+  }
+
+  const now = Date.now();
+  if (action === 'follow') {
+    db.prepare(
+      'INSERT OR IGNORE INTO follows (follower_wallet, following_wallet, created_at) VALUES (?, ?, ?)'
+    ).run(followerWallet, followingWallet, now);
+  } else {
+    db.prepare(
+      'DELETE FROM follows WHERE follower_wallet = ? AND following_wallet = ?'
+    ).run(followerWallet, followingWallet);
+  }
+  const lists = followLists(followingWallet);
+  res.json({
+    following: action === 'follow',
+    followerWallet,
+    followingWallet,
+    followerCount: lists.followerCount,
+  });
 });
 
 module.exports = router;

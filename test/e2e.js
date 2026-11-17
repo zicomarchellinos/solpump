@@ -12,15 +12,46 @@
 //   5. /api/coins/register rejects a fake mint (on-chain verification)
 //   6. chart / stats / PnL / portfolio math over DB-seeded real trades,
 //      including the recorded user + pool transaction signatures
+//   7. creator fees: 1% fee math, fee totals on the detail endpoint,
+//      claim validation (non-creator 403, zero claim 400), PnL net of fee
+//   8. follows: signature verification (wrong message/signature 401,
+//      self-follow 400), follow/unfollow + lists, creator profile
+//      aggregation, and the feed's ?following= filter
+//   9. market cap = price x 1B supply, everywhere it is exposed
 // The actual Phantom signature steps cannot be exercised here (no wallet
-// extension), so no real on-chain trade is executed by this test.
+// extension), so no real on-chain trade is executed by this test — and the
+// claim success path (a real pool payout) cannot be tested without
+// funding the pool with devnet SOL, so only its validation paths are.
 // Run with:
 //   node test/e2e.js [baseUrl]
 
 const path = require('path');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const { Keypair } = require('@solana/web3.js');
 const bonding = require('../src/bonding');
+
+// A throwaway wallet that can sign follow messages: a real Solana keypair,
+// signed with Node's built-in Ed25519 (same scheme Phantom uses).
+function makeTestWallet() {
+  const kp = Keypair.generate();
+  const seed = Buffer.from(kp.secretKey.slice(0, 32));
+  const pub = Buffer.from(kp.secretKey.slice(32));
+  const keyObject = crypto.createPrivateKey({
+    key: {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: pub.toString('base64url'),
+      d: seed.toString('base64url'),
+    },
+    format: 'jwk',
+  });
+  return {
+    address: kp.publicKey.toBase58(),
+    sign: (message) =>
+      crypto.sign(null, Buffer.from(message, 'utf8'), keyObject).toString('base64'),
+  };
+}
 
 const BASE = process.argv[2] || process.env.BASE_URL || 'http://localhost:3100';
 const WALLET_A = 'HyevJPsT3Yf5MTWMph4LaArUqtKS27ScfHF5Cqim6eek';
@@ -86,6 +117,35 @@ async function main() {
     bonding.FUNDING_TOKENS_RAW === 800000000000000n,
     'funding raw amount is 800M * 10^6'
   );
+  assert(bonding.CREATOR_FEE_BPS === 100, 'creator fee is 1% (100 bps)');
+  assert(approx(bonding.creatorFeeSol(1.5), 0.015), 'creatorFeeSol(1.5 SOL) = 0.015 SOL');
+  assert(approx(bonding.creatorFeeSol(0.0005), 0.000005), 'creatorFeeSol(0.0005 SOL) = 0.000005 SOL');
+  // Market cap = current price x 1B total supply.
+  const mcFresh = { sol_reserve: 30, token_reserve: 800000000 };
+  assert(
+    approx(bonding.marketCapSol(mcFresh), bonding.currentPrice(mcFresh) * 1000000000),
+    'marketCapSol = price x 1B supply'
+  );
+  assert(approx(bonding.marketCapSol(mcFresh), 37.5), `fresh-coin market cap is 37.5 SOL`);
+  // PnL is net of the creator fee on sells: the seller received
+  // solOut - fee, so realized PnL and totalSellSol use the net amount.
+  const feeSell = bonding.creatorFeeSol(solOut);
+  const pnlNet = bonding.computePnl(
+    [
+      { side: 'buy', sol_amount: 1.5, token_amount: tok1, fee_sol: bonding.creatorFeeSol(1.5) },
+      { side: 'sell', sol_amount: solOut, token_amount: halfA, fee_sol: feeSell },
+    ],
+    bonding.currentPrice({ sol_reserve: 32 - solOut, token_reserve: 800000000 - tok1 - tok2 + halfA })
+  );
+  assert(approx(pnlNet.totalSellSol, solOut - feeSell), 'PnL totalSellSol is net of the sell fee');
+  assert(
+    approx(pnlNet.totalFeesPaidSol, bonding.creatorFeeSol(1.5) + feeSell),
+    'PnL totalFeesPaidSol sums buy + sell fees'
+  );
+  assert(
+    approx(pnlNet.realizedPnlSol, solOut - feeSell - (1.5 / tok1) * halfA),
+    'PnL realized uses net sell proceeds'
+  );
 
   // ---------- 2. Server: seed two coins ----------
   const db = new Database(path.join(__dirname, '..', 'data', 'solpump.db'));
@@ -118,14 +178,16 @@ async function main() {
   );
   const insertTrade = db.prepare(
     `INSERT INTO trades
-       (mint_address, wallet, side, sol_amount, token_amount, price,
+       (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
         user_tx_signature, pool_tx_signature, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  insertTrade.run(mint, WALLET_A, 'buy', 1.5, tok1, 1.5 / tok1, 'a'.repeat(88), 'A'.repeat(88), now - 50000);
-  insertTrade.run(mint, WALLET_B, 'buy', 0.5, tok2, 0.5 / tok2, 'b'.repeat(88), 'B'.repeat(88), now - 40000);
-  insertTrade.run(mint, WALLET_A, 'sell', solOut, halfA, solOut / halfA, 'c'.repeat(88), 'C'.repeat(88), now - 30000);
-  insertTrade.run(mint, WALLET_B, 'buy', sol3, 1000000, sol3 / 1000000, 'd'.repeat(88), 'D'.repeat(88), now - 10000);
+  const fee = (sol) => bonding.creatorFeeSol(sol);
+  const totalFees = fee(1.5) + fee(0.5) + fee(solOut) + fee(sol3);
+  insertTrade.run(mint, WALLET_A, 'buy', 1.5, tok1, 1.5 / tok1, fee(1.5), 'a'.repeat(88), 'A'.repeat(88), now - 50000);
+  insertTrade.run(mint, WALLET_B, 'buy', 0.5, tok2, 0.5 / tok2, fee(0.5), 'b'.repeat(88), 'B'.repeat(88), now - 40000);
+  insertTrade.run(mint, WALLET_A, 'sell', solOut, halfA, solOut / halfA, fee(solOut), 'c'.repeat(88), 'C'.repeat(88), now - 30000);
+  insertTrade.run(mint, WALLET_B, 'buy', sol3, 1000000, sol3 / 1000000, fee(sol3), 'd'.repeat(88), 'D'.repeat(88), now - 10000);
   console.log('seeded test coins', mintUnfunded, mint);
 
   try {
@@ -146,6 +208,11 @@ async function main() {
     feed = await get('/api/coins?search=tcat');
     assert(feed.coins.length === 1 && feed.coins[0].ticker === 'TCAT', 'search finds the coin');
     assert(approx(funded.price, finalSol / finalTok), 'price = finalSol / finalTok');
+    assert(
+      approx(funded.marketCapSol, funded.price * 1000000000),
+      'feed market cap = price x 1B supply'
+    );
+    assert(approx(funded.totalFeesSol, totalFees), 'feed totalFeesSol sums the 1% trade fees');
 
     // ---------- 4. Prepare: rejections BEFORE any signing ----------
     console.log('prepare rejections:');
@@ -273,9 +340,14 @@ async function main() {
     const pnl = detail.walletPnl;
     assert(approx(pnl.holdings, halfA), `A holdings = half of first buy (${pnl.holdings.toFixed(0)})`);
     assert(approx(pnl.totalBuySol, 1.5), 'A totalBuySol is 1.5');
-    assert(approx(pnl.totalSellSol, solOut), 'A totalSellSol matches the sell');
+    // Sell proceeds are net of the 1% creator fee.
+    assert(approx(pnl.totalSellSol, solOut - fee(solOut)), 'A totalSellSol is net of the sell fee');
+    assert(
+      approx(pnl.totalFeesPaidSol, fee(1.5) + fee(solOut)),
+      'A totalFeesPaidSol sums the buy + sell fees'
+    );
     const avgCost = 1.5 / tok1;
-    const expectedRealized = solOut - avgCost * halfA;
+    const expectedRealized = solOut - fee(solOut) - avgCost * halfA;
     assert(
       approx(pnl.realizedPnlSol, expectedRealized),
       `A realized PnL = ${pnl.realizedPnlSol.toFixed(6)} SOL (expected ${expectedRealized.toFixed(6)})`
@@ -301,10 +373,264 @@ async function main() {
       'portfolio ROI matches'
     );
 
+    // ---------- 8. Creator fees, claims, follows, profiles ----------
+    console.log('creator fees + claims + follows + profiles:');
+    assert(detail.creatorFeePct === 1, 'detail reports a 1% creator fee');
+    assert(
+      approx(detail.stats.totalFeesSol, totalFees),
+      'detail stats totalFeesSol sums the 1% trade fees'
+    );
+    assert(
+      approx(detail.creatorFees.totalEarnedSol, totalFees),
+      'creatorFees earned = total fees'
+    );
+    assert(detail.creatorFees.totalClaimedSol === 0, 'creatorFees claimed starts at 0');
+    assert(
+      approx(detail.creatorFees.unclaimedSol, totalFees),
+      'creatorFees unclaimed = earned before any claim'
+    );
+    assert(
+      Array.isArray(detail.feeClaims) && detail.feeClaims.length === 0,
+      'no fee claims yet'
+    );
+    const sellRow = detail.trades.find((t) => t.side === 'sell');
+    assert(approx(sellRow.feeSol, fee(solOut)), 'trade rows carry their 1% fee');
+    assert(
+      approx(detail.stats.marketCapSol, detail.stats.price * 1000000000),
+      'detail market cap = price x 1B supply'
+    );
+
+    // Claim validation (the success path needs a funded pool — not testable
+    // here without devnet SOL, so only the guards are exercised).
+    const notCreator = await post(
+      `/api/coins/${mint}/claim-fees`,
+      { wallet: WALLET_B },
+      403
+    );
+    assert(/Hanya kreator/.test(notCreator.error), 'non-creator claim is 403');
+    const zeroClaim = await post(
+      `/api/coins/${mintUnfunded}/claim-fees`,
+      { wallet: WALLET_A },
+      400
+    );
+    assert(/Tidak ada fee/.test(zeroClaim.error), 'claiming 0 fees is 400');
+    const badClaimWallet = await post(
+      `/api/coins/${mint}/claim-fees`,
+      { wallet: 'not-an-address' },
+      400
+    );
+    assert(/tidak valid/.test(badClaimWallet.error), 'claim with invalid wallet is 400');
+
+    // Follows: signature verification + rules. The follower is a fresh
+    // throwaway wallet that can sign (WALLET_A/B private keys are unknown).
+    const follower = makeTestWallet();
+    const followMsg = `solpump:follow:${WALLET_A}`;
+    const selfFollow = await post(
+      '/api/follows',
+      {
+        followerWallet: WALLET_A,
+        followingWallet: WALLET_A,
+        action: 'follow',
+        message: `solpump:follow:${WALLET_A}`,
+        signature: follower.sign(`solpump:follow:${WALLET_A}`),
+      },
+      400
+    );
+    assert(/dirimu sendiri/.test(selfFollow.error), 'self-follow is 400');
+    const wrongMsg = await post(
+      '/api/follows',
+      {
+        followerWallet: follower.address,
+        followingWallet: WALLET_A,
+        action: 'follow',
+        message: 'solpump:follow:someone-else',
+        signature: follower.sign('solpump:follow:someone-else'),
+      },
+      401
+    );
+    assert(/tidak sesuai/.test(wrongMsg.error), 'follow with a mismatched message is 401');
+    const badFollowSig = await post(
+      '/api/follows',
+      {
+        followerWallet: follower.address,
+        followingWallet: WALLET_A,
+        action: 'follow',
+        message: followMsg,
+        signature: follower.sign(`solpump:unfollow:${WALLET_A}`),
+      },
+      401
+    );
+    assert(/tidak valid/.test(badFollowSig.error), 'follow with a wrong signature is 401');
+    const followed = await post('/api/follows', {
+      followerWallet: follower.address,
+      followingWallet: WALLET_A,
+      action: 'follow',
+      message: followMsg,
+      signature: follower.sign(followMsg),
+    });
+    assert(followed.following === true, 'valid signed follow succeeds');
+    assert(followed.followerCount === 1, 'followerCount is 1 after the follow');
+    // Idempotent: following again does not duplicate.
+    await post('/api/follows', {
+      followerWallet: follower.address,
+      followingWallet: WALLET_A,
+      action: 'follow',
+      message: followMsg,
+      signature: follower.sign(followMsg),
+    });
+    const lists = await get(`/api/follows/${follower.address}`);
+    assert(
+      lists.following.length === 1 && lists.following[0] === WALLET_A,
+      'following list contains the followed creator'
+    );
+    assert(lists.followerCount === 0, 'follower has no followers of their own');
+    const creatorLists = await get(`/api/follows/${WALLET_A}`);
+    assert(
+      creatorLists.followers.length === 1 && creatorLists.followers[0] === follower.address,
+      'creator followers list contains the follower'
+    );
+
+    // Creator profile aggregates coins, volume, fees, followers.
+    const profile = await get(`/api/creators/${WALLET_A}?viewer=${follower.address}`);
+    assert(profile.coins.length === 2, 'creator profile lists both coins');
+    assert(
+      approx(profile.totalVolumeSol, 1.5 + 0.5 + solOut + sol3),
+      'profile total volume sums all coins'
+    );
+    assert(approx(profile.totalFeesEarnedSol, totalFees), 'profile total fees earned');
+    assert(profile.totalFeesClaimedSol === 0, 'profile fees claimed starts at 0');
+    assert(profile.followerCount === 1, 'profile followerCount is 1');
+    assert(profile.isFollowing === true, 'viewer follows this creator');
+    assert(profile.isSelf === false, 'viewer is not the creator');
+    const fundedProfileCoin = profile.coins.find((c) => c.mintAddress === mint);
+    assert(
+      approx(fundedProfileCoin.feesUnclaimedSol, totalFees),
+      'profile coin carries its unclaimed fees'
+    );
+    const selfProfile = await get(`/api/creators/${WALLET_A}?viewer=${WALLET_A}`);
+    assert(selfProfile.isSelf === true, 'own profile reports isSelf');
+    assert(selfProfile.isFollowing === false, 'own profile reports isFollowing=false');
+
+    // Feed ?following= filter: only coins by followed creators.
+    const followingFeed = await get(`/api/coins?following=${follower.address}`);
+    assert(
+      followingFeed.coins.length === 2 &&
+        followingFeed.coins.every((c) => c.creatorWallet === WALLET_A),
+      'following feed shows only the followed creator coins'
+    );
+    const emptyFeed = await get(`/api/coins?following=${WALLET_B}`);
+    assert(emptyFeed.coins.length === 0, 'following feed is empty for a wallet following nobody');
+    const creatorFeed = await get(`/api/coins?creator=${WALLET_A}`);
+    assert(creatorFeed.coins.length === 2, 'creator feed filter lists the creator coins');
+
+    // Unfollow (signed) removes the follow.
+    const unfollowMsg = `solpump:unfollow:${WALLET_A}`;
+    const unfollowed = await post('/api/follows', {
+      followerWallet: follower.address,
+      followingWallet: WALLET_A,
+      action: 'unfollow',
+      message: unfollowMsg,
+      signature: follower.sign(unfollowMsg),
+    });
+    assert(unfollowed.following === false, 'valid signed unfollow succeeds');
+    assert(unfollowed.followerCount === 0, 'followerCount is 0 after the unfollow');
+    const afterUnfollow = await get(`/api/follows/${follower.address}`);
+    assert(afterUnfollow.following.length === 0, 'following list is empty after unfollow');
+
+    // ---------- 9. Callouts: verified buyers only, server-side entry ----------
+    console.log('callouts:');
+    const noBuyer = Keypair.generate().publicKey.toBase58();
+    const noBuyPost = await post(
+      `/api/coins/${mint}/callouts`,
+      { wallet: noBuyer, text: 'To the moon!' },
+      403
+    );
+    assert(/pernah membeli/.test(noBuyPost.error), 'wallet with no buy cannot post a callout (403)');
+    const tooLong = await post(
+      `/api/coins/${mint}/callouts`,
+      { wallet: WALLET_B, text: 'x'.repeat(281) },
+      400
+    );
+    assert(/280/.test(tooLong.error), 'callout over 280 chars is 400');
+    const emptyPost = await post(
+      `/api/coins/${mint}/callouts`,
+      { wallet: WALLET_B, text: '   ' },
+      400
+    );
+    assert(/kosong/.test(emptyPost.error), 'empty callout is 400');
+    const unknownCallout = await post(
+      `/api/coins/${Keypair.generate().publicKey.toBase58()}/callouts`,
+      { wallet: WALLET_B, text: 'Hi' },
+      404
+    );
+    assert(/tidak ditemukan/.test(unknownCallout.error), 'callout on unknown coin is 404');
+    // B's buys: 0.5 SOL for tok2 + sol3 for 1M tokens; B never sold.
+    const bEntry = (0.5 + sol3) / (tok2 + 1000000);
+    const bHoldings = tok2 + 1000000;
+    const currentPrice = finalSol / finalTok;
+    // A client-supplied entryPrice must be ignored: the server derives it
+    // from real trades.
+    const created = await post(
+      `/api/coins/${mint}/callouts`,
+      { wallet: WALLET_B, text: 'TCAT masih awal, kurva baru jalan!', entryPrice: 999 },
+      201
+    );
+    const c = created.callout;
+    assert(approx(c.entryPrice, bEntry), `callout entry price = avg buy price (${c.entryPrice})`);
+    assert(approx(c.holdingsAtPost, bHoldings), 'callout holdings = net holdings at posting');
+    assert(approx(c.currentPrice, currentPrice), 'callout current price matches the coin price');
+    assert(
+      approx(c.pnlSol, (currentPrice - bEntry) * bHoldings),
+      'callout live PnL (SOL) = (current - entry) x holdings'
+    );
+    assert(
+      approx(c.pnlPct, ((currentPrice - bEntry) / bEntry) * 100),
+      'callout live PnL (%) = price move vs entry'
+    );
+    const coinCallouts = await get(`/api/coins/${mint}/callouts`);
+    assert(
+      coinCallouts.callouts.length === 1 && coinCallouts.callouts[0].id === c.id,
+      'coin callouts endpoint lists the new callout'
+    );
+    const detail2 = await get(`/api/coins/${mint}`);
+    assert(
+      detail2.callouts.length === 1 && detail2.callouts[0].text.includes('masih awal'),
+      'coin detail includes the callout'
+    );
+    const profileB = await get(`/api/creators/${WALLET_B}`);
+    assert(
+      profileB.callouts.length === 1 && profileB.callouts[0].coinTicker === 'TCAT',
+      'creator profile lists the trader callout with its coin'
+    );
+    // Following feed: callouts from followed traders only.
+    const followBMsg = `solpump:follow:${WALLET_B}`;
+    await post('/api/follows', {
+      followerWallet: follower.address,
+      followingWallet: WALLET_B,
+      action: 'follow',
+      message: followBMsg,
+      signature: follower.sign(followBMsg),
+    });
+    const followingCallouts = await get(`/api/callouts?following=${follower.address}`);
+    assert(
+      followingCallouts.callouts.length === 1 && followingCallouts.callouts[0].id === c.id,
+      'following callouts feed shows the followed trader callout'
+    );
+    const otherCallouts = await get(`/api/callouts?following=${WALLET_A}`);
+    assert(otherCallouts.callouts.length === 0, 'following feed is empty when nobody followed posts');
+
     console.log('\nALL E2E CHECKS PASSED');
   } finally {
     db.prepare('DELETE FROM trades WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
+    db.prepare('DELETE FROM fee_claims WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
+    db.prepare('DELETE FROM callouts WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
     db.prepare('DELETE FROM coins WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
+    db.prepare('DELETE FROM follows WHERE follower_wallet = ? OR following_wallet = ?').run(
+      WALLET_A, WALLET_A
+    );
+    db.prepare('DELETE FROM follows WHERE follower_wallet = ? OR following_wallet = ?').run(
+      WALLET_B, WALLET_B
+    );
     const left = db.prepare('SELECT COUNT(*) AS n FROM coins').get().n;
     console.log(`test data cleaned; coins remaining in DB: ${left}`);
     db.close();

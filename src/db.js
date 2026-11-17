@@ -64,6 +64,51 @@ db.exec(`
     error TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
+
+  -- Creator-fee claims: real devnet SOL the pool paid out to a coin's
+  -- creator from accrued 1% trade fees (one row per claim, with the
+  -- pool's payout transaction signature).
+  CREATE TABLE IF NOT EXISTS fee_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+    creator_wallet TEXT NOT NULL,
+    amount_sol REAL NOT NULL,
+    tx_signature TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_fee_claims_mint ON fee_claims (mint_address, created_at);
+
+  -- Social follows, keyed by wallet address. A follow is only stored
+  -- after the follower proves wallet ownership by signing a message
+  -- (see src/signverify.js); a wallet cannot follow itself.
+  CREATE TABLE IF NOT EXISTS follows (
+    follower_wallet TEXT NOT NULL,
+    following_wallet TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (follower_wallet, following_wallet)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_follows_following ON follows (following_wallet);
+
+  -- Callouts: short trade calls (max 280 chars) attached to a coin. Only a
+  -- wallet with a real BUY record for the coin may post one — verified
+  -- server-side from the trades table. entry_price (average buy price) and
+  -- holdings_at_post are computed server-side from real trades at posting
+  -- time and never taken from the client; live PnL is derived from them
+  -- against the current price at read time.
+  CREATE TABLE IF NOT EXISTS callouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+    wallet TEXT NOT NULL,
+    text TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    holdings_at_post REAL NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_callouts_mint ON callouts (mint_address, created_at);
+  CREATE INDEX IF NOT EXISTS idx_callouts_wallet ON callouts (wallet, created_at);
 `);
 
 // Lightweight migrations for databases created before these columns existed.
@@ -84,6 +129,9 @@ if (!hasColumn('trades', 'user_tx_signature')) {
 }
 if (!hasColumn('trades', 'pool_tx_signature')) {
   db.exec('ALTER TABLE trades ADD COLUMN pool_tx_signature TEXT');
+}
+if (!hasColumn('trades', 'fee_sol')) {
+  db.exec('ALTER TABLE trades ADD COLUMN fee_sol REAL NOT NULL DEFAULT 0');
 }
 // Replay protection: one user transaction can only settle one trade.
 db.exec(
