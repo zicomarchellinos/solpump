@@ -6,6 +6,12 @@ Pembuat coin kripto ala [pump.fun](https://pump.fun) di **Solana devnet**.
 - **Feed coin** yang bisa dicari dan diurutkan, dengan statistik pasar.
 - **Halaman detail coin**: bukti on-chain (alamat mint + transaksi, tautan ke Solana Explorer), grafik harga (area chart dengan sumbu waktu asli dan filter rentang), statistik harga, dan progres kurva bonding.
 - **Trading ASLI di devnet** lewat dompet pool kustodian (lihat di bawah): panel beli/jual dengan harga bonding-curve constant-product, riwayat transaksi yang bisa difilter lengkap dengan tautan kedua transaksi on-chain, kartu Profit/Loss per coin (metode average-cost), dan halaman **Portofolio Saya** yang merangkum total PnL semua coin. Saldo SOL dan token di UI dibaca langsung dari devnet RPC, bukan dari database lokal.
+- **Burn**: pemegang coin bisa membakar tokennya (transaksi SPL burn asli via Phantom, diverifikasi on-chain). Burn mengurangi cadangan token kurva, jadi harga naik; halaman coin menampilkan total burn, riwayat burn, suplai beredar (1B dikurangi total burn), dan pratinjau efek harga.
+- **Grafik candlestick**: toggle Area/Candles di halaman coin, candle OHLC dari trade tercatat dengan timeframe 1m/5m/15m/1h, volume bar, harga USD desimal biasa.
+- **Deposit & transfer**: halaman portofolio menampilkan alamat deposit dompet sendiri (dengan QR code, library QR di-vendor lokal) + transfer masuk on-chain terbaru; coin bisa dikirim ke alamat Solana mana pun (transfer SPL asli via Phantom, diverifikasi on-chain, riwayat kirim/terima di portofolio).
+- **Custom pair**: saat membuat coin, kreator memilih aset pair — SOL (default) atau coin lain yang sudah ada di registry situs. Trading, fee kreator, dan PnL berdenominasi aset pair; harga USD dihitung lewat rantai pair menuju SOL (maks 5 hop, deteksi siklus). Kalau coin pair hilang dari registry, trading coin tersebut nonaktif dengan penjelasan, bukan crash.
+- **Profil yang bisa diedit**: satu dompet bisa membuat banyak coin; di halaman profil sendiri, pemilik bisa mengatur username (3–20 karakter, unik tanpa membedakan huruf besar/kecil), foto profil, border avatar (6 preset), dan cover banner. Edit dibuktikan dengan tanda tangan Phantom `signMessage` (Ed25519, diverifikasi server) — tanpa tanda tangan tidak bisa edit. Username/foto/border tampil di kartu coin, callout, daftar pengikut, dan halaman profil.
+- **Tiga bahasa**: Indonesia (default), English, dan 简体中文, dengan switcher di header yang tersimpan di localStorage. Semua teks UI lewat kamus `public/i18n.js` (436 kunci per bahasa); format angka tetap seperti semula di semua bahasa.
 
 Nama, ticker, dan logo coin tersimpan di registry situs ini (SQLite) — mint on-chain-nya adalah token SPL standar tanpa metadata Metaplex.
 
@@ -29,7 +35,7 @@ Tidak ada program on-chain kustom — trading memakai **dompet pool kustodian** 
 Harga token dan market cap ditampilkan dalam USD, ala pump.fun — pasangannya tetap **TICKER/SOL**, dan semua jumlah yang benar-benar berpindah (input beli/jual, jumlah diterima, saldo pool, fee kreator) tetap dalam SOL.
 
 - **Harga token**: harga SOL dari kurva bonding × kurs SOL/USD, ditampilkan desimal biasa tanpa notasi ilmiah (mis. `$0.000005`).
-- **Market cap**: harga × kurs SOL/USD × 1.000.000.000 (suplai total), dengan sufiks ringkas: `$5K`, `$500K`, `$5M`, `$50M`, `$500M`, `$5B`.
+- **Market cap**: harga × kurs SOL/USD × suplai beredar (1.000.000.000 dikurangi total token yang diburn), dengan sufiks ringkas: `$5K`, `$500K`, `$5M`, `$50M`, `$500M`, `$5B`. Untuk pair coin, harga USD = harga dalam aset pair × harga USD aset pair (dihitung lewat rantai pair menuju SOL); kalau rantai tidak bisa dihitung, harga tampil dalam aset pair saja.
 - **Kurs SOL/USD** diambil server dari API harga publik tanpa API key (Jupiter lite price API utama, CoinGecko sebagai cadangan), di-cache 60 detik di server (`src/solprice.js`), dan disertakan di respons API (`solUsd` + field `*Usd`). Kalau semua sumber harga tidak bisa dijangkau, server memakai harga terakhir yang ter-cache; kalau belum pernah ada harga sama sekali, UI kembali menampilkan SOL (tidak pernah crash atau NaN).
 - **Market cap awal ≈ $5.000**: cadangan virtual 55 SOL dipilih agar coin baru mulai di sekitar $5K — market cap awal = 55 SOL × (1B / 800M) = 68,75 SOL ≈ **$5.008** pada kurs ~$72,85 (17 Nov 2026). Angka ini kira-kira saja karena kurs SOL/USD bergerak; kalau SOL bergerak jauh, setel ulang `VIRTUAL_SOL` di `src/bonding.js` dengan rumus `5000 / (1,25 × kurs SOL/USD)`.
 
@@ -65,10 +71,10 @@ npm run build
 
 ```bash
 npm start            # di satu terminal (port 3000, atau PORT=3100)
-npm run test:e2e     # API: matematika bonding-curve, PnL, penolakan prepare (pool habis / trading nonaktif), penolakan tanda tangan palsu, penolakan mint palsu
-npm run test:ui      # UI: feed, detail coin + grafik, portofolio, form buat coin (jsdom)
+npm run test:e2e     # API: matematika bonding-curve, PnL, penolakan prepare (pool habis / trading nonaktif), penolakan tanda tangan palsu, penolakan mint palsu, burn, candle, transfer, custom pair, multi-coin per dompet, profil (username unik, tanda tangan)
+npm run test:ui      # UI: feed, detail coin + grafik/candle/burn/transfer, portofolio + deposit, form buat coin + pair picker, switcher bahasa (3 bahasa), profil + edit form (jsdom)
 npm run test:mint    # simulasi transaksi mint di devnet (tanpa dompet, tanpa biaya)
-npm run test:mint-flow  # kode klien persis (public/solana.js): deteksi Phantom, genesis devnet, konstruksi tx mint/funding/beli/jual
+npm run test:mint-flow  # kode klien persis (public/solana.js): deteksi Phantom, genesis devnet, konstruksi tx mint/funding/beli/jual/burn/transfer/pair-buy
 ```
 
 `test:e2e` dan `test:ui` butuh server berjalan dan membersihkan data ujinya sendiri. `test:mint` dan `test:mint-flow` membuktikan resep mint melawan devnet sungguhan lewat `simulateTransaction` — tidak ada transaksi nyata yang dikirim. Langkah tanda tangan Phantom sendiri tidak bisa diuji di sini (tidak ada ekstensi dompet).
@@ -90,15 +96,17 @@ npm run test:mint-flow  # kode klien persis (public/solana.js): deteksi Phantom,
 
 ```
 server.js            entry point Express (API + frontend statis)
-src/db.js            skema SQLite (coins, trades, meta, failed_trades)
-src/bonding.js       matematika bonding-curve + PnL (average-cost)
+src/db.js            skema SQLite (coins, trades, meta, failed_trades, burns, transfers, profiles, follows, callouts, fee_claims)
+src/bonding.js       matematika bonding-curve + PnL (average-cost) + burn + candle
+src/pairs.js         registry aset pair + resolusi harga USD lewat rantai pair
+src/signverify.js    verifikasi tanda tangan Ed25519 (follow + edit profil)
 src/solprice.js      kurs SOL/USD (Jupiter/CoinGecko, cache 60 detik)
 src/rpc.js           koneksi devnet RPC bersama + retry
 src/pool.js          keypair pool wallet + transfer SOL/token dari pool
-src/verify.js        verifikasi on-chain via devnet RPC (mint, funding, transfer)
+src/verify.js        verifikasi on-chain via devnet RPC (mint, funding, transfer, burn)
 src/routes.js        endpoint API
 src/browser-entry.js entry point bundle browser (esbuild)
-public/              frontend (index.html, app.js, solana.js, styles.css)
+public/              frontend (index.html, app.js, solana.js, i18n.js, styles.css, vendor/qrcode.js)
 test/                skrip uji
 ```
 
@@ -109,13 +117,29 @@ test/                skrip uji
 | `GET /api/pool` | Alamat dompet pool (publik) |
 | `GET /api/sol-price` | Kurs SOL/USD saat ini (cache 60 detik; null kalau belum pernah ada harga) |
 | `GET /api/coins?search=&sort=` | Daftar coin + statistik pasar |
-| `GET /api/coins/:mint?wallet=` | Detail coin: chart, statistik, trade, PnL dompet |
-| `GET /api/portfolio?wallet=` | Portofolio satu dompet |
+| `GET /api/coins/:mint?wallet=` | Detail coin: chart, statistik, trade, PnL dompet, burn, callout |
+| `GET /api/coins/:mint/candles?timeframe=` | Candle OHLC (1m/5m/15m/1h, default 5m) |
+| `GET /api/coins/:mint/burns` | Riwayat burn + total burn/suplai beredar |
+| `GET /api/pairs` | Aset pair yang tersedia (SOL + coin terdaftar) |
+| `GET /api/portfolio?wallet=` | Portofolio satu dompet (+ riwayat transfer) |
+| `GET /api/deposits?wallet=` | Transfer masuk on-chain terbaru ke dompet itu |
+| `GET /api/transfers?wallet=` | Riwayat transfer (kirim + terima) |
+| `POST /api/transfers` | Catat transfer setelah verifikasi on-chain |
 | `POST /api/trades/prepare` | Kuotasi + pra-pemeriksaan saldo pool/pengguna (sebelum tanda tangan) |
-| `POST /api/trades/buy` | Selesaikan beli setelah transfer SOL pengguna terverifikasi on-chain |
+| `POST /api/trades/buy` | Selesaikan beli setelah transfer SOL/pair-token pengguna terverifikasi on-chain |
 | `POST /api/trades/sell` | Selesaikan jual setelah transfer token pengguna terverifikasi on-chain |
-| `POST /api/coins/register` | Daftarkan coin setelah verifikasi mint (+ funding) on-chain |
+| `POST /api/coins/register` | Daftarkan coin setelah verifikasi mint (+ funding) on-chain; `pairMint` opsional |
 | `POST /api/coins/:mint/fund` | Aktifkan trading dengan memverifikasi transfer funding belakangan |
+| `POST /api/coins/:mint/burn` | Catat burn setelah verifikasi on-chain (menaikkan harga) |
+| `POST /api/coins/:mint/claim-fees` | Kreator klaim fee 1% (SOL atau pair token) |
+| `GET /api/creators/:wallet` | Profil kreator: coin, volume, fee, pengikut, callout, profil editable |
+| `GET /api/follows/:wallet` | Daftar pengikut + mengikuti (+ profil mereka) |
+| `POST /api/follows` | Follow/unfollow (dibuktikan tanda tangan) |
+| `GET /api/profiles/:wallet` | Profil editable satu dompet (atau null) |
+| `POST /api/profiles/:wallet` | Edit profil (dibuktikan tanda tangan; username unik) |
+| `GET /api/coins/:mint/callouts` | Callout untuk satu coin |
+| `POST /api/coins/:mint/callouts` | Posting callout (hanya pembeli terverifikasi) |
+| `GET /api/callouts` | Callout terbaru (semua coin / yang diikuti) |
 
 ## Catatan
 

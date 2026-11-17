@@ -42,15 +42,66 @@ function currentPrice(coin) {
   return coin.sol_reserve / coin.token_reserve;
 }
 
-function marketCapSol(coin) {
-  return currentPrice(coin) * TOTAL_SUPPLY;
+// Circulating supply: the 1B total supply minus everything holders have
+// burned (burns are permanent — burned tokens leave the supply forever).
+// Market cap is priced on the CIRCULATING supply, not the original 1B:
+// a coin with 100M burned has 900M tokens left, so its market cap is
+// price x 900M. With zero burns this is exactly the old 1B formula.
+function circulatingSupply(totalBurned = 0) {
+  return Math.max(0, TOTAL_SUPPLY - (Number(totalBurned) || 0));
 }
 
-// Market cap in USD: price (SOL) x SOL/USD x 1B supply. Returns null when
-// no SOL price is available (the caller then falls back to SOL).
-function marketCapUsd(coin, solUsd) {
-  if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
-  return marketCapSol(coin) * solUsd;
+function marketCapSol(coin, totalBurned = 0) {
+  return currentPrice(coin) * circulatingSupply(totalBurned);
+}
+
+// Market cap in USD: price (pair asset) x USD price of one unit of the
+// pair asset x circulating supply. Returns null when no price is available
+// (the caller then falls back to the pair asset).
+function marketCapUsd(coin, assetUsd, totalBurned = 0) {
+  if (!Number.isFinite(assetUsd) || assetUsd <= 0) return null;
+  return marketCapSol(coin, totalBurned) * assetUsd;
+}
+
+// Burn price effect: burning tokens removes them from the curve's token
+// reserve, so price = sol_reserve / token_reserve goes UP — that is the
+// whole point of the burn mechanism. Returns null when the burn would
+// empty the reserve (the reserve must stay positive).
+function priceAfterBurn(coin, burnAmount) {
+  const remaining = coin.token_reserve - burnAmount;
+  if (!(burnAmount > 0) || remaining <= 0) return null;
+  return coin.sol_reserve / remaining;
+}
+
+function burnPriceEffect(coin, burnAmount) {
+  const newPrice = priceAfterBurn(coin, burnAmount);
+  if (newPrice === null) return null;
+  const price = currentPrice(coin);
+  return { newPrice, pctChange: ((newPrice - price) / price) * 100 };
+}
+
+// Candlestick aggregation (OHLC per time bucket) from chart points
+// (launch point + trades + burns, chronological). `points` carry t (ms),
+// price, and amount (pair-asset volume of that event; 0 for the launch
+// point and for burns, which move the price without trading volume).
+// Empty buckets produce NO candle — never a zero candle — so sparse trade
+// data renders as gaps, not flat lines at zero.
+function buildCandles(points, timeframeMs) {
+  const buckets = new Map(); // bucketStartMs -> candle
+  for (const p of points) {
+    const start = Math.floor(p.t / timeframeMs) * timeframeMs;
+    let c = buckets.get(start);
+    if (!c) {
+      c = { t: start, open: p.price, high: p.price, low: p.price, close: p.price, volume: 0, count: 0 };
+      buckets.set(start, c);
+    }
+    if (p.price > c.high) c.high = p.price;
+    if (p.price < c.low) c.low = p.price;
+    c.close = p.price;
+    c.volume += Number(p.amount) || 0;
+    c.count += 1;
+  }
+  return [...buckets.values()].sort((a, b) => a.t - b.t);
 }
 
 // Compact USD formatting, pump.fun style: $5K, $500K, $5M, $50M, $500M,
@@ -110,10 +161,15 @@ function quoteSellTokensForSol(coin, solOut) {
 }
 
 // Market stats derived from the trade history. `trades` must be in
-// chronological order (oldest first). Pass the current SOL/USD price to
-// include the USD fields (priceUsd, marketCapUsd, highUsd, lowUsd); they
-// stay null when no price is given.
-function computeStats(coin, trades, solUsd = null) {
+// chronological order (oldest first). Pass the USD price of one unit of
+// the pair asset (SOL/USD for SOL pairs, the pair coin's USD token price
+// for coin pairs — see src/pairs.js) to include the USD fields
+// (priceUsd, marketCapUsd, highUsd, lowUsd); they stay null when no price
+// is given. `totalBurned` feeds the circulating-supply market cap.
+// NOTE: volumeSol / totalFeesSol are denominated in the PAIR ASSET
+// (SOL for SOL pairs, pair tokens for coin pairs) — the field names are
+// historical, the values follow the pair.
+function computeStats(coin, trades, assetUsd = null, totalBurned = 0) {
   const price = currentPrice(coin);
   const changePct = ((price - INITIAL_PRICE) / INITIAL_PRICE) * 100;
   let high = INITIAL_PRICE;
@@ -128,12 +184,12 @@ function computeStats(coin, trades, solUsd = null) {
     totalFeesSol += t.fee_sol || 0;
     traders.add(t.wallet);
   }
-  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
+  const toUsd = (sol) => (Number.isFinite(assetUsd) && assetUsd > 0 ? sol * assetUsd : null);
   return {
     price,
     priceUsd: toUsd(price),
-    marketCapSol: marketCapSol(coin),
-    marketCapUsd: marketCapUsd(coin, solUsd),
+    marketCapSol: marketCapSol(coin, totalBurned),
+    marketCapUsd: marketCapUsd(coin, assetUsd, totalBurned),
     changePct,
     high,
     highUsd: toUsd(high),
@@ -144,21 +200,31 @@ function computeStats(coin, trades, solUsd = null) {
     txCount: trades.length,
     uniqueTraders: traders.size,
     progressPct: curveProgressPct(coin),
+    totalBurned: Number(totalBurned) || 0,
+    circulatingSupply: circulatingSupply(totalBurned),
   };
 }
 
 // Chart points: one point per trade plus a launch point at the initial price.
-// `trades` must be in chronological order (oldest first). Pass the current
-// SOL/USD price to include priceUsd per point (for the tooltip); it stays
-// null when no price is given.
-function chartPoints(coin, trades, solUsd = null) {
-  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
+// `trades` must be in chronological order (oldest first). Pass the USD
+// price of one unit of the pair asset to include priceUsd per point (for
+// the tooltip); it stays null when no price is given. Burns are merged in
+// as price points (side 'burn', zero volume — a burn moves the price
+// without trading volume) so the chart reflects the post-burn price; each
+// burn carries its recorded price_after. Points also carry `amount`
+// (pair-asset volume of the event) for the candlestick aggregation.
+function chartPoints(coin, trades, assetUsd = null, burns = []) {
+  const toUsd = (sol) => (Number.isFinite(assetUsd) && assetUsd > 0 ? sol * assetUsd : null);
   const points = [
-    { t: coin.created_at, price: INITIAL_PRICE, priceUsd: toUsd(INITIAL_PRICE), side: null },
+    { t: coin.created_at, price: INITIAL_PRICE, priceUsd: toUsd(INITIAL_PRICE), side: null, amount: 0 },
   ];
   for (const t of trades) {
-    points.push({ t: t.created_at, price: t.price, priceUsd: toUsd(t.price), side: t.side });
+    points.push({ t: t.created_at, price: t.price, priceUsd: toUsd(t.price), side: t.side, amount: t.sol_amount });
   }
+  for (const b of burns) {
+    points.push({ t: b.created_at, price: b.price_after, priceUsd: toUsd(b.price_after), side: 'burn', amount: 0 });
+  }
+  points.sort((a, b) => a.t - b.t || (a.side === null ? -1 : 1));
   return points;
 }
 
@@ -170,12 +236,13 @@ function chartPoints(coin, trades, solUsd = null) {
 // creator fee is part of what they paid, so the cost basis is the full
 // amount); on a sell the trader actually received sol_amount - fee_sol,
 // so realized PnL and totalSellSol use the NET proceeds.
-// Pass the current SOL/USD price to also get the USD figures
+// Amounts are denominated in the PAIR ASSET (SOL for SOL pairs, pair
+// tokens for coin pairs) — the field names are historical. Pass the USD
+// price of one unit of the pair asset to also get the USD figures
 // (avgBuyPriceUsd, costBasisUsd, currentValueUsd, realized/unrealized/
-// total PnL in USD) — the SOL figures converted at the current rate,
-// which is the same as computing them from USD prices at that rate.
-// The USD fields are null when no price is given.
-function computePnl(trades, price, solUsd = null) {
+// total PnL in USD) — the pair-asset figures converted at the current
+// rate. The USD fields are null when no price is given.
+function computePnl(trades, price, assetUsd = null) {
   let holdings = 0;
   let cost = 0; // cost basis of the current holdings
   let realized = 0;
@@ -208,7 +275,7 @@ function computePnl(trades, price, solUsd = null) {
   const unrealized = currentValue - cost;
   const totalPnl = realized + unrealized;
   const roiPct = totalBuySol > 0 ? (totalPnl / totalBuySol) * 100 : 0;
-  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
+  const toUsd = (sol) => (Number.isFinite(assetUsd) && assetUsd > 0 ? sol * assetUsd : null);
   return {
     holdings,
     avgBuyPrice,
@@ -245,9 +312,13 @@ module.exports = {
   creatorFeeSol,
   INITIAL_PRICE,
   currentPrice,
+  circulatingSupply,
   marketCapSol,
   marketCapUsd,
   fmtMarketCapUsd,
+  priceAfterBurn,
+  burnPriceEffect,
+  buildCandles,
   curveProgressPct,
   quoteBuy,
   quoteSell,

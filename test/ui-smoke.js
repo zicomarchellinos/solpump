@@ -64,9 +64,17 @@ async function main() {
     `INSERT INTO callouts (mint_address, wallet, text, entry_price, holdings_at_post, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
   ).run(mint, WALLET_A, 'SMOKE masih awal, gas!', 2.0 / (tok1 + tok2), tok1 + tok2, now - 5000);
+  // Editable profile for the creator: username + gold border + photo +
+  // cover (the image files need not exist — the test asserts the rendered
+  // img src attributes, not that the images load).
+  db.prepare(
+    `INSERT INTO profiles (wallet, username, avatar_url, border, cover_url, updated_at)
+     VALUES (?, 'smokecat', '/uploads/smoke-avatar.png', 'gold', '/uploads/smoke-cover.png', ?)`
+  ).run(WALLET_A, now);
   console.log('seeded smoke coin', mint);
 
   let dom;
+  let dom2;
   try {
     dom = await JSDOM.fromURL(`${BASE}/`, {
       resources: 'usable',
@@ -144,6 +152,10 @@ async function main() {
     assert(document.querySelector('.coin-card .coin-desc'), 'coin card shows the description');
     const cardText = document.querySelector('.coin-card').textContent;
     assert(cardText.includes('SMOKE/SOL'), 'coin card shows the TICKER/SOL pair label');
+    assert(
+      cardText.includes('smokecat'),
+      'coin card shows the creator username instead of the bare address'
+    );
     assert(cardText.includes('mnt lalu'), 'coin card shows the time since creation');
     if (expPrice) {
       assert(cardText.includes(expPrice), `coin card shows the USD price (${expPrice})`);
@@ -199,6 +211,68 @@ async function main() {
     }, 15000, 'pool address in footer');
     assert(poolAddr.includes('…'), `footer shows pool address (${poolAddr.trim()})`);
     assert(document.body.textContent.includes('dompet pool kustodian'), 'footer discloses the custodial pool wallet');
+
+    // Language switcher: default is Indonesian; switching changes the
+    // visible strings in all three languages and persists in localStorage.
+    const navLabels = () =>
+      [...document.querySelectorAll('.nav a .nav-label')].map((el) => el.textContent.trim());
+    assert(
+      JSON.stringify(navLabels()) === JSON.stringify(['Beranda', 'Buat Coin', 'Portofolio Saya']),
+      `default language is Indonesian (nav: ${navLabels().join(' / ')})`
+    );
+    assert(document.querySelector('#langBox'), 'language switcher renders in the topbar');
+    assert(
+      document.querySelectorAll('#langBox .lang-btn').length === 3,
+      'language switcher has ID / EN / 中文 buttons'
+    );
+    assert(
+      document.querySelector('#langBox .lang-btn.active').dataset.lang === 'id',
+      'ID is the active language by default'
+    );
+    document.querySelector('#langBox .lang-btn[data-lang="en"]').click();
+    await waitFor(
+      () => navLabels()[0] === 'Home',
+      15000,
+      'nav labels switch to English'
+    );
+    assert(
+      JSON.stringify(navLabels()) === JSON.stringify(['Home', 'Create Coin', 'My Portfolio']),
+      `English nav labels render (${navLabels().join(' / ')})`
+    );
+    assert(
+      window.localStorage.getItem('solpump-lang') === 'en',
+      'language choice persists in localStorage (en)'
+    );
+    assert(
+      document.querySelector('#langBox .lang-btn.active').dataset.lang === 'en',
+      'EN is the active language after switching'
+    );
+    document.querySelector('#langBox .lang-btn[data-lang="zh"]').click();
+    await waitFor(
+      () => navLabels()[0] === '首页',
+      15000,
+      'nav labels switch to Chinese'
+    );
+    assert(
+      JSON.stringify(navLabels()) === JSON.stringify(['首页', '创建代币', '我的投资组合']),
+      `Chinese nav labels render (${navLabels().join(' / ')})`
+    );
+    assert(
+      window.localStorage.getItem('solpump-lang') === 'zh',
+      'language choice persists in localStorage (zh)'
+    );
+    // Back to Indonesian for the rest of the test (which asserts
+    // Indonesian strings), and wait for the feed to re-render.
+    document.querySelector('#langBox .lang-btn[data-lang="id"]').click();
+    await waitFor(
+      () => navLabels()[0] === 'Beranda' && document.querySelector('.coin-card'),
+      15000,
+      'nav labels switch back to Indonesian + feed re-renders'
+    );
+    assert(
+      window.localStorage.getItem('solpump-lang') === 'id',
+      'language choice persists in localStorage (id)'
+    );
 
     // Coin detail: chart, stats, trade panel, PnL prompt, trades table.
     window.location.hash = `#/coin/${mint}`;
@@ -272,7 +346,10 @@ async function main() {
     );
     // Callouts: the seeded callout renders with its verified-buyer marker.
     assert(document.querySelector('#calloutsCard'), 'callouts section renders');
-    assert(document.querySelector('.callout-avatar'), 'callout shows the trader avatar');
+    assert(
+      document.querySelector('#calloutsCard img.profile-avatar-img, #calloutsCard .coin-avatar'),
+      'callout shows the trader avatar'
+    );
     assert(
       document.body.textContent.includes('Pembeli terverifikasi'),
       'callout shows the verified-buyer marker'
@@ -285,6 +362,97 @@ async function main() {
     const bodyText = document.body.textContent;
     assert(!bodyText.includes('×10'), 'detail page has no ×10^ scientific notation');
     assert(!/\de[-+]\d/.test(bodyText), 'detail page has no e-notation prices');
+
+    // Burn section: card with totals + history (empty) + connect prompt
+    // (no wallet here); circulating supply shows 1B with zero burns.
+    assert(document.querySelector('#burnCard'), 'burn section renders on the coin detail');
+    assert(
+      document.querySelector('#burnCard').textContent.includes('Total Burn'),
+      'burn card shows the total burned stat'
+    );
+    assert(
+      document.querySelector('#burnCard').textContent.includes('1.000.000.000'),
+      'burn card shows the 1B circulating supply with zero burns'
+    );
+    assert(document.querySelector('#burnHistory'), 'burn history container renders');
+    assert(
+      document.querySelector('#burnHistory').textContent.includes('Belum ada burn'),
+      'burn history shows the empty state'
+    );
+    assert(
+      document.querySelector('#burnForm').textContent.includes('Hubungkan dompet'),
+      'burn form asks to connect a wallet first'
+    );
+    // Transfer card (coin detail): connect prompt without a wallet.
+    assert(document.querySelector('#transferCard'), 'transfer section renders on the coin detail');
+    assert(
+      document.querySelector('#transferCard').textContent.includes('Hubungkan dompet'),
+      'transfer form asks to connect a wallet first'
+    );
+    // Candlestick chart: Area/Candles toggle + timeframe pills; switching
+    // to candles renders real candles from the seeded trades.
+    assert(document.querySelector('[data-chart-type="area"]'), 'area chart toggle renders');
+    assert(document.querySelector('[data-chart-type="candles"]'), 'candles chart toggle renders');
+    assert(
+      document.querySelector('[data-chart-type="area"].active'),
+      'area chart is active by default'
+    );
+    document.querySelector('[data-chart-type="candles"]').click();
+    await waitFor(
+      () => document.querySelector('#chartSvg g[data-candle]'),
+      15000,
+      'candlesticks render'
+    );
+    assert(
+      document.querySelectorAll('#chartSvg g[data-candle]').length >= 1,
+      'candlestick chart shows at least one candle from the seeded trades'
+    );
+    assert(
+      document.querySelector('[data-timeframe="1m"]') &&
+        document.querySelector('[data-timeframe="5m"]') &&
+        document.querySelector('[data-timeframe="15m"]') &&
+        document.querySelector('[data-timeframe="1h"]'),
+      'timeframe pills render (1m / 5m / 15m / 1h)'
+    );
+    assert(
+      document.querySelector('[data-timeframe="5m"].active'),
+      '5m is the default candle timeframe'
+    );
+    document.querySelector('[data-timeframe="1m"]').click();
+    await waitFor(
+      () => document.querySelector('[data-timeframe="1m"].active'),
+      15000,
+      '1m timeframe activates'
+    );
+    await waitFor(
+      () => document.querySelector('#chartSvg g[data-candle]'),
+      15000,
+      'candlesticks re-render at 1m'
+    );
+    assert(true, 'candlesticks re-render after switching timeframe');
+    // Back to the area chart.
+    document.querySelector('[data-chart-type="area"]').click();
+    await waitFor(
+      () => document.querySelector('#chartSvg path') && !document.querySelector('#chartSvg g[data-candle]'),
+      15000,
+      'area chart renders again'
+    );
+    assert(true, 'area chart renders again after switching back');
+    // Callout shows the author's username + photo avatar + gold ring.
+    const calloutCard = document.querySelector('#calloutsCard');
+    assert(
+      calloutCard.textContent.includes('smokecat'),
+      'callout shows the author username'
+    );
+    const calloutAvatar = calloutCard.querySelector('img.profile-avatar-img');
+    assert(
+      calloutAvatar && calloutAvatar.getAttribute('src') === '/uploads/smoke-avatar.png',
+      'callout shows the author photo avatar'
+    );
+    assert(
+      calloutAvatar && calloutAvatar.classList.contains('avatar-ring-gold'),
+      'callout avatar carries the gold border ring'
+    );
 
     // Portfolio (no wallet connected): connect prompt renders.
     window.location.hash = '#/portfolio';
@@ -337,12 +505,193 @@ async function main() {
       document.body.textContent.includes('Phantom harus di jaringan Devnet'),
       'create form reminds that Phantom must be on Devnet'
     );
+    // Pair picker: SOL (default) + a searchable list of listed site coins.
+    assert(document.querySelector('#pairPicker'), 'pair picker renders on the create form');
+    assert(document.querySelector('#pairSearch'), 'pair picker has a search input');
+    assert(
+      document.querySelector('input[name="pairAsset"][value=""]:checked'),
+      'SOL is the default pair asset'
+    );
+    await waitFor(
+      () => document.querySelector('#pairList').textContent.includes('$SMOKE'),
+      15000,
+      'pair list loads the listed SMOKE coin'
+    );
+    assert(
+      document.querySelector('#pairList .pair-option input[value="' + mint + '"]'),
+      'pair list offers the seeded coin as a pair option'
+    );
+    // Searching filters the pair list; a non-matching query empties it.
+    const pairSearch = document.getElementById('pairSearch');
+    pairSearch.value = 'zzz-no-such-coin';
+    pairSearch.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await waitFor(
+      () => document.querySelector('#pairList').textContent.includes('Belum ada coin lain'),
+      15000,
+      'pair search with no match shows the empty state'
+    );
+    assert(true, 'pair search filters to the empty state on no match');
+    pairSearch.value = 'smoke';
+    pairSearch.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await waitFor(
+      () => document.querySelector('#pairList').textContent.includes('$SMOKE'),
+      15000,
+      'pair search finds the coin again'
+    );
+    assert(true, 'pair search finds the coin by ticker');
+
+    // Creator profile (no wallet connected): username, photo avatar with
+    // ring, cover banner — and NO edit form for a non-owner.
+    window.location.hash = `#/creator/${WALLET_A}`;
+    window.dispatchEvent(new window.HashChangeEvent('hashchange'));
+    await waitFor(
+      () => document.querySelector('.profile-cover img'),
+      15000,
+      'profile cover banner'
+    );
+    assert(
+      document.querySelector('.profile-cover img').getAttribute('src') === '/uploads/smoke-cover.png',
+      'profile shows the cover banner image'
+    );
+    assert(
+      document.body.textContent.includes('smokecat'),
+      'profile shows the username as the display name'
+    );
+    const profileAvatar = document.querySelector('img.profile-avatar-img');
+    assert(
+      profileAvatar && profileAvatar.getAttribute('src') === '/uploads/smoke-avatar.png',
+      'profile shows the photo avatar'
+    );
+    assert(
+      profileAvatar && profileAvatar.classList.contains('avatar-ring-gold'),
+      'profile avatar carries the gold border ring'
+    );
+    assert(
+      !document.querySelector('#editProfileBtn'),
+      'no edit button on a profile when no wallet is connected'
+    );
+
+    // ---- Connected wallet (second page, wallet pre-seeded in
+    // localStorage): portfolio deposit section + transfer UI, and the
+    // owner-only edit-profile form. ----
+    dom2 = await JSDOM.fromURL(`${BASE}/`, {
+      resources: 'usable',
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(window) {
+        const nodeFetch = fetch;
+        window.fetch = (input, init) => {
+          const url =
+            typeof input === 'string' && input.startsWith('/')
+              ? new URL(input, window.location.href).toString()
+              : input;
+          return nodeFetch(url, init);
+        };
+        window.localStorage.setItem('solpump-wallet', WALLET_A);
+      },
+    });
+    const win2 = dom2.window;
+    const doc2 = win2.document;
+    win2.addEventListener('error', (e) => {
+      throw new Error(`page 2 error: ${e.message}`);
+    });
+    await waitFor(() => doc2.querySelector('.coin-card'), 15000, 'feed in page 2');
+
+    // Portfolio with a wallet: deposit section (address + copy + QR),
+    // per-holding transfer button, transfer history card.
+    win2.location.hash = '#/portfolio';
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(() => doc2.querySelector('#depositCard'), 20000, 'deposit card in portfolio');
+    assert(
+      doc2.querySelector('#depositCard').textContent.includes(WALLET_A),
+      'deposit section shows the connected wallet address'
+    );
+    assert(doc2.querySelector('#copyDepositBtn'), 'deposit section has a copy button');
+    await waitFor(() => doc2.querySelector('#depositQr img'), 15000, 'deposit QR code');
+    assert(
+      doc2.querySelector('#depositQr img').getAttribute('src').startsWith('data:image/'),
+      'deposit QR code renders as an image'
+    );
+    assert(
+      doc2.querySelector('#depositCard').textContent.includes('tidak pernah memegang dana'),
+      'deposit section notes the site never holds user funds'
+    );
+    assert(
+      doc2.querySelector('[data-transfer="' + mint + '"]'),
+      'portfolio positions have a per-holding transfer (Kirim) button'
+    );
+    assert(doc2.querySelector('#transferHistory'), 'portfolio shows the transfer history card');
+    assert(
+      doc2.querySelector('#transferHistory').textContent.includes('Belum ada transfer'),
+      'transfer history shows the empty state'
+    );
+    // Clicking Kirim opens the transfer card for that coin.
+    doc2.querySelector('[data-transfer="' + mint + '"]').click();
+    await waitFor(
+      () => !doc2.querySelector('#portfolioTransferCard').hidden,
+      15000,
+      'portfolio transfer card opens'
+    );
+    assert(
+      doc2.querySelector('#pfTransferTo') && doc2.querySelector('#pfTransferAmount'),
+      'portfolio transfer card has recipient + amount inputs'
+    );
+
+    // Own profile (owner wallet): edit button + edit form prefilled with
+    // the current username/border; deposit card also present.
+    win2.location.hash = `#/creator/${WALLET_A}`;
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(() => doc2.querySelector('#editProfileBtn'), 15000, 'edit button on own profile');
+    assert(true, 'edit button renders on the owner profile');
+    assert(doc2.querySelector('#depositCard'), 'own profile shows the deposit card');
+    assert(
+      doc2.querySelector('#editProfileCard').hidden,
+      'edit form starts hidden'
+    );
+    doc2.querySelector('#editProfileBtn').click();
+    await waitFor(
+      () => !doc2.querySelector('#editProfileCard').hidden,
+      15000,
+      'edit form opens'
+    );
+    assert(
+      doc2.querySelector('#editUsername').value === 'smokecat',
+      'edit form prefills the current username'
+    );
+    assert(
+      doc2.querySelector('input[name="editBorder"][value="gold"]').checked,
+      'edit form preselects the current border'
+    );
+    assert(
+      doc2.querySelectorAll('input[name="editBorder"]').length === 6,
+      'border picker offers all 6 presets'
+    );
+    assert(doc2.querySelector('#editAvatar'), 'edit form has an avatar upload input');
+    assert(doc2.querySelector('#editCover'), 'edit form has a cover upload input');
+    assert(doc2.querySelector('#saveProfileBtn'), 'edit form has a save button');
+    assert(doc2.querySelector('#removeAvatar'), 'edit form offers removing the current photo');
+    assert(doc2.querySelector('#removeCover'), 'edit form offers removing the current cover');
+
+    // Another wallet's profile (same connected wallet): no edit button.
+    win2.location.hash = '#/creator/J6uK6XxHL2T2bg8CefLKYTSCwpMeBmTG7Pa9K8NYWSvb';
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(
+      () => doc2.body.textContent.includes('Coin yang Dibuat'),
+      15000,
+      'other creator profile'
+    );
+    assert(
+      !doc2.querySelector('#editProfileBtn'),
+      'no edit button on another wallet profile'
+    );
 
     console.log('\nALL UI SMOKE CHECKS PASSED');
   } finally {
     if (dom) dom.window.close();
+    if (dom2) dom2.window.close();
     db.prepare('DELETE FROM trades WHERE mint_address = ?').run(mint);
     db.prepare('DELETE FROM callouts WHERE mint_address = ?').run(mint);
+    db.prepare('DELETE FROM profiles WHERE wallet = ?').run(WALLET_A);
     db.prepare('DELETE FROM coins WHERE mint_address = ?').run(mint);
     const left = db.prepare('SELECT COUNT(*) AS n FROM coins').get().n;
     console.log(`test data cleaned; coins remaining in DB: ${left}`);

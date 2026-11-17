@@ -6,9 +6,13 @@
 // wallet; every trade takes a 1% creator fee (see src/bonding.js).
 // Display currency: token prices + market cap are USD (pump.fun style —
 // the server supplies the SOL/USD rate and the *Usd fields; the UI falls
-// back to SOL when no rate is available). The trading pair is TICKER/SOL:
-// buy/sell amounts, amounts received, pool balances and fees stay in SOL
-// because that is the currency actually moving.
+// back to the pair asset when no USD price is available). Each coin trades
+// against a PAIR ASSET — SOL by default, or another coin in the registry
+// (see src/pairs.js): buy/sell amounts, amounts received, pool balances
+// and fees are denominated in that asset (coin.pairAsset.symbol), and the
+// pair label is coin.pairLabel (TICKER/SOL or TICKER/PAIR).
+// All user-facing strings go through translate() (public/i18n.js) —
+// Indonesian (default), English, Simplified Chinese.
 
 const EXPLORER = 'https://explorer.solana.com';
 
@@ -20,6 +24,8 @@ const state = {
   onchainBalances: {}, // mintAddress -> live on-chain token balance
   coinCache: null, // last loaded coin detail
   chartRange: 0, // 0 = all, else last N trades
+  chartType: 'area', // 'area' | 'candles'
+  candleTimeframe: '5m', // '1m' | '5m' | '15m' | '1h'
   tradeTab: 'Semua',
   tradeSide: 'buy',
   following: new Set(), // wallets the connected wallet follows
@@ -89,9 +95,9 @@ function fmtPct(x) {
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
-function fmtSignedSol(x) {
+function fmtSignedSol(x, asset = 'SOL') {
   const n = Number(x);
-  return `${n >= 0 ? '+' : '−'}${fmtSol(Math.abs(n))} SOL`;
+  return `${n >= 0 ? '+' : '−'}${fmtSol(Math.abs(n))} ${asset}`;
 }
 
 // USD price formatting (pump.fun style): plain decimals, never scientific
@@ -162,16 +168,20 @@ function fmtPriceBoth(usdValue, solValue) {
   return `${fmtPrice(solValue)} SOL`;
 }
 
-// Market-cap display: USD with suffixes when available, SOL otherwise.
+// Market-cap display: USD with suffixes when available, pair asset
+// otherwise (the pair asset is SOL for SOL pairs, the pair coin for
+// coin pairs — the coin's pairAsset.symbol labels it).
 function fmtMarketCap(c) {
   if (c && Number.isFinite(c.marketCapUsd)) return fmtMarketCapUsd(c.marketCapUsd);
-  return `${fmtSol(c.marketCapSol)} SOL`;
+  const asset = (c && c.pairAsset && c.pairAsset.symbol) || 'SOL';
+  return `${fmtSol(c.marketCapSol)} ${asset}`;
 }
 
-// Money figure (PnL, value): USD primary, SOL as a small secondary line.
-// Falls back to SOL only when no USD price is available.
-function fmtMoneyBoth(usd, sol, signed = false) {
-  const solStr = signed ? fmtSignedSol(sol) : `${fmtSol(sol)} SOL`;
+// Money figure (PnL, value): USD primary, pair asset as a small secondary
+// line. Falls back to the pair asset only when no USD price is available.
+// `asset` is the pair-asset symbol (default SOL for SOL pairs).
+function fmtMoneyBoth(usd, sol, signed = false, asset = 'SOL') {
+  const solStr = signed ? fmtSignedSol(sol, asset) : `${fmtSol(sol)} ${asset}`;
   if (!Number.isFinite(usd)) return solStr;
   const usdStr = signed ? fmtSignedUsd(usd) : fmtUsd(usd);
   return `${usdStr}<div class="small muted">${solStr}</div>`;
@@ -195,17 +205,17 @@ function fmtDate(ts) {
   });
 }
 
-// Relative time, pump.fun style ("5 mnt lalu", "2 jam lalu").
+// Relative time, pump.fun style ("5 mnt lalu", "2 jam lalu" / "5 min ago").
 function fmtAgo(ts) {
   const diff = Date.now() - Number(ts);
-  if (!Number.isFinite(diff) || diff < 0) return 'baru saja';
+  if (!Number.isFinite(diff) || diff < 0) return translate('agoJustNow');
   const min = Math.floor(diff / 60000);
-  if (min < 1) return 'baru saja';
-  if (min < 60) return `${min} mnt lalu`;
+  if (min < 1) return translate('agoJustNow');
+  if (min < 60) return translate('agoMinutes', { n: min });
   const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr} jam lalu`;
+  if (hr < 24) return translate('agoHours', { n: hr });
   const day = Math.floor(hr / 24);
-  if (day < 30) return `${day} hari lalu`;
+  if (day < 30) return translate('agoDays', { n: day });
   return fmtDate(ts);
 }
 
@@ -218,10 +228,12 @@ function toast(msg) {
   }, 3500);
 }
 
+// Server errors come back in Indonesian; translateError() maps the common
+// ones to the current language (unknown ones stay Indonesian).
 async function apiGet(url) {
   const res = await fetch(url);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(translateError(data.error || `HTTP ${res.status}`));
   return data;
 }
 
@@ -232,7 +244,7 @@ async function apiPost(url, body) {
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(translateError(data.error || `HTTP ${res.status}`));
   return data;
 }
 
@@ -262,6 +274,57 @@ function followMessage(action, followingWallet) {
   return `solpump:${action}:${followingWallet}`;
 }
 
+// ---------- Editable profiles (username / photo / border / cover) ----------
+// Border presets: the stored value is the key; the ring is a CSS class
+// (see .avatar-ring-* in styles.css). 'none' = no ring.
+const BORDER_PRESETS = [
+  { key: 'none', labelKey: 'borderNone' },
+  { key: 'green', labelKey: 'borderGreen' },
+  { key: 'blue', labelKey: 'borderBlue' },
+  { key: 'purple', labelKey: 'borderPurple' },
+  { key: 'gold', labelKey: 'borderGold' },
+  { key: 'rainbow', labelKey: 'borderRainbow' },
+];
+
+// Canonical profile-edit message — must match src/signverify.js exactly.
+// The server rebuilds it from the SUBMITTED fields: username '' when
+// cleared/absent, border 'none' when absent, and the sha256 of each
+// submitted image's base64 payload ('' when no image is submitted).
+function profileMessage({ wallet, username, border, avatarHash, coverHash }) {
+  return [
+    `solpump:profile:${wallet}`,
+    `username:${username || ''}`,
+    `border:${border || 'none'}`,
+    `avatar:${avatarHash || ''}`,
+    `cover:${coverHash || ''}`,
+  ].join('\n');
+}
+
+async function sha256Hex(text) {
+  const bytes = await crypto.subtle.digest('sha256', new TextEncoder().encode(text));
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Display name for a wallet: the username when the profile has one,
+// otherwise the shortened address.
+function displayName(profile, wallet) {
+  return (profile && profile.username) || shortAddr(wallet);
+}
+
+// Avatar: the profile photo when set, otherwise an initials tile. The
+// border preset renders as a CSS ring around it. `size` is px (square);
+// `round` makes it a circle (callouts), otherwise a rounded tile.
+function avatarHtml(profile, wallet, size = 56, round = false) {
+  const border = (profile && profile.border) || 'none';
+  const ringClass = border !== 'none' ? ` avatar-ring avatar-ring-${border}` : '';
+  const style = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.32)}px${round ? ';border-radius:50%' : ''}`;
+  if (profile && profile.avatarUrl) {
+    return `<img src="${esc(profile.avatarUrl)}" alt="${translate('profileAvatarAlt')}" class="profile-avatar-img${ringClass}" style="${style}">`;
+  }
+  const initials = (wallet || '?').slice(0, 2).toUpperCase();
+  return `<div class="coin-avatar${ringClass}" style="${style}">${esc(initials)}</div>`;
+}
+
 // One callout (social trade call). Entry price + holdings were computed
 // server-side from the trader's real trades; PnL is live vs the current
 // price. Prices are USD (plain decimals, never scientific notation), PnL is
@@ -269,16 +332,16 @@ function followMessage(action, followingWallet) {
 // green=profit / pink=loss styling as the PnL card.
 function calloutHtml(c, { showCoin = false } = {}) {
   const cls = c.pnlSol >= 0 ? 'profit' : 'loss';
+  const asset = c.assetSymbol || 'SOL';
   const pnlUsd = Number.isFinite(c.pnlUsd)
-    ? `${fmtSignedUsd(c.pnlUsd)} <span class="muted">(${fmtSignedSol(c.pnlSol)})</span>`
-    : fmtSignedSol(c.pnlSol);
-  const initials = (c.wallet || '?').slice(0, 2).toUpperCase();
+    ? `${fmtSignedUsd(c.pnlUsd)} <span class="muted">(${fmtSignedSol(c.pnlSol, asset)})</span>`
+    : fmtSignedSol(c.pnlSol, asset);
   return `
     <div class="callout">
       <div class="callout-head">
-        <span class="callout-avatar">${esc(initials)}</span>
-        ${creatorLink(c.wallet)}
-        <span class="badge badge-ok">✓ Pembeli terverifikasi</span>
+        ${avatarHtml(c.authorProfile, c.wallet, 28, true)}
+        ${creatorLink(c.wallet, displayName(c.authorProfile, c.wallet))}
+        <span class="badge badge-ok">${translate('calloutVerified')}</span>
         <span class="muted small" style="margin-left:auto">${fmtAgo(c.createdAt)}</span>
       </div>
       <p class="callout-text">${esc(c.text)}</p>
@@ -286,14 +349,14 @@ function calloutHtml(c, { showCoin = false } = {}) {
         ? `<a class="callout-coin" href="#/coin/${esc(c.mintAddress)}">
             <span class="coin-mini">${esc((c.coinTicker || '?').slice(0, 2).toUpperCase())}</span>
             <span><b>${esc(c.coinName || c.coinTicker)}</b> <span class="muted">$${esc(c.coinTicker)}</span></span>
-            <span class="muted small" style="margin-left:auto">Lihat coin ↗</span>
+            <span class="muted small" style="margin-left:auto">${translate('calloutViewCoin')}</span>
           </a>`
         : ''}
       <div class="callout-meta small">
-        <span>Entry <b>${fmtPriceBoth(c.entryPriceUsd, c.entryPrice)}</b></span>
-        <span>Dipergang <b>${fmtTokens(c.holdingsAtPost)}</b></span>
-        <span>Harga kini <b>${fmtPriceBoth(c.currentPriceUsd, c.currentPrice)}</b></span>
-        <span>PnL <b class="${cls}">${pnlUsd} (${fmtPct(c.pnlPct)})</b></span>
+        <span>${translate('calloutEntry')} <b>${fmtPriceBoth(c.entryPriceUsd, c.entryPrice)}</b></span>
+        <span>${translate('calloutHeld')} <b>${fmtTokens(c.holdingsAtPost)}</b></span>
+        <span>${translate('calloutCurrentPrice')} <b>${fmtPriceBoth(c.currentPriceUsd, c.currentPrice)}</b></span>
+        <span>${translate('calloutPnl')} <b class="${cls}">${pnlUsd} (${fmtPct(c.pnlPct)})</b></span>
       </div>
     </div>`;
 }
@@ -315,7 +378,13 @@ async function refreshOnchainBalances() {
     return;
   }
   try {
-    state.onchainBalances = await getAllTokenBalances(state.wallet);
+    // Never let a slow or hanging RPC block the page: after 8s, fall back
+    // to empty on-chain balances (the trade-based holdings still render;
+    // the "Saldo On-chain" column just shows 0 until the next refresh).
+    state.onchainBalances = await Promise.race([
+      getAllTokenBalances(state.wallet),
+      new Promise((resolve) => setTimeout(() => resolve({}), 8000)),
+    ]);
   } catch {
     state.onchainBalances = {};
   }
@@ -332,7 +401,12 @@ async function refreshBalance() {
     return;
   }
   try {
-    state.balanceSol = await getDevnetBalanceSol(state.wallet);
+    // Same 8s guard as refreshOnchainBalances: a hanging RPC must not
+    // stall the header/balance refresh forever.
+    state.balanceSol = await Promise.race([
+      getDevnetBalanceSol(state.wallet),
+      new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+    ]);
   } catch {
     state.balanceSol = null;
   }
@@ -368,7 +442,7 @@ async function syncWalletAccount() {
       state.wallet = current;
       localStorage.setItem('solpump-wallet', current);
       await loadFollowing();
-      toast(`Dompet aktif di Phantom berubah — sekarang ${shortAddr(current)}.`);
+      toast(translate('toastWalletChanged', { addr: shortAddr(current) }));
     }
     await refreshBalance();
     await refreshOnchainBalances();
@@ -383,7 +457,7 @@ async function connectWallet() {
   // The extension can inject after our scripts run; wait briefly for it.
   const phantom = (await waitForPhantom(3000)) || getPhantom();
   if (!phantom) {
-    toast('Phantom tidak ditemukan. Instal ekstensi Phantom dulu (di HP, buka situs ini dari browser di dalam aplikasi Phantom).');
+    toast(translate('errPhantomNotFound'));
     window.open('https://phantom.app/', '_blank', 'noopener');
     return;
   }
@@ -399,15 +473,15 @@ async function connectWallet() {
     // tells the user to switch Phantom to Devnet explicitly.
     try {
       const ok = await verifyDevnetRpc();
-      if (!ok) toast('Peringatan: endpoint RPC bukan devnet. Laporkan ke pengelola situs.');
+      if (!ok) toast(translate('warnRpcNotDevnet'));
     } catch {
       // Non-fatal: the mint flow re-checks before signing.
     }
     renderHeader();
     route();
-    toast('Dompet terhubung.');
+    toast(translate('toastWalletConnected'));
   } catch (err) {
-    toast(`Gagal menghubungkan dompet: ${friendlyError(err)}`);
+    toast(translate('errConnectWallet', { msg: friendlyError(err) }));
   }
 }
 
@@ -424,6 +498,7 @@ function disconnectWallet() {
 }
 
 function renderHeader() {
+  renderLangSwitcher();
   const box = document.getElementById('walletBox');
   if (state.wallet) {
     // Live devnet balance, prominent: re-read from devnet RPC on connect
@@ -431,12 +506,12 @@ function renderHeader() {
     // claim). The refresh button re-reads it on demand; the address links
     // to the wallet's own profile page.
     box.innerHTML = `
-      <a class="wallet-chip" href="#/creator/${esc(state.wallet)}" title="Profil saya">
+      <a class="wallet-chip" href="#/creator/${esc(state.wallet)}" title="${translate('headerMyProfile')}">
         <span class="mono">${esc(shortAddr(state.wallet))}</span>
-        <span class="bal" title="Saldo SOL devnet (dibaca langsung dari devnet)">${state.balanceSol === null ? '…' : `${fmtSol(state.balanceSol)} SOL`}</span>
+        <span class="bal" title="${translate('headerBalanceTitle')}">${state.balanceSol === null ? '…' : `${fmtSol(state.balanceSol)} SOL`}</span>
       </a>
-      <button class="btn btn-sm btn-ghost" id="refreshBalHeaderBtn" title="Periksa ulang saldo devnet">↻</button>
-      <button class="btn btn-sm" id="disconnectBtn">Putuskan</button>`;
+      <button class="btn btn-sm btn-ghost" id="refreshBalHeaderBtn" title="${translate('headerRefreshTitle')}">↻</button>
+      <button class="btn btn-sm" id="disconnectBtn">${translate('headerDisconnect')}</button>`;
     document.getElementById('disconnectBtn').onclick = disconnectWallet;
     document.getElementById('refreshBalHeaderBtn').onclick = async () => {
       const btn = document.getElementById('refreshBalHeaderBtn');
@@ -445,7 +520,7 @@ function renderHeader() {
       renderHeader();
     };
   } else {
-    box.innerHTML = `<button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>`;
+    box.innerHTML = `<button class="btn btn-primary" id="connectBtn">${translate('headerConnect')}</button>`;
     document.getElementById('connectBtn').onclick = connectWallet;
   }
   // Nav active state
@@ -456,6 +531,37 @@ function renderHeader() {
       'active',
       href === hash || (href === '#/' && (hash === '' || hash === '#/'))
     );
+  });
+}
+
+// Language switcher in the topbar (ID / EN / 中文), persisted in
+// localStorage by i18n.js. Switching re-renders the header and the
+// current view so dynamic strings switch too; static shell strings are
+// applied by setLang() itself. The footer pool address is re-filled after
+// the switch (applyStaticI18n rebuilds the footer's innerHTML).
+function renderLangSwitcher() {
+  const box = document.getElementById('langBox');
+  if (!box) return;
+  const langs = [
+    ['id', 'ID'],
+    ['en', 'EN'],
+    ['zh', '中文'],
+  ];
+  const current = getLang();
+  box.innerHTML = langs
+    .map(
+      ([code, label]) =>
+        `<button class="lang-btn ${current === code ? 'active' : ''}" data-lang="${code}" title="${translate('langSwitcherLabel')}">${label}</button>`
+    )
+    .join('');
+  box.querySelectorAll('[data-lang]').forEach((b) => {
+    b.addEventListener('click', () => {
+      if (getLang() === b.dataset.lang) return;
+      setLang(b.dataset.lang);
+      fillPoolAddress();
+      renderHeader();
+      route();
+    });
   });
 }
 
@@ -471,7 +577,7 @@ function route() {
   const c = hash.match(/^#\/creator\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (c) return renderCreator(c[1]);
   document.getElementById('view').innerHTML =
-    '<div class="card"><p>Halaman tidak ditemukan.</p><a href="#/">Kembali ke Beranda</a></div>';
+    `<div class="card"><p>${translate('notFoundTitle')}</p><a href="#/">${translate('backHome')}</a></div>`;
 }
 
 window.addEventListener('hashchange', route);
@@ -485,17 +591,17 @@ async function renderFeed() {
   // Layout ala pump.fun: strip trending di atas, lalu filter pill + grid.
   // (Tidak ada hero — pump.fun langsung ke konten.)
   const sortPills = [
-    ['newest', 'Baru'],
-    ['marketcap', 'Market Cap'],
-    ['volume', 'Volume'],
-    ['price', 'Harga'],
-    ['change', 'Perubahan'],
+    ['newest', translate('sortNewest')],
+    ['marketcap', translate('sortMarketCap')],
+    ['volume', translate('sortVolume')],
+    ['price', translate('sortPrice')],
+    ['change', translate('sortChange')],
   ];
   view.innerHTML = `
     <div id="trendStrip"></div>
     <div class="toolbar">
-      <input id="searchInput" type="search" placeholder="Cari coin atau ticker…" value="${esc(feedSearch)}">
-      <div class="sort-pills" role="tablist" aria-label="Urutkan coin">
+      <input id="searchInput" type="search" placeholder="${translate('searchPlaceholder')}" value="${esc(feedSearch)}">
+      <div class="sort-pills" role="tablist" aria-label="${translate('sortAriaLabel')}">
         ${sortPills
           .map(
             ([v, label]) =>
@@ -504,11 +610,11 @@ async function renderFeed() {
           .join('')}
       </div>
       ${state.wallet && state.following.size > 0
-        ? `<button class="pill ${state.feedFollowingOnly ? 'active' : ''}" id="followingToggle" title="Hanya coin dan callout dari kreator yang kamu ikuti">Mengikuti (${state.following.size})</button>`
+        ? `<button class="pill ${state.feedFollowingOnly ? 'active' : ''}" id="followingToggle" title="${translate('followingOnlyTitle')}">${translate('followingFilter', { n: state.following.size })}</button>`
         : ''}
     </div>
     <div id="followingCallouts"></div>
-    <div id="coinList"><p class="muted">Memuat coin…</p></div>`;
+    <div id="coinList"><p class="muted">${translate('loadingCoins')}</p></div>`;
 
   const searchInput = document.getElementById('searchInput');
   let debounce;
@@ -551,7 +657,7 @@ async function renderFeed() {
         return;
       }
       strip.innerHTML = `
-        <div class="trend-title">Sedang trending</div>
+        <div class="trend-title">${translate('trendingTitle')}</div>
         <div class="trend-strip">
           ${data.coins
             .map(
@@ -587,7 +693,7 @@ async function renderFeed() {
       try {
         const cd = await apiGet(`/api/callouts?following=${encodeURIComponent(state.wallet)}`);
         calloutsBox.innerHTML = cd.callouts.length
-          ? `<div class="card"><h2 style="margin-top:0">Callout dari yang Kamu Ikuti</h2>${cd.callouts
+          ? `<div class="card"><h2 style="margin-top:0">${translate('followingCalloutsTitle')}</h2>${cd.callouts
               .map((c) => calloutHtml(c, { showCoin: true }))
               .join('')}</div>`
           : '';
@@ -608,14 +714,14 @@ async function renderFeed() {
         list.innerHTML = state.feedFollowingOnly
           ? `
           <div class="card empty">
-            <h2>Belum ada coin dari kreator yang kamu ikuti</h2>
-            <p>Kreator yang kamu ikuti belum membuat coin, atau filter ini aktif. Matikan filter "Mengikuti" untuk melihat semua coin.</p>
+            <h2>${translate('emptyFollowingTitle')}</h2>
+            <p>${translate('emptyFollowingBody')}</p>
           </div>`
           : `
           <div class="card empty">
-            <h2>Belum ada coin</h2>
-            <p>Feed masih kosong — coin muncul setelah ada mint asli yang terverifikasi di devnet.</p>
-            <p><a class="btn btn-primary" href="#/create">Jadi yang pertama membuat coin</a></p>
+            <h2>${translate('emptyFeedTitle')}</h2>
+            <p>${translate('emptyFeedBody')}</p>
+            <p><a class="btn btn-primary" href="#/create">${translate('emptyFeedCta')}</a></p>
           </div>`;
         return;
       }
@@ -630,105 +736,117 @@ async function renderFeed() {
         a.addEventListener('click', (e) => e.stopPropagation());
       });
     } catch (err) {
-      list.innerHTML = `<div class="alert alert-error">Gagal memuat coin: ${esc(err.message)}</div>`;
+      list.innerHTML = `<div class="alert alert-error">${esc(translate('errLoadCoins', { msg: err.message }))}</div>`;
     }
   }
 }
 
 function coinCard(c) {
   const chg = c.changePct >= 0 ? 'profit' : 'loss';
+  const pairAsset = (c.pairAsset && c.pairAsset.symbol) || 'SOL';
+  const pairLabel = c.pairLabel || `${c.ticker}/SOL`;
   return `
     <div class="card coin-card" data-mint="${esc(c.mintAddress)}">
       <div class="coin-head">
         ${logoHtml(c)}
         <div class="coin-id">
           <div class="coin-name">${esc(c.name)} <span class="coin-ticker">$${esc(c.ticker)}</span></div>
-          <div class="coin-pair">${esc(c.ticker)}/SOL • ${fmtAgo(c.createdAt)}</div>
+          <div class="coin-pair">${esc(pairLabel)} • ${fmtAgo(c.createdAt)}</div>
         </div>
         <div style="text-align:right;flex-shrink:0">
-          <div class="small muted">Market cap</div>
+          <div class="small muted">${translate('cardMarketCap')}</div>
           <div><b>${fmtMarketCap(c)}</b></div>
         </div>
-        ${c.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
+        ${c.tradingEnabled ? '' : `<span class="badge badge-warn">${translate('badgeTradingOff')}</span>`}
       </div>
       ${c.description ? `<p class="coin-desc">${esc(c.description)}</p>` : ''}
       <div class="coin-price-row">
         <span class="coin-price"><b>${fmtPriceBoth(c.priceUsd, c.price)}</b> <span class="${chg}">${fmtPct(c.changePct)}</span></span>
-        <span class="small muted">Vol <b style="color:var(--text)">${fmtSol(c.volumeSol)} SOL</b></span>
+        <span class="small muted">${translate('cardVolume')} <b style="color:var(--text)">${fmtSol(c.volumeSol)} ${esc(pairAsset)}</b></span>
       </div>
-      <div class="progress" title="Progres kurva bonding: ${c.progressPct.toFixed(1)}%">
+      <div class="progress" title="${translate('cardProgressTitle', { pct: c.progressPct.toFixed(1) })}">
         <div style="width:${c.progressPct.toFixed(1)}%"></div>
       </div>
-      <div class="coin-foot">Kurva bonding ${c.progressPct.toFixed(1)}% • ${c.txCount} tx • oleh ${creatorLink(c.creatorWallet)}</div>
+      <div class="coin-foot">${translate('cardFoot', { pct: c.progressPct.toFixed(1), n: c.txCount, creator: creatorLink(c.creatorWallet, displayName(c.creatorProfile, c.creatorWallet)) })}</div>
     </div>`;
 }
 
 // ---------- Create coin ----------
 async function renderCreate() {
   const view = document.getElementById('view');
+  // Selected pair asset: null = SOL (default), otherwise a pair coin's mint.
+  let selectedPairMint = null;
+  let pairOptions = [];
   view.innerHTML = `
-    <h1>Buat Coin</h1>
-    <p class="muted">Minting asli di Solana devnet: suplai 1.000.000.000 token, 6 desimal, otoritas mint langsung dicabut. Nama, ticker, dan logo tersimpan di registry situs ini. Setelah mint, kamu akan diminta satu tanda tangan lagi untuk memindahkan 800.000.000 token ke dompet pool agar coin bisa diperdagangkan (200.000.000 token tetap di dompetmu).</p>
+    <h1>${translate('createTitle')}</h1>
+    <p class="muted">${translate('createIntro')}</p>
     <div id="pendingMintBox"></div>
     <div class="create-layout">
     <div class="card">
       <div class="field">
-        <label for="coinName">Nama coin</label>
-        <input id="coinName" maxlength="32" placeholder="cth: SolPump Cat">
+        <label for="coinName">${translate('createNameLabel')}</label>
+        <input id="coinName" maxlength="32" placeholder="${translate('createNamePlaceholder')}">
       </div>
       <div class="field">
-        <label for="coinTicker">Ticker</label>
-        <input id="coinTicker" maxlength="10" placeholder="cth: SPCAT">
-        <div class="hint">Otomatis huruf besar, maksimal 10 karakter.</div>
+        <label for="coinTicker">${translate('createTickerLabel')}</label>
+        <input id="coinTicker" maxlength="10" placeholder="${translate('createTickerPlaceholder')}">
+        <div class="hint">${translate('createTickerHint')}</div>
       </div>
       <div class="field">
-        <label for="coinDesc">Deskripsi (opsional)</label>
-        <textarea id="coinDesc" rows="3" maxlength="500" placeholder="Ceritakan tentang coin-mu…"></textarea>
+        <label for="coinDesc">${translate('createDescLabel')}</label>
+        <textarea id="coinDesc" rows="3" maxlength="500" placeholder="${translate('createDescPlaceholder')}"></textarea>
       </div>
       <div class="field">
-        <label for="coinLogo">Logo (opsional, maks ~675 KB)</label>
+        <label for="coinLogo">${translate('createLogoLabel')}</label>
         <input id="coinLogo" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+      </div>
+      <div class="field">
+        <label>${translate('pairPickerTitle')}</label>
+        <p class="hint">${translate('pairPickerHint')}</p>
+        <div id="pairPicker">
+          <label class="pair-option"><input type="radio" name="pairAsset" value="" checked> <b>SOL</b> <span class="muted small">${translate('pairSolLabel')}</span></label>
+          <input id="pairSearch" type="search" placeholder="${translate('pairSearchPlaceholder')}" style="margin-top:8px">
+          <div id="pairList" style="margin-top:8px"><p class="muted small">${translate('loadingGeneric')}</p></div>
+        </div>
       </div>
       <div id="walletStatus"></div>
       <div id="mintSteps"></div>
       <div id="mintError"></div>
       <div class="alert alert-info" style="margin-top:8px">
-        <strong>⚠️ Phantom harus di jaringan Devnet.</strong> Website tidak bisa membaca atau mengubah jaringan Phantom.
-        Buka Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih <strong>Devnet</strong>.
-        Kalau Phantom di Mainnet, minting akan gagal dengan "Failed to simulate" / "Not enough SOL" di Phantom
-        meski saldo devnet-mu cukup — karena Phantom memeriksa jaringan yang salah.
+        ${translate('createDevnetWarning')}
       </div>
       <label class="check-row">
         <input type="checkbox" id="devnetConfirm">
-        <span>Saya sudah memastikan Phantom di jaringan <strong>Devnet</strong> dan akun aktifnya adalah akun yang punya SOL devnet.</span>
+        <span>${translate('createDevnetConfirm')}</span>
       </label>
-      <button class="btn btn-primary" id="mintBtn" style="margin-top:8px">Buat Coin &amp; Mint di Devnet</button>
+      <button class="btn btn-primary" id="mintBtn" style="margin-top:8px">${translate('createMintBtn')}</button>
     </div>
     <div class="create-preview-col">
       <div class="card" id="createPreview">
-        <h2 style="margin-top:0">Pratinjau</h2>
-        <p class="small muted">Beginilah coin-mu akan tampil di feed.</p>
+        <h2 style="margin-top:0">${translate('previewTitle')}</h2>
+        <p class="small muted">${translate('previewSubtitle')}</p>
         <div class="card coin-card" style="margin-bottom:0;cursor:default">
           <div class="coin-head">
             <div id="logoPreview"><div class="coin-avatar">??</div></div>
             <div class="coin-id">
-              <div class="coin-name"><span id="pvName">Nama coin</span> <span class="coin-ticker">$<span id="pvTicker">TICKER</span></span></div>
-              <div class="coin-pair"><span id="pvPair">TICKER</span>/SOL • baru saja</div>
+              <div class="coin-name"><span id="pvName">${translate('createNameLabel')}</span> <span class="coin-ticker">$<span id="pvTicker">TICKER</span></span></div>
+              <div class="coin-pair"><span id="pvPair">TICKER/SOL</span> • ${translate('agoJustNow')}</div>
             </div>
             <div style="text-align:right;flex-shrink:0">
-              <div class="small muted">Market cap</div>
+              <div class="small muted">${translate('cardMarketCap')}</div>
               <div><b>$5K</b></div>
             </div>
           </div>
-          <p class="coin-desc" id="pvDesc">Deskripsi coin-mu akan tampil di sini.</p>
+          <p class="coin-desc" id="pvDesc">${translate('previewDescDefault')}</p>
           <div class="coin-price-row">
             <span class="coin-price"><b>~$0.000005</b></span>
-            <span class="small muted">Vol <b style="color:var(--text)">0 SOL</b></span>
+            <span class="small muted">${translate('cardVolume')} <b style="color:var(--text)" id="pvVol">0 SOL</b></span>
           </div>
           <div class="progress"><div style="width:0%"></div></div>
-          <div class="coin-foot">Kurva bonding 0% • 0 tx</div>
+          <div class="coin-foot">${translate('previewFoot')}</div>
         </div>
-        <p class="preview-note">Harga awal (~$0.000005) dan market cap awal (~$5K) ditentukan kurva bonding saat coin dibuat.</p>
+        <p class="preview-note">${translate('previewNote')}</p>
+        <p class="preview-note" id="pvPairNote">${translate('pairPreviewNote', { pair: 'SOL' })}</p>
       </div>
     </div>
     </div>`;
@@ -743,20 +861,80 @@ async function renderCreate() {
 
   // Live preview: mirror the form into the preview card (pump.fun's create
   // page shows the same "how your coin will look" panel).
+  function selectedPairSymbol() {
+    if (!selectedPairMint) return 'SOL';
+    const found = pairOptions.find((p) => p.mint === selectedPairMint);
+    return found ? found.symbol : 'SOL';
+  }
   function renderPreview() {
-    const name = document.getElementById('coinName').value.trim() || 'Nama coin';
+    const name = document.getElementById('coinName').value.trim() || translate('createNameLabel');
     const ticker = document.getElementById('coinTicker').value.trim() || 'TICKER';
-    const desc = document.getElementById('coinDesc').value.trim() || 'Deskripsi coin-mu akan tampil di sini.';
+    const desc = document.getElementById('coinDesc').value.trim() || translate('previewDescDefault');
     document.getElementById('pvName').textContent = name;
     document.getElementById('pvTicker').textContent = ticker;
-    document.getElementById('pvPair').textContent = ticker;
+    document.getElementById('pvPair').textContent = `${ticker}/${selectedPairSymbol()}`;
     document.getElementById('pvDesc').textContent = desc;
+    const pairNote = document.getElementById('pvPairNote');
+    if (pairNote) {
+      pairNote.textContent = translate('pairPreviewNote', { pair: `${ticker}/${selectedPairSymbol()}` });
+    }
+    const pvVol = document.getElementById('pvVol');
+    if (pvVol) pvVol.textContent = `0 ${selectedPairSymbol()}`;
     // Without a logo, the preview avatar shows the ticker's initials.
     if (!logoData) {
       document.getElementById('logoPreview').innerHTML =
         `<div class="coin-avatar">${esc(ticker.slice(0, 2).toUpperCase())}</div>`;
     }
   }
+
+  // Pair picker: SOL (default) + a searchable list of listed site coins.
+  async function loadPairOptions() {
+    const list = document.getElementById('pairList');
+    try {
+      const data = await apiGet('/api/pairs');
+      pairOptions = (data.pairs || []).filter((p) => p.type === 'COIN');
+      renderPairList('');
+    } catch {
+      if (list) list.innerHTML = `<p class="muted small">${translate('pairEmpty')}</p>`;
+    }
+  }
+  function renderPairList(query) {
+    const list = document.getElementById('pairList');
+    if (!list) return;
+    const q = (query || '').trim().toLowerCase();
+    const filtered = pairOptions.filter(
+      (p) =>
+        !q ||
+        p.symbol.toLowerCase().includes(q) ||
+        (p.name || '').toLowerCase().includes(q)
+    );
+    if (!filtered.length) {
+      list.innerHTML = `<p class="muted small">${translate('pairEmpty')}</p>`;
+      return;
+    }
+    list.innerHTML = filtered
+      .map(
+        (p) => `<label class="pair-option">
+          <input type="radio" name="pairAsset" value="${esc(p.mint)}" ${selectedPairMint === p.mint ? 'checked' : ''}>
+          <b>$${esc(p.symbol)}</b> <span class="muted small">${esc(p.name || '')}</span>
+        </label>`
+      )
+      .join('');
+    list.querySelectorAll('input[name="pairAsset"]').forEach((r) => {
+      r.addEventListener('change', () => {
+        selectedPairMint = r.value || null;
+        renderPreview();
+      });
+    });
+  }
+  document.querySelector('input[name="pairAsset"][value=""]').addEventListener('change', () => {
+    selectedPairMint = null;
+    renderPreview();
+  });
+  document.getElementById('pairSearch').addEventListener('input', (e) => {
+    renderPairList(e.target.value);
+  });
+  loadPairOptions();
 
   let logoData = null;
   const logoInput = document.getElementById('coinLogo');
@@ -769,14 +947,14 @@ async function renderCreate() {
       return;
     }
     if (file.size > 675000) {
-      preview.innerHTML = '<p class="loss small">File terlalu besar (maks ~675 KB).</p>';
+      preview.innerHTML = `<p class="loss small">${translate('errFileTooBig')}</p>`;
       return;
     }
     const reader = new FileReader();
     reader.onload = () => {
       const [meta, base64] = String(reader.result).split(',');
       logoData = { dataBase64: base64, mimeType: file.type };
-      preview.innerHTML = `<img src="${esc(reader.result)}" alt="Pratinjau logo" class="coin-logo">`;
+      preview.innerHTML = `<img src="${esc(reader.result)}" alt="${translate('previewLogoAlt')}" class="coin-logo">`;
     };
     reader.readAsDataURL(file);
   });
@@ -796,11 +974,11 @@ async function renderCreate() {
     }
     box.innerHTML = `
       <div class="card" style="border-color:var(--gold)">
-        <h2 style="margin-top:0">Mint tertunda: $${esc(pending.ticker)}</h2>
-        <p>Coin ini <strong>sudah berhasil di-mint di devnet</strong> (${esc(shortAddr(pending.mintAddress))}), tapi pendaftarannya gagal: ${esc(pending.error || 'tidak diketahui')}. Kamu tidak perlu mint ulang — coba daftarkan lagi.</p>
+        <h2 style="margin-top:0">${translate('pendingTitle', { ticker: esc(pending.ticker) })}</h2>
+        <p>${translate('pendingBody', { addr: esc(shortAddr(pending.mintAddress)), err: esc(pending.error || translate('notAvailable')) })}</p>
         <p>
-          <button class="btn btn-primary" id="retryRegisterBtn">Coba daftarkan lagi</button>
-          <button class="btn" id="dropPendingBtn">Buang</button>
+          <button class="btn btn-primary" id="retryRegisterBtn">${translate('pendingRetry')}</button>
+          <button class="btn" id="dropPendingBtn">${translate('pendingDrop')}</button>
         </p>
       </div>`;
     document.getElementById('retryRegisterBtn').onclick = async () => {
@@ -815,13 +993,14 @@ async function renderCreate() {
           creatorWallet: pending.creatorWallet,
           txSignature: pending.txSignature,
           fundingTxSignature: pending.fundingTxSignature || undefined,
+          pairMint: pending.pairMint || undefined,
           image: pending.image || undefined,
         });
         savePendingMint(null);
-        toast(`Coin $${pending.ticker} berhasil didaftarkan!`);
+        toast(translate('toastCoinRegistered', { ticker: pending.ticker }));
         location.hash = `#/coin/${pending.mintAddress}`;
       } catch (err) {
-        toast(`Pendaftaran masih gagal: ${err.message}`);
+        toast(translate('errRegisterStillFailing', { msg: err.message }));
         btn.disabled = false;
       }
     };
@@ -839,11 +1018,11 @@ async function renderCreate() {
     if (!detected) {
       el.innerHTML = `
         <div class="alert alert-info">
-          <strong>Phantom tidak terdeteksi.</strong> Instal ekstensi Phantom di browser ini untuk membuat coin.
-          <div class="small" style="margin-top:6px">Di HP: ekstensi tidak tersedia — buka situs ini dari <strong>browser di dalam aplikasi Phantom</strong>.</div>
+          <strong>${translate('createPhantomMissingTitle')}</strong> ${translate('createPhantomMissingBody')}
+          <div class="small" style="margin-top:6px">${translate('createPhantomMissingMobile')}</div>
           <div style="margin-top:8px">
-            <a class="btn btn-sm" href="https://phantom.app/" target="_blank" rel="noopener">Unduh Phantom</a>
-            <button class="btn btn-sm" id="recheckPhantom">Periksa lagi</button>
+            <a class="btn btn-sm" href="https://phantom.app/" target="_blank" rel="noopener">${translate('createDownloadPhantom')}</a>
+            <button class="btn btn-sm" id="recheckPhantom">${translate('createRecheck')}</button>
           </div>
         </div>`;
       document.getElementById('recheckPhantom').onclick = () => updateWalletStatus();
@@ -852,9 +1031,9 @@ async function renderCreate() {
     if (!state.wallet) {
       el.innerHTML = `
         <div class="alert alert-info">
-          <strong>Dompet belum terhubung.</strong> Hubungkan Phantom dulu.
-          <div class="small" style="margin-top:6px">Pastikan Phantom di jaringan <strong>Devnet</strong>: buka Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih Devnet. Website tidak bisa mengubah jaringan Phantom secara otomatis — kalau Phantom di Mainnet, minting akan gagal dengan "Failed to simulate" / "Not enough SOL".</div>
-          <div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="connectFromCreate">Hubungkan Phantom</button></div>
+          <strong>${translate('createWalletMissingTitle')}</strong> ${translate('createWalletMissingBody')}
+          <div class="small" style="margin-top:6px">${translate('createWalletMissingNote')}</div>
+          <div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="connectFromCreate">${translate('headerConnect')}</button></div>
         </div>`;
       document.getElementById('connectFromCreate').onclick = connectWallet;
       return;
@@ -876,14 +1055,14 @@ async function renderCreate() {
     const low = bal !== null && bal < need;
     el.innerHTML = `
       <div class="alert ${low ? 'alert-error' : 'alert-success'}">
-        <strong>Dompet:</strong> <span class="mono">${esc(state.wallet)}</span><br>
-        <strong>Saldo devnet:</strong> ${bal === null ? '…' : `${fmtSol(bal)} SOL`}
-        ${cost ? `• Butuh ~${fmtSol(need)} SOL untuk minting (sewa akun ${fmtSol(cost.mintRentSol + cost.ataRentSol)} + biaya)` : ''}
-        ${low ? `<br>Saldo kurang ${fmtSol(need - bal)} SOL. Ambil SOL devnet gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>, lalu periksa ulang saldo di bawah.` : ''}
-        <div style="margin-top:8px"><button class="btn btn-sm" id="refreshBalBtn">Periksa ulang saldo</button></div>
+        <strong>${translate('createWalletLabel')}</strong> <span class="mono">${esc(state.wallet)}</span><br>
+        <strong>${translate('createBalanceLabel')}</strong> ${bal === null ? '…' : `${fmtSol(bal)} SOL`}
+        ${cost ? translate('createNeedSol', { need: fmtSol(need), rent: fmtSol(cost.mintRentSol + cost.ataRentSol) }) : ''}
+        ${low ? translate('createLowBalance', { short: fmtSol(need - bal) }) : ''}
+        <div style="margin-top:8px"><button class="btn btn-sm" id="refreshBalBtn">${translate('createRefreshBalance')}</button></div>
       </div>
       <div class="alert alert-info">
-        <strong>Jaringan:</strong> pastikan Phantom di <strong>Devnet</strong> sebelum mint (Pengaturan → Developer Settings → Testnet Mode → Devnet). Kalau Phantom di Mainnet, minting akan gagal dengan "Failed to simulate" / "Not enough SOL" — Phantom memeriksa saldo Mainnet-mu, bukan saldo devnet.
+        ${translate('createNetworkNote')}
       </div>`;
     document.getElementById('refreshBalBtn').onclick = () => updateWalletStatus();
   }
@@ -903,26 +1082,26 @@ async function renderCreate() {
     };
 
     if (!name || !ticker) {
-      fail('Nama dan ticker wajib diisi.');
+      fail(translate('errNameTickerRequired'));
       return;
     }
     if (!document.getElementById('devnetConfirm').checked) {
-      fail('Centang dulu konfirmasi Devnet di atas — pastikan Phantom di jaringan Devnet sebelum minting, supaya tidak gagal dengan "Failed to simulate".');
+      fail(translate('errDevnetConfirm'));
       return;
     }
     if (!solanaLibsReady()) {
-      fail('Library Solana gagal dimuat. Muat ulang halaman dan coba lagi.');
+      fail(translate('errSolanaLibs'));
       return;
     }
     // Re-detect Phantom fresh (late injection) and re-check everything
     // right now — never trust connect-time state.
     const phantom = (await waitForPhantom(3000)) || getPhantom();
     if (!phantom) {
-      fail('Phantom tidak terdeteksi. Instal ekstensi Phantom (di HP, buka situs ini dari browser di dalam aplikasi Phantom).');
+      fail(translate('errPhantomNotDetected'));
       return;
     }
     if (!state.wallet) {
-      fail('Hubungkan dompet Phantom dulu.');
+      fail(translate('errConnectFirst'));
       return;
     }
     // Sync with the account currently active in Phantom: the user may have
@@ -931,17 +1110,17 @@ async function renderCreate() {
     // through to the popup.
     const synced = await syncWalletAccount();
     if (!synced) {
-      fail('Tidak bisa membaca akun aktif di Phantom. Buka Phantom dan coba lagi.');
+      fail(translate('errReadAccount'));
       return;
     }
 
     const steps = [
-      'Memeriksa dompet & saldo',
-      'Membangun + simulasi transaksi mint',
-      'Tanda tangan mint di Phantom',
-      'Mengirim & konfirmasi mint',
-      'Transfer 800M token ke pool (funding)',
-      'Memverifikasi & mendaftarkan coin',
+      translate('stepWallet'),
+      translate('stepBuildMint'),
+      translate('stepSignMint'),
+      translate('stepSendMint'),
+      translate('stepFunding'),
+      translate('stepRegister'),
     ];
     const paint = (activeIdx, doneUntil) => {
       stepsEl.innerHTML = `<ul class="steps">${steps
@@ -969,16 +1148,16 @@ async function renderCreate() {
         ]);
         state.balanceSol = bal;
         cost = c;
-        if (!rpcOk) throw new Error('Endpoint RPC bukan devnet — laporkan ke pengelola situs.');
+        if (!rpcOk) throw new Error(translate('errRpcNotDevnet'));
       } catch (err) {
-        fail(`Gagal memeriksa dompet: ${esc(friendlyError(err))}`);
+        fail(translate('errCheckWallet', { msg: esc(friendlyError(err)) }));
         return;
       }
       // Mint + funding need rent for the mint, two ATAs, and fees.
       const needTotal = cost.totalSol + 0.003;
       if (state.balanceSol < needTotal) {
         fail(
-          `Saldo devnet ${fmtSol(state.balanceSol)} SOL kurang dari ~${fmtSol(needTotal)} SOL yang dibutuhkan (mint + funding). Ambil SOL gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>, lalu periksa ulang saldo di atas.`
+          translate('errLowBalanceMint', { bal: fmtSol(state.balanceSol), need: fmtSol(needTotal) })
         );
         return;
       }
@@ -989,7 +1168,7 @@ async function renderCreate() {
       mintAddress = built.mintAddress;
       const sim = await simulateTransaction(built.transaction);
       if (!sim.ok) {
-        fail(`Transaksi mint tidak lolos simulasi devnet — belum ada yang ditandatangani.<br><span class="mono small">${esc(sim.error)}</span>`);
+        fail(`${translate('errMintSimFailed')}<br><span class="mono small">${esc(sim.error)}</span>`);
         return;
       }
 
@@ -1016,7 +1195,7 @@ async function renderCreate() {
           const fundingNeed = 0.003; // pool ATA rent (~0.002 SOL) + fee buffer
           if (balAfterMint < fundingNeed) {
             throw new Error(
-              `Saldo devnet tersisa ${fmtSol(balAfterMint)} SOL setelah mint — kurang dari ~${fmtSol(fundingNeed)} SOL untuk funding. Ambil SOL gratis di faucet.solana.com, lalu funding dari halaman coin.`
+              translate('errLowBalanceFunding', { bal: fmtSol(balAfterMint), need: fmtSol(fundingNeed) })
             );
           }
           const funding = await buildFundingTransaction(state.wallet, mintAddress, poolAddress);
@@ -1028,12 +1207,11 @@ async function renderCreate() {
         } catch (fundErr) {
           // Ask instead of failing the whole mint: the coin exists on-chain.
           const skip = window.confirm(
-            `Transfer funding 800M token ke pool gagal (${friendlyError(fundErr)}).\n\n` +
-              'Klik OK untuk tetap mendaftarkan coin TANPA trading (bisa di-funding nanti dari halaman coin), atau Batal untuk berhenti di sini.'
+            translate('confirmFundingFailed', { err: friendlyError(fundErr) })
           );
           if (!skip) {
             fail(
-              `Mint berhasil on-chain (${txLink(mintSignature)}), tapi funding dibatalkan. Coin belum terdaftar — kamu bisa mendaftarkannya nanti dengan tombol di bawah setelah funding berhasil.`
+              translate('errMintFundCancelled', { tx: txLink(mintSignature) })
             );
             savePendingMint({
               mintAddress,
@@ -1043,8 +1221,9 @@ async function renderCreate() {
               creatorWallet: state.wallet,
               txSignature: mintSignature,
               fundingTxSignature: null,
+              pairMint: selectedPairMint,
               image: logo,
-              error: 'funding dibatalkan',
+              error: translate('pendingErrFundingCancelled'),
             });
             renderPendingMint();
             return;
@@ -1064,6 +1243,7 @@ async function renderCreate() {
           creatorWallet: state.wallet,
           txSignature: mintSignature,
           fundingTxSignature: fundingSignature || undefined,
+          pairMint: selectedPairMint || undefined,
           image: logo,
         });
       } catch (regErr) {
@@ -1077,21 +1257,27 @@ async function renderCreate() {
           creatorWallet: state.wallet,
           txSignature: mintSignature,
           fundingTxSignature: fundingSignature || null,
+          pairMint: selectedPairMint,
           image: logo,
           error: regErr.message,
         });
         renderPendingMint();
         fail(
-          `Mint berhasil on-chain (${txLink(mintSignature)}), tapi pendaftaran gagal: ${esc(regErr.message)}. Gunakan tombol "Coba daftarkan lagi" di atas — tidak perlu mint ulang.`
+          translate('errMintRegisterFailed', { tx: txLink(mintSignature), err: esc(regErr.message) })
         );
         return;
       }
-      savePendingMint(null);
+      // Clear the pending mint ONLY if it is the coin just registered: a
+      // pending mint for a DIFFERENT coin (an earlier failed registration)
+      // must survive, so the user can still retry it after creating
+      // another coin. One wallet can create many coins.
+      const pending = loadPendingMint();
+      if (!pending || pending.mintAddress === mintAddress) savePendingMint(null);
       paint(5, 5);
-      toast(`Coin $${ticker} berhasil dibuat!`);
+      toast(translate('toastCoinCreated', { ticker }));
       location.hash = `#/coin/${mintAddress}`;
     } catch (err) {
-      fail(`Mint gagal: ${esc(friendlyError(err))}`);
+      fail(translate('errMintFailed', { msg: esc(friendlyError(err)) }));
     }
   }
 }
@@ -1099,20 +1285,24 @@ async function renderCreate() {
 // ---------- Coin detail ----------
 async function renderCoin(mintAddress) {
   const view = document.getElementById('view');
-  view.innerHTML = '<p class="muted">Memuat coin…</p>';
+  view.innerHTML = `<p class="muted">${translate('loadingCoin')}</p>`;
   let data;
   try {
     const params = state.wallet ? `?wallet=${encodeURIComponent(state.wallet)}` : '';
     data = await apiGet(`/api/coins/${mintAddress}${params}`);
   } catch (err) {
-    view.innerHTML = `<div class="alert alert-error">Gagal memuat coin: ${esc(err.message)}</div>
-      <p><a href="#/">Kembali ke Beranda</a></p>`;
+    view.innerHTML = `<div class="alert alert-error">${esc(translate('errLoadCoin', { msg: err.message }))}</div>
+      <p><a href="#/">${translate('backHome')}</a></p>`;
     return;
   }
   state.coinCache = data;
-  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, walletPnl, walletTrades, solUsd } = data;
+  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd } = data;
   const chg = stats.changePct >= 0 ? 'profit' : 'loss';
   const isCreator = state.wallet && state.wallet === coin.creatorWallet;
+  // Pair asset: SOL for SOL pairs, the pair coin's ticker for coin pairs.
+  const pairAsset = (coin.pairAsset && coin.pairAsset.symbol) || 'SOL';
+  const pairAvailable = !coin.pairAsset || coin.pairAsset.available !== false;
+  const pairLabel = coin.pairLabel || `${coin.ticker}/SOL`;
 
   view.innerHTML = `
     <div class="card">
@@ -1120,29 +1310,33 @@ async function renderCoin(mintAddress) {
         ${logoHtml(coin, 'coin-logo detail-head-logo')}
         <div>
           <div class="coin-name" style="font-size:1.3rem">${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span></div>
-          <div class="small muted">${esc(coin.ticker)}/SOL • Dibuat ${fmtAgo(coin.createdAt)} oleh ${creatorLink(coin.creatorWallet)}</div>
+          <div class="small muted">${esc(pairLabel)} • ${translate('coinCreatedBy', { ago: fmtAgo(coin.createdAt), creator: creatorLink(coin.creatorWallet) })}</div>
         </div>
-        <span class="badge badge-ok" style="margin-left:auto">✓ Terverifikasi on-chain</span>
-        ${coin.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
+        <span class="badge badge-ok" style="margin-left:auto">${translate('badgeVerified')}</span>
+        ${coin.tradingEnabled ? '' : `<span class="badge badge-warn">${translate('badgeTradingOff')}</span>`}
         ${state.wallet && !isCreator
-          ? `<button class="btn btn-sm" id="followCreatorBtn">${viewerFollowsCreator ? '✓ Mengikuti' : '+ Ikuti kreator'}</button>`
+          ? `<button class="btn btn-sm" id="followCreatorBtn">${viewerFollowsCreator ? translate('followFollowing') : translate('followCreator')}</button>`
           : ''}
       </div>
       ${coin.description ? `<p>${esc(coin.description)}</p>` : ''}
+      ${!pairAvailable ? `
+      <div class="alert alert-error">
+        <strong>${translate('pairUnavailableTitle')}</strong> ${translate('pairUnavailableBody')}
+      </div>` : ''}
       ${coin.tradingEnabled ? '' : `
       <div class="alert alert-info" id="fundingBox">
-        <strong>Trading belum aktif.</strong> Kreator belum memindahkan 800.000.000 token ke dompet pool, jadi coin ini belum bisa diperdagangkan.
-        ${state.wallet === coin.creatorWallet ? '<div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="fundPoolBtn">Fund pool sekarang (800M token)</button></div><div id="fundResult"></div>' : ''}
+        <strong>${translate('fundingTitle')}</strong> ${translate('fundingBody')}
+        ${state.wallet === coin.creatorWallet ? `<div style="margin-top:8px"><button class="btn btn-sm btn-primary" id="fundPoolBtn">${translate('fundingBtn')}</button></div><div id="fundResult"></div>` : ''}
       </div>`}
       <div class="proof">
-        <div class="row"><span class="k">Alamat mint</span>
+        <div class="row"><span class="k">${translate('proofMintAddress')}</span>
           <span class="mono">${esc(shortAddr(coin.mintAddress))}</span>
-          <button class="btn btn-sm btn-ghost" data-copy="${esc(coin.mintAddress)}">Salin</button>
-          <a href="${EXPLORER}/address/${esc(coin.mintAddress)}?cluster=devnet" target="_blank" rel="noopener">Explorer ↗</a>
+          <button class="btn btn-sm btn-ghost" data-copy="${esc(coin.mintAddress)}">${translate('copyBtn')}</button>
+          <a href="${EXPLORER}/address/${esc(coin.mintAddress)}?cluster=devnet" target="_blank" rel="noopener">${translate('explorerLink')}</a>
         </div>
-        <div class="row"><span class="k">Transaksi mint</span>
+        <div class="row"><span class="k">${translate('proofMintTx')}</span>
           <span class="mono">${esc(shortAddr(coin.txSignature))}</span>
-          <a href="${EXPLORER}/tx/${esc(coin.txSignature)}?cluster=devnet" target="_blank" rel="noopener">Explorer ↗</a>
+          <a href="${EXPLORER}/tx/${esc(coin.txSignature)}?cluster=devnet" target="_blank" rel="noopener">${translate('explorerLink')}</a>
         </div>
       </div>
     </div>
@@ -1151,90 +1345,118 @@ async function renderCoin(mintAddress) {
     <div class="detail-main">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
-        <h2 style="margin:0">Grafik Harga</h2>
+        <h2 style="margin:0">${translate('chartTitle')}</h2>
         <div style="text-align:right"><span style="font-size:1.2rem;font-weight:800">${fmtPriceBoth(stats.priceUsd, stats.price)}</span>
         <span class="${chg}"> ${fmtPct(stats.changePct)}</span>
-        <div class="small muted">Market Cap <b style="color:var(--text)">${fmtMarketCap(stats)}</b></div></div>
+        <div class="small muted">${translate('statMarketCap')} <b style="color:var(--text)">${fmtMarketCap(coin)}</b></div></div>
       </div>
       <div class="range-btns" style="margin-top:12px">
-        ${[0, 10, 25, 50]
-          .map(
-            (n) =>
-              `<button class="btn btn-sm ${state.chartRange === n ? 'active' : ''}" data-range="${n}">${
-                n === 0 ? 'Semua' : `${n} tx`
-              }</button>`
-          )
-          .join('')}
+        <button class="btn btn-sm ${state.chartType === 'area' ? 'active' : ''}" data-chart-type="area">${translate('chartArea')}</button>
+        <button class="btn btn-sm ${state.chartType === 'candles' ? 'active' : ''}" data-chart-type="candles">${translate('chartCandles')}</button>
+        ${state.chartType === 'candles'
+          ? ['1m', '5m', '15m', '1h']
+              .map(
+                (tf) =>
+                  `<button class="btn btn-sm ${state.candleTimeframe === tf ? 'active' : ''}" data-timeframe="${tf}">${tf}</button>`
+              )
+              .join('')
+          : [0, 10, 25, 50]
+              .map(
+                (n) =>
+                  `<button class="btn btn-sm ${state.chartRange === n ? 'active' : ''}" data-range="${n}">${
+                    n === 0 ? translate('rangeAll') : translate('rangeTx', { n })
+                  }</button>`
+              )
+              .join('')}
       </div>
       <div class="chart-wrap" id="chartWrap"></div>
     </div>
 
     <div class="card">
       <div class="stat-grid">
-        <div class="stat"><div class="label">Market Cap</div><div class="value">${fmtMarketCap(stats)}</div></div>
-        <div class="stat"><div class="label">Perubahan</div><div class="value ${chg}">${fmtPct(stats.changePct)}</div></div>
-        <div class="stat"><div class="label">Tertinggi</div><div class="value">${fmtPriceBoth(stats.highUsd, stats.high)}</div></div>
-        <div class="stat"><div class="label">Terendah</div><div class="value">${fmtPriceBoth(stats.lowUsd, stats.low)}</div></div>
-        <div class="stat"><div class="label">Volume</div><div class="value">${fmtSol(stats.volumeSol)} SOL</div></div>
-        <div class="stat"><div class="label">Fee Kreator Terkumpul</div><div class="value">${fmtSol(stats.totalFeesSol)} SOL</div></div>
-        <div class="stat"><div class="label">Transaksi</div><div class="value">${stats.txCount}</div></div>
-        <div class="stat"><div class="label">Trader Unik</div><div class="value">${stats.uniqueTraders}</div></div>
-        <div class="stat"><div class="label">Suplai</div><div class="value">1.000.000.000</div></div>
+        <div class="stat"><div class="label">${translate('statMarketCap')}</div><div class="value">${fmtMarketCap(coin)}</div></div>
+        <div class="stat"><div class="label">${translate('statChange')}</div><div class="value ${chg}">${fmtPct(stats.changePct)}</div></div>
+        <div class="stat"><div class="label">${translate('statHigh')}</div><div class="value">${fmtPriceBoth(stats.highUsd, stats.high)}</div></div>
+        <div class="stat"><div class="label">${translate('statLow')}</div><div class="value">${fmtPriceBoth(stats.lowUsd, stats.low)}</div></div>
+        <div class="stat"><div class="label">${translate('statVolume')}</div><div class="value">${fmtSol(stats.volumeSol)} ${esc(pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('statFeesCollected')}</div><div class="value">${fmtSol(stats.totalFeesSol)} ${esc(pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('statTxCount')}</div><div class="value">${stats.txCount}</div></div>
+        <div class="stat"><div class="label">${translate('statUniqueTraders')}</div><div class="value">${stats.uniqueTraders}</div></div>
+        <div class="stat"><div class="label">${translate('statSupply')}</div><div class="value">${fmtTokens(stats.circulatingSupply)}</div></div>
+        <div class="stat"><div class="label">${translate('statBurned')}</div><div class="value">${fmtTokens(stats.totalBurned)}</div></div>
       </div>
       <div style="margin-top:14px">
-        <div class="small muted">Kurva bonding: ${stats.progressPct.toFixed(1)}% menuju kelulusan (85 SOL)</div>
+        <div class="small muted">${translate('curveProgress', { pct: stats.progressPct.toFixed(1) })}</div>
         <div class="progress"><div style="width:${stats.progressPct.toFixed(1)}%"></div></div>
       </div>
     </div>
 
+    <div class="card" id="burnCard">
+      <h2 style="margin-top:0">${translate('burnTitle')}</h2>
+      <p class="small muted">${translate('burnIntro')}</p>
+      <div class="stat-grid" style="grid-template-columns:1fr 1fr">
+        <div class="stat"><div class="label">${translate('burnTotalLabel')}</div><div class="value">${fmtTokens(burnStats ? burnStats.totalBurned : 0)}</div></div>
+        <div class="stat"><div class="label">${translate('burnSupplyLabel')}</div><div class="value">${fmtTokens(burnStats ? burnStats.circulatingSupply : 1000000000)}</div></div>
+      </div>
+      <div id="burnForm" style="margin-top:12px"></div>
+      <div id="burnResult" style="margin-top:8px"></div>
+      <h3 style="margin-top:16px">${translate('burnHistoryTitle')} (${burnStats ? burnStats.burnCount : 0})</h3>
+      <div id="burnHistory"></div>
+    </div>
+
     <div class="card">
-      <h2 style="margin-top:0">Riwayat Transaksi</h2>
+      <h2 style="margin-top:0">${translate('tradesTitle')}</h2>
       <div class="tabs">
-        ${['Semua', 'Beli', 'Jual', 'Punyaku']
-          .map((t) => `<button class="btn btn-sm ${state.tradeTab === t ? 'active' : ''}" data-tab="${t}">${t}</button>`)
+        ${[['Semua', 'tabAll'], ['Beli', 'tabBuy'], ['Jual', 'tabSell'], ['Punyaku', 'tabMine']]
+          .map(([key, labelKey]) => `<button class="btn btn-sm ${state.tradeTab === key ? 'active' : ''}" data-tab="${key}">${translate(labelKey)}</button>`)
           .join('')}
       </div>
       <div class="table-wrap" id="tradesTable"></div>
     </div>
 
     <div class="card" id="calloutsCard">
-      <h2 style="margin-top:0">Callout (${(callouts || []).length})</h2>
-      <p class="small muted">Post singkat dari trader yang benar-benar membeli coin ini — entry price dan holdings dihitung dari transaksi devnet asli mereka, PnL-nya live mengikuti harga.</p>
+      <h2 style="margin-top:0">${translate('calloutsTitle', { n: (callouts || []).length })}</h2>
+      <p class="small muted">${translate('calloutsIntro')}</p>
       <div id="calloutForm"></div>
       <div id="calloutList">
         ${(callouts || []).length === 0
-          ? '<p class="muted">Belum ada callout untuk coin ini.</p>'
+          ? `<p class="muted">${translate('calloutsEmpty')}</p>`
           : (callouts || []).map((c) => calloutHtml(c)).join('')}
       </div>
     </div>
     </div>
     <aside class="detail-side">
       <div class="card trade-box">
-        <h2 style="margin-top:0">Beli / Jual <span class="badge badge-live">DEVNET ASLI</span></h2>
-        <p class="small muted">Trading asli di devnet: SOL dan token beneran berpindah on-chain lewat dompet pool kustodian (<span id="tradePoolAddr">…</span>). Devnet hanya untuk percobaan — SOL di sini token testnet gratis tanpa nilai uang.</p>
-        <p class="small"><b>${creatorFeePct}% creator fee</b> dari volume SOL setiap trade masuk ke kreator ${creatorLink(coin.creatorWallet)} — saat beli sudah termasuk dalam SOL yang kamu bayar, saat jual dipotong dari SOL yang kamu terima.</p>
+        <h2 style="margin-top:0">${translate('tradeTitle')} <span class="badge badge-live">${translate('badgeDevnetLive')}</span></h2>
+        <p class="small muted">${translate('tradeIntro', { asset: esc(pairAsset), pool: '<span id="tradePoolAddr">…</span>' })}</p>
+        <p class="small">${translate('tradeFeeNote', { pct: creatorFeePct, asset: esc(pairAsset), creator: creatorLink(coin.creatorWallet) })}</p>
         <div class="tabs">
-          <button class="btn btn-sm ${state.tradeSide === 'buy' ? 'active' : ''}" data-side="buy">Beli</button>
-          <button class="btn btn-sm ${state.tradeSide === 'sell' ? 'active' : ''}" data-side="sell">Jual</button>
+          <button class="btn btn-sm ${state.tradeSide === 'buy' ? 'active' : ''}" data-side="buy">${translate('tabBuy')}</button>
+          <button class="btn btn-sm ${state.tradeSide === 'sell' ? 'active' : ''}" data-side="sell">${translate('tabSell')}</button>
         </div>
         <div id="tradeForm"></div>
         <div id="tradeResult"></div>
       </div>
       <div class="card" id="pnlCard"></div>
+      <div class="card" id="transferCard">
+        <h2 style="margin-top:0">${translate('transferTitle')}</h2>
+        <div id="transferForm"></div>
+        <div id="transferResult" style="margin-top:8px"></div>
+      </div>
       <div class="card" id="feeCard">
-        <h2 style="margin-top:0">Fee Kreator <span class="badge badge-ok">${creatorFeePct}% dari setiap trade</span></h2>
+        <h2 style="margin-top:0">${translate('feeTitle')} <span class="badge badge-ok">${translate('feeBadge', { pct: creatorFeePct })}</span></h2>
         <div class="stat-grid" style="grid-template-columns:1fr 1fr">
-          <div class="stat"><div class="label">Total fee terkumpul</div><div class="value">${fmtSol(creatorFees.totalEarnedSol)} SOL</div></div>
-          <div class="stat"><div class="label">Sudah diklaim</div><div class="value">${fmtSol(creatorFees.totalClaimedSol)} SOL</div></div>
-          <div class="stat"><div class="label">Bisa diklaim</div><div class="value">${fmtSol(creatorFees.unclaimedSol)} SOL</div></div>
+          <div class="stat"><div class="label">${translate('feeTotal')}</div><div class="value">${fmtSol(creatorFees.totalEarnedSol)} ${esc(pairAsset)}</div></div>
+          <div class="stat"><div class="label">${translate('feeClaimed')}</div><div class="value">${fmtSol(creatorFees.totalClaimedSol)} ${esc(pairAsset)}</div></div>
+          <div class="stat"><div class="label">${translate('feeClaimable')}</div><div class="value">${fmtSol(creatorFees.unclaimedSol)} ${esc(pairAsset)}</div></div>
         </div>
         ${isCreator
           ? `<div style="margin-top:12px">
-              <button class="btn btn-primary" id="claimFeesBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>Klaim ${fmtSol(creatorFees.unclaimedSol)} SOL</button>
+              <button class="btn btn-primary" id="claimFeesBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>${translate('feeClaimBtn', { amount: fmtSol(creatorFees.unclaimedSol), asset: esc(pairAsset) })}</button>
               <div id="claimResult" style="margin-top:8px"></div>
-              <p class="small muted">Fee dikirim dari dompet pool ke dompetmu sebagai transaksi devnet asli. Klaim tercatat di riwayat transaksi.</p>
+              <p class="small muted">${translate('feeClaimNote')}</p>
             </div>`
-          : `<p class="small muted" style="margin-top:12px">1% dari volume SOL setiap beli dan jual masuk ke kreator ${creatorLink(coin.creatorWallet)}.</p>`}
+          : `<p class="small muted" style="margin-top:12px">${translate('feeNonCreatorNote', { asset: esc(pairAsset), creator: creatorLink(coin.creatorWallet) })}</p>`}
       </div>
     </aside>
     </div>`;
@@ -1242,7 +1464,7 @@ async function renderCoin(mintAddress) {
   // Copy buttons
   view.querySelectorAll('[data-copy]').forEach((b) => {
     b.addEventListener('click', () => {
-      navigator.clipboard.writeText(b.dataset.copy).then(() => toast('Disalin.'));
+      navigator.clipboard.writeText(b.dataset.copy).then(() => toast(translate('copiedGeneric')));
     });
   });
 
@@ -1262,17 +1484,17 @@ async function renderCoin(mintAddress) {
     claimBtn.addEventListener('click', async () => {
       const resEl = document.getElementById('claimResult');
       claimBtn.disabled = true;
-      resEl.innerHTML = '<p class="muted">Mengirim klaim dari pool…</p>';
+      resEl.innerHTML = `<p class="muted">${translate('claimSending')}</p>`;
       try {
         const res = await apiPost(`/api/coins/${coin.mintAddress}/claim-fees`, {
           wallet: state.wallet,
         });
-        resEl.innerHTML = `<div class="alert alert-success">Berhasil mengklaim ${fmtSol(res.claim.amountSol)} SOL! Transaksi: ${txLink(res.claim.txSignature)}</div>`;
+        resEl.innerHTML = `<div class="alert alert-success">${translate('claimSuccess', { amount: fmtSol(res.claim.amountSol), asset: esc(res.claim.assetSymbol || pairAsset), tx: txLink(res.claim.txSignature) })}</div>`;
         await refreshBalance();
         renderHeader();
         setTimeout(() => renderCoin(mintAddress), 1200);
       } catch (err) {
-        resEl.innerHTML = `<div class="alert alert-error">Klaim gagal: ${esc(friendlyError(err))}</div>`;
+        resEl.innerHTML = `<div class="alert alert-error">${esc(translate('claimFailed', { msg: friendlyError(err) }))}</div>`;
         claimBtn.disabled = false;
       }
     });
@@ -1284,7 +1506,7 @@ async function renderCoin(mintAddress) {
     if (el && state.poolAddress) {
       el.innerHTML = `<a class="mono" href="${EXPLORER}/address/${esc(state.poolAddress)}?cluster=devnet" target="_blank" rel="noopener">${esc(shortAddr(state.poolAddress))} ↗</a>`;
     } else if (el) {
-      el.textContent = 'tidak tersedia';
+      el.textContent = translate('notAvailable');
     }
   });
 
@@ -1295,36 +1517,36 @@ async function renderCoin(mintAddress) {
       const resEl = document.getElementById('fundResult');
       fundBtn.disabled = true;
       try {
-        if (!solanaLibsReady()) throw new Error('Library Solana gagal dimuat.');
+        if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsShort'));
         const phantom = (await waitForPhantom(3000)) || getPhantom();
-        if (!phantom) throw new Error('Phantom tidak terdeteksi.');
+        if (!phantom) throw new Error(translate('errPhantomShort'));
         // Sync with the account currently active in Phantom, then check
         // its fresh devnet balance against the funding cost (pool ATA rent
         // + fee) — never open a popup for a tx that cannot pay its fee.
         if (!(await syncWalletAccount())) {
-          throw new Error('Tidak bisa membaca akun aktif di Phantom.');
+          throw new Error(translate('errReadAccountShort'));
         }
         if (state.balanceSol !== null && state.balanceSol < 0.003) {
           throw new Error(
-            `Saldo devnet ${fmtSol(state.balanceSol)} SOL kurang dari ~0,003 SOL untuk funding. Ambil SOL gratis di faucet.solana.com.`
+            translate('errLowBalanceFund', { bal: fmtSol(state.balanceSol) })
           );
         }
         const poolAddress = await loadPoolAddress();
-        if (!poolAddress) throw new Error('Alamat pool tidak tersedia.');
-        resEl.innerHTML = '<p class="muted">Membangun transaksi funding…</p>';
+        if (!poolAddress) throw new Error(translate('errPoolUnavailable'));
+        resEl.innerHTML = `<p class="muted">${translate('fundingBuilding')}</p>`;
         const funding = await buildFundingTransaction(state.wallet, coin.mintAddress, poolAddress);
         const sim = await simulateTransaction(funding.transaction);
         if (!sim.ok) throw new Error(sim.error);
-        resEl.innerHTML = '<p class="muted">Tanda tangani transfer funding di Phantom…</p>';
+        resEl.innerHTML = `<p class="muted">${translate('fundingSign')}</p>`;
         const sig = await signAndSend(phantom, funding.transaction);
         await refreshBalance();
         renderHeader();
-        resEl.innerHTML = '<p class="muted">Memverifikasi funding on-chain…</p>';
+        resEl.innerHTML = `<p class="muted">${translate('fundingVerifying')}</p>`;
         await apiPost(`/api/coins/${coin.mintAddress}/fund`, { fundingTxSignature: sig });
-        toast('Pool ter-funding — trading aktif!');
+        toast(translate('toastFunded'));
         renderCoin(mintAddress);
       } catch (err) {
-        resEl.innerHTML = `<div class="alert alert-error">Funding gagal: ${esc(friendlyError(err))}</div>`;
+        resEl.innerHTML = `<div class="alert alert-error">${esc(translate('fundingFailed', { msg: friendlyError(err) }))}</div>`;
         fundBtn.disabled = false;
       }
     });
@@ -1334,6 +1556,20 @@ async function renderCoin(mintAddress) {
   view.querySelectorAll('[data-range]').forEach((b) => {
     b.addEventListener('click', () => {
       state.chartRange = Number(b.dataset.range);
+      renderCoin(mintAddress);
+    });
+  });
+
+  // Chart type toggle (Area / Candles) + candle timeframe pills.
+  view.querySelectorAll('[data-chart-type]').forEach((b) => {
+    b.addEventListener('click', () => {
+      state.chartType = b.dataset.chartType;
+      renderCoin(mintAddress);
+    });
+  });
+  view.querySelectorAll('[data-timeframe]').forEach((b) => {
+    b.addEventListener('click', () => {
+      state.candleTimeframe = b.dataset.timeframe;
       renderCoin(mintAddress);
     });
   });
@@ -1357,11 +1593,18 @@ async function renderCoin(mintAddress) {
     });
   });
 
-  renderChartEl(document.getElementById('chartWrap'), chart, state.chartRange);
+  if (state.chartType === 'candles') {
+    await renderCandleChartEl(document.getElementById('chartWrap'), mintAddress, state.candleTimeframe);
+  } else {
+    renderChartEl(document.getElementById('chartWrap'), chart, state.chartRange);
+  }
   // Live on-chain balances before the trade form renders (MAX uses them).
   await refreshOnchainBalances();
   renderTradeForm();
   renderPnlCard();
+  renderBurnForm();
+  renderBurnHistory();
+  renderTransferForm();
   renderTradesTable();
   renderCalloutForm();
 
@@ -1370,20 +1613,20 @@ async function renderCoin(mintAddress) {
   function renderCalloutForm() {
     const form = document.getElementById('calloutForm');
     if (!state.wallet) {
-      form.innerHTML = `<p class="muted">Hubungkan dompet untuk membuat callout.</p>`;
+      form.innerHTML = `<p class="muted">${translate('calloutConnectFirst')}</p>`;
       return;
     }
     const hasBuy = (walletTrades || []).some((t) => t.side === 'buy');
     if (!hasBuy) {
-      form.innerHTML = `<p class="muted">Kamu belum membeli coin ini — beli dulu untuk membuat callout (hanya pembeli terverifikasi yang bisa posting).</p>`;
+      form.innerHTML = `<p class="muted">${translate('calloutNoBuy')}</p>`;
       return;
     }
     form.innerHTML = `
       <div class="field">
-        <textarea id="calloutText" rows="2" maxlength="280" placeholder="Call coin ini… (maks 280 karakter)"></textarea>
+        <textarea id="calloutText" rows="2" maxlength="280" placeholder="${translate('calloutPlaceholder')}"></textarea>
         <div class="small muted" style="text-align:right"><span id="calloutCount">0</span>/280</div>
       </div>
-      <button class="btn btn-primary" id="postCalloutBtn">Posting Callout</button>
+      <button class="btn btn-primary" id="postCalloutBtn">${translate('calloutPostBtn')}</button>
       <div id="calloutResult" style="margin-top:8px"></div>`;
     const input = document.getElementById('calloutText');
     const count = document.getElementById('calloutCount');
@@ -1395,7 +1638,7 @@ async function renderCoin(mintAddress) {
       const resEl = document.getElementById('calloutResult');
       const btn = document.getElementById('postCalloutBtn');
       if (!text) {
-        toast('Tulis callout-mu dulu.');
+        toast(translate('errCalloutEmpty'));
         return;
       }
       btn.disabled = true;
@@ -1404,10 +1647,10 @@ async function renderCoin(mintAddress) {
           wallet: state.wallet,
           text,
         });
-        toast('Callout diposting!');
+        toast(translate('toastCalloutPosted'));
         renderCoin(mintAddress);
       } catch (err) {
-        resEl.innerHTML = `<div class="alert alert-error">Gagal posting: ${esc(friendlyError(err))}</div>`;
+        resEl.innerHTML = `<div class="alert alert-error">${esc(translate('errCalloutPost', { msg: friendlyError(err) }))}</div>`;
         btn.disabled = false;
       }
     });
@@ -1419,28 +1662,39 @@ async function renderCoin(mintAddress) {
     // Live on-chain holdings (the user may also hold minted tokens, which
     // the trade history does not know about).
     const liveHoldings = state.onchainBalances[coin.mintAddress] || 0;
+    // USD price of one unit of the pair asset (SOL/USD for SOL pairs, the
+    // pair coin's USD token price for coin pairs) — converts execution
+    // prices to USD.
+    const assetUsd = Number.isFinite(coin.pairAssetUsd) ? coin.pairAssetUsd : null;
+    if (!pairAvailable) {
+      form.innerHTML = `<p class="muted">${translate('pairUnavailableBody')}</p>`;
+      return;
+    }
     if (!coin.tradingEnabled) {
-      form.innerHTML = `<p class="muted">Trading belum aktif untuk coin ini — kreator belum memindahkan 800.000.000 token ke pool.</p>`;
+      form.innerHTML = `<p class="muted">${translate('tradeNotActive')}</p>`;
       return;
     }
     if (!state.wallet) {
-      form.innerHTML = `<p class="muted">Hubungkan dompet Phantom untuk trading di devnet.</p>
-        <button class="btn btn-primary" id="connectTrade">Hubungkan Phantom</button>`;
+      form.innerHTML = `<p class="muted">${translate('tradeConnectFirst')}</p>
+        <button class="btn btn-primary" id="connectTrade">${translate('headerConnect')}</button>`;
       document.getElementById('connectTrade').onclick = connectWallet;
       return;
     }
     if (state.tradeSide === 'buy') {
+      // Quick amounts are pair-aware: SOL pairs use SOL amounts, coin
+      // pairs use pair-token amounts (min buy is 1,000 pair tokens).
+      const quickAmounts = pairAsset === 'SOL' ? [0.1, 0.5, 1, 5] : [1000, 100000, 1000000, 10000000];
       form.innerHTML = `
         <div class="field">
-          <label>Jumlah SOL</label>
-          <input id="buySol" type="number" min="0" step="0.01" placeholder="0.5">
+          <label>${translate('buyAmountLabel', { asset: esc(pairAsset) })}</label>
+          <input id="buySol" type="number" min="0" step="any" placeholder="${pairAsset === 'SOL' ? '0.5' : '100000'}">
           <div class="quick">
-            ${[0.1, 0.5, 1, 5].map((v) => `<button class="btn" data-quick="${v}">${v} SOL</button>`).join('')}
+            ${quickAmounts.map((v) => `<button class="btn" data-quick="${v}">${fmtTokens(v)} ${esc(pairAsset)}</button>`).join('')}
           </div>
           <div class="estimate" id="buyEstimate"></div>
         </div>
-        <button class="btn btn-buy" id="buyBtn">Beli $${esc(coin.ticker)}</button>
-        <p class="small muted" style="margin-top:8px">Kamu akan menandatangani transfer SOL asli ke dompet pool, lalu pool mengirim token ke dompetmu.</p>`;
+        <button class="btn btn-buy" id="buyBtn">${translate('buyBtnLabel', { ticker: esc(coin.ticker) })}</button>
+        <p class="small muted" style="margin-top:8px">${translate('buyNote', { asset: esc(pairAsset) })}</p>`;
       const input = document.getElementById('buySol');
       const update = () => {
         const sol = Number(input.value);
@@ -1449,8 +1703,15 @@ async function renderCoin(mintAddress) {
           const tokens = (coin.tokenReserve * sol) / (coin.solReserve + sol);
           const fee = (sol * creatorFeePct) / 100;
           const execSol = sol / tokens;
-          const execUsd = Number.isFinite(solUsd) ? execSol * solUsd : null;
-          est.textContent = `≈ ${fmtTokens(tokens)} ${coin.ticker} (harga eksekusi ≈ ${fmtPriceBoth(execUsd, execSol)}) • Fee kreator ${creatorFeePct}%: ${fmtSol(fee)} SOL`;
+          const execUsd = assetUsd !== null ? execSol * assetUsd : null;
+          est.textContent = translate('buyEstimate', {
+            tokens: fmtTokens(tokens),
+            ticker: coin.ticker,
+            price: fmtPriceBoth(execUsd, execSol),
+            pct: creatorFeePct,
+            fee: fmtSol(fee),
+            asset: pairAsset,
+          });
         } else est.textContent = '';
       };
       input.addEventListener('input', update);
@@ -1462,21 +1723,21 @@ async function renderCoin(mintAddress) {
       });
       document.getElementById('buyBtn').addEventListener('click', async () => {
         const sol = Number(input.value);
-        if (!(sol > 0)) return toast('Masukkan jumlah SOL.');
+        if (!(sol > 0)) return toast(translate('errEnterSol', { asset: pairAsset }));
         await submitTrade('buy', { solAmount: sol });
       });
     } else {
       form.innerHTML = `
         <div class="field">
-          <label>Jumlah ${esc(coin.ticker)}</label>
+          <label>${translate('sellAmountLabel', { ticker: esc(coin.ticker) })}</label>
           <input id="sellTokens" type="number" min="0" step="any" placeholder="1000000">
           <div class="quick">
-            <button class="btn" id="maxSell">MAX (${fmtTokens(liveHoldings)})</button>
+            <button class="btn" id="maxSell">${translate('sellMax', { bal: fmtTokens(liveHoldings) })}</button>
           </div>
           <div class="estimate" id="sellEstimate"></div>
         </div>
-        <button class="btn btn-sell" id="sellBtn">Jual $${esc(coin.ticker)}</button>
-        <p class="small muted" style="margin-top:8px">Kamu akan menandatangani transfer token asli ke dompet pool, lalu pool mengirim SOL ke dompetmu.</p>`;
+        <button class="btn btn-sell" id="sellBtn">${translate('sellBtnLabel', { ticker: esc(coin.ticker) })}</button>
+        <p class="small muted" style="margin-top:8px">${translate('sellNote', { asset: esc(pairAsset) })}</p>`;
       const input = document.getElementById('sellTokens');
       const update = () => {
         const tokens = Number(input.value);
@@ -1485,8 +1746,14 @@ async function renderCoin(mintAddress) {
           const sol = (coin.solReserve * tokens) / (coin.tokenReserve + tokens);
           const fee = (sol * creatorFeePct) / 100;
           const execSol = sol / tokens;
-          const execUsd = Number.isFinite(solUsd) ? execSol * solUsd : null;
-          est.textContent = `≈ ${fmtSol(sol - fee)} SOL diterima setelah fee kreator ${creatorFeePct}% (${fmtSol(fee)} SOL) • Harga eksekusi ≈ ${fmtPriceBoth(execUsd, execSol)}`;
+          const execUsd = assetUsd !== null ? execSol * assetUsd : null;
+          est.textContent = translate('sellEstimate', {
+            amount: fmtSol(sol - fee),
+            asset: pairAsset,
+            pct: creatorFeePct,
+            fee: fmtSol(fee),
+            price: fmtPriceBoth(execUsd, execSol),
+          });
         } else est.textContent = '';
       };
       input.addEventListener('input', update);
@@ -1496,21 +1763,23 @@ async function renderCoin(mintAddress) {
       });
       document.getElementById('sellBtn').addEventListener('click', async () => {
         const tokens = Number(input.value);
-        if (!(tokens > 0)) return toast('Masukkan jumlah token.');
+        if (!(tokens > 0)) return toast(translate('errEnterTokens'));
         await submitTrade('sell', { tokenAmount: tokens });
       });
     }
     if (pnl && pnl.totalTrades > 0) {
       const pnlUsd = Number.isFinite(pnl.totalPnlUsd)
-        ? `${fmtSignedUsd(pnl.totalPnlUsd)} <span class="muted">(${fmtSignedSol(pnl.totalPnlSol)})</span>`
-        : fmtSignedSol(pnl.totalPnlSol);
+        ? `${fmtSignedUsd(pnl.totalPnlUsd)} <span class="muted">(${fmtSignedSol(pnl.totalPnlSol, pairAsset)})</span>`
+        : fmtSignedSol(pnl.totalPnlSol, pairAsset);
       form.insertAdjacentHTML(
         'beforeend',
-        `<p class="small" style="margin-top:10px">Saldo on-chain: <b>${fmtTokens(liveHoldings)} ${esc(
-          coin.ticker
-        )}</b> • PnL <b class="${pnl.totalPnlSol >= 0 ? 'profit' : 'loss'}">${pnlUsd} (${fmtPct(
-          pnl.roiPct
-        )})</b></p>`
+        `<p class="small" style="margin-top:10px">${translate('tradeFooterBalance', {
+          bal: fmtTokens(liveHoldings),
+          ticker: esc(coin.ticker),
+          cls: pnl.totalPnlSol >= 0 ? 'profit' : 'loss',
+          pnl: pnlUsd,
+          roi: fmtPct(pnl.roiPct),
+        })}</p>`
       );
     }
   }
@@ -1518,6 +1787,8 @@ async function renderCoin(mintAddress) {
   // Real trade flow: prepare (quote + balance pre-checks, server-side) ->
   // build the user's leg -> simulate -> sign in Phantom -> send + confirm
   // -> server verifies the leg on-chain, completes the pool leg, records.
+  // The user's leg is a SOL transfer for SOL pairs, a pair-token transfer
+  // for coin pairs (buildPairBuyTransaction).
   async function submitTrade(side, amounts) {
     const resEl = document.getElementById('tradeResult');
     const btn = document.getElementById(side === 'buy' ? 'buyBtn' : 'sellBtn');
@@ -1530,19 +1801,19 @@ async function renderCoin(mintAddress) {
       resEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
     };
     try {
-      if (!solanaLibsReady()) throw new Error('Library Solana gagal dimuat. Muat ulang halaman.');
+      if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
       const phantom = (await waitForPhantom(3000)) || getPhantom();
-      if (!phantom) throw new Error('Phantom tidak terdeteksi.');
+      if (!phantom) throw new Error(translate('errPhantomShort'));
       // Sync with the account currently active in Phantom so the quote and
       // balance checks apply to the account that will actually sign.
       if (!(await syncWalletAccount())) {
-        throw new Error('Tidak bisa membaca akun aktif di Phantom.');
+        throw new Error(translate('errReadAccountShort'));
       }
       const poolAddress = await loadPoolAddress();
-      if (!poolAddress) throw new Error('Alamat pool tidak tersedia.');
+      if (!poolAddress) throw new Error(translate('errPoolUnavailable'));
 
       // 1. Prepare: quote + pool/user balance checks BEFORE signing.
-      setBusy('Memeriksa kuota & saldo pool…');
+      setBusy(translate('tradePreparing'));
       const prepared = await apiPost('/api/trades/prepare', {
         mintAddress: coin.mintAddress,
         wallet: state.wallet,
@@ -1551,20 +1822,30 @@ async function renderCoin(mintAddress) {
       });
 
       // 2. Build the user's leg and simulate it before asking to sign.
-      setBusy('Membangun transaksi…');
-      const built =
-        side === 'buy'
-          ? await buildBuyTransaction(state.wallet, coin.mintAddress, poolAddress, prepared.solAmount)
-          : await buildSellTransaction(state.wallet, coin.mintAddress, poolAddress, prepared.tokenAmount);
+      setBusy(translate('tradeBuilding'));
+      let built;
+      if (side === 'buy' && coin.pairMint) {
+        built = await buildPairBuyTransaction(
+          state.wallet,
+          coin.mintAddress,
+          coin.pairMint,
+          poolAddress,
+          prepared.solAmount
+        );
+      } else if (side === 'buy') {
+        built = await buildBuyTransaction(state.wallet, coin.mintAddress, poolAddress, prepared.solAmount);
+      } else {
+        built = await buildSellTransaction(state.wallet, coin.mintAddress, poolAddress, prepared.tokenAmount);
+      }
       const sim = await simulateTransaction(built.transaction);
       if (!sim.ok) throw new Error(`Simulasi gagal: ${sim.error}`);
 
       // 3. Sign + send + confirm the user's leg.
-      setBusy('Tanda tangani transaksi di Phantom…');
+      setBusy(translate('tradeSigning'));
       const userSig = await signAndSend(phantom, built.transaction);
 
       // 4. Server verifies the leg on-chain, completes the pool leg, records.
-      setBusy('Memverifikasi & menyelesaikan trade…');
+      setBusy(translate('tradeSettling'));
       const res = await apiPost(`/api/trades/${side}`, {
         mintAddress: coin.mintAddress,
         wallet: state.wallet,
@@ -1573,56 +1854,62 @@ async function renderCoin(mintAddress) {
       });
       const receivedNote =
         side === 'sell'
-          ? ` Kamu menerima ${fmtSol(res.netSolAmount)} SOL setelah fee kreator ${fmtSol(res.trade.feeSol)} SOL.`
-          : ` Termasuk fee kreator ${fmtSol(res.trade.feeSol)} SOL.`;
-      const execUsd = Number.isFinite(solUsd) ? res.trade.price * solUsd : null;
-      resEl.innerHTML = `<div class="alert alert-success">${side === 'buy' ? 'Beli' : 'Jual'} berhasil: ${fmtTokens(
-        res.trade.tokenAmount
-      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPriceBoth(execUsd, res.trade.price)}.${receivedNote}<br>
-      Transaksimu: ${txLink(res.trade.userTxSignature)} • Transaksi pool: ${txLink(res.trade.poolTxSignature)}</div>`;
+          ? translate('tradeSuccessNet', { amount: fmtSol(res.netSolAmount), fee: fmtSol(res.trade.feeSol), asset: pairAsset })
+          : translate('tradeSuccessFee', { fee: fmtSol(res.trade.feeSol), asset: pairAsset });
+      const assetUsd = Number.isFinite(coin.pairAssetUsd) ? coin.pairAssetUsd : null;
+      const execUsd = assetUsd !== null ? res.trade.price * assetUsd : null;
+      const successMsg = translate(side === 'buy' ? 'tradeSuccessBuy' : 'tradeSuccessSell', {
+        tokens: fmtTokens(res.trade.tokenAmount),
+        ticker: esc(coin.ticker),
+        amount: fmtSol(res.trade.solAmount),
+        asset: pairAsset,
+        price: fmtPriceBoth(execUsd, res.trade.price),
+      });
+      resEl.innerHTML = `<div class="alert alert-success">${successMsg}${receivedNote}<br>
+      ${translate('tradeSuccessTxs', { userTx: txLink(res.trade.userTxSignature), poolTx: txLink(res.trade.poolTxSignature) })}</div>`;
       await refreshBalance();
       renderHeader();
       await refreshOnchainBalances();
       setTimeout(() => renderCoin(mintAddress), 800);
     } catch (err) {
-      fail(`Gagal: ${esc(friendlyError(err))}`);
+      fail(esc(translate('errGeneric', { msg: friendlyError(err) })));
     }
   }
 
   function renderPnlCard() {
     const card = document.getElementById('pnlCard');
     if (!state.wallet) {
-      card.innerHTML = `<h2 style="margin-top:0">Profit / Loss</h2>
-        <p class="muted">Hubungkan dompet untuk melihat untung-rugi kamu di coin ini.</p>`;
+      card.innerHTML = `<h2 style="margin-top:0">${translate('pnlTitle')}</h2>
+        <p class="muted">${translate('pnlConnectFirst')}</p>`;
       return;
     }
     if (!walletPnl || walletPnl.totalTrades === 0) {
-      card.innerHTML = `<h2 style="margin-top:0">Profit / Loss</h2>
-        <p class="muted">Belum ada transaksi di coin ini. Beli dulu untuk mulai melacak PnL.</p>
-        <p class="small">Saldo on-chain di dompetmu: <b>${fmtTokens(state.onchainBalances[coin.mintAddress] || 0)} ${esc(coin.ticker)}</b></p>`;
+      card.innerHTML = `<h2 style="margin-top:0">${translate('pnlTitle')}</h2>
+        <p class="muted">${translate('pnlEmpty')}</p>
+        <p class="small">${translate('pnlOnchainBalance', { bal: fmtTokens(state.onchainBalances[coin.mintAddress] || 0), ticker: esc(coin.ticker) })}</p>`;
       return;
     }
     const p = walletPnl;
     const cls = p.totalPnlSol >= 0 ? 'profit' : 'loss';
     card.innerHTML = `
-      <h2 style="margin-top:0">Profit / Loss
+      <h2 style="margin-top:0">${translate('pnlTitle')}
         <span class="badge ${p.totalPnlSol >= 0 ? 'badge-buy' : 'badge-sell'}" style="float:right">${
-          p.totalPnlSol >= 0 ? 'UNTUNG' : 'RUGI'
+          p.totalPnlSol >= 0 ? translate('pnlProfit') : translate('pnlLoss')
         }</span>
       </h2>
       <div class="pnl-grid">
-        <div class="stat"><div class="label">Holdings (dari trading)</div><div class="value">${fmtTokens(p.holdings)}</div></div>
-        <div class="stat"><div class="label">Saldo On-chain di Dompet</div><div class="value">${fmtTokens(state.onchainBalances[coin.mintAddress] || 0)}</div></div>
-        <div class="stat"><div class="label">Harga Rata-rata Beli</div><div class="value">${fmtPriceBoth(p.avgBuyPriceUsd, p.avgBuyPrice)}</div></div>
-        <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtMoneyBoth(p.costBasisUsd, p.costBasisSol)}</div></div>
-        <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtMoneyBoth(p.currentValueUsd, p.currentValueSol)}</div></div>
-        <div class="stat"><div class="label">Unrealized PnL</div><div class="value ${p.unrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.unrealizedPnlUsd, p.unrealizedPnlSol, true)}</div></div>
-        <div class="stat"><div class="label">Realized PnL</div><div class="value ${p.realizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.realizedPnlUsd, p.realizedPnlSol, true)}</div></div>
-        <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtMoneyBoth(p.totalPnlUsd, p.totalPnlSol, true)}</div></div>
-        <div class="stat"><div class="label">ROI</div><div class="value ${cls}">${fmtPct(p.roiPct)}</div></div>
-        <div class="stat"><div class="label">Fee Kreator Dibayar</div><div class="value">${fmtSol(p.totalFeesPaidSol || 0)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('pnlHoldings')}</div><div class="value">${fmtTokens(p.holdings)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlOnchain')}</div><div class="value">${fmtTokens(state.onchainBalances[coin.mintAddress] || 0)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlAvgBuy')}</div><div class="value">${fmtPriceBoth(p.avgBuyPriceUsd, p.avgBuyPrice)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlCostBasis')}</div><div class="value">${fmtMoneyBoth(p.costBasisUsd, p.costBasisSol, false, pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlCurrentValue')}</div><div class="value">${fmtMoneyBoth(p.currentValueUsd, p.currentValueSol, false, pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlUnrealized')}</div><div class="value ${p.unrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.unrealizedPnlUsd, p.unrealizedPnlSol, true, pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlRealized')}</div><div class="value ${p.realizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.realizedPnlUsd, p.realizedPnlSol, true, pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlTotal')}</div><div class="value ${cls}">${fmtMoneyBoth(p.totalPnlUsd, p.totalPnlSol, true, pairAsset)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlRoi')}</div><div class="value ${cls}">${fmtPct(p.roiPct)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlFeesPaid')}</div><div class="value">${fmtSol(p.totalFeesPaidSol || 0)} ${esc(pairAsset)}</div></div>
       </div>
-      <p class="small muted" style="margin-top:10px">Metode average-cost, dihitung server dari transaksi devnet yang tercatat. Jual dihitung dari SOL bersih setelah fee kreator 1%.</p>`;
+      <p class="small muted" style="margin-top:10px">${translate('pnlNote', { asset: esc(pairAsset) })}</p>`;
   }
 
   function renderTradesTable() {
@@ -1642,7 +1929,7 @@ async function renderCoin(mintAddress) {
     else if (state.tradeTab === 'Jual') rows = rows.filter((t) => t.side === 'sell');
     else if (state.tradeTab === 'Punyaku') {
       if (!state.wallet) {
-        wrap.innerHTML = '<p class="muted">Hubungkan dompet untuk melihat transaksimu.</p>';
+        wrap.innerHTML = `<p class="muted">${translate('tradesConnectFirst')}</p>`;
         return;
       }
       rows = walletTrades.map((t) => ({ kind: 'trade', ...t }));
@@ -1654,24 +1941,24 @@ async function renderCoin(mintAddress) {
     }
     rows.sort((a, b) => b.createdAt - a.createdAt);
     if (!rows.length) {
-      wrap.innerHTML = '<p class="muted">Belum ada transaksi.</p>';
+      wrap.innerHTML = `<p class="muted">${translate('tradesEmpty')}</p>`;
       return;
     }
     wrap.innerHTML = `
       <table>
-        <thead><tr><th>Waktu</th><th>Jenis</th><th>Token</th><th>SOL</th><th>Fee Kreator</th><th>Harga</th><th>Dompet</th><th>Tx Kamu</th><th>Tx Pool</th></tr></thead>
+        <thead><tr><th>${translate('thTime')}</th><th>${translate('thType')}</th><th>${translate('thToken')}</th><th>${translate('thAsset', { asset: esc(pairAsset) })}</th><th>${translate('thFee')}</th><th>${translate('thPrice')}</th><th>${translate('thWallet')}</th><th>${translate('thYourTx')}</th><th>${translate('thPoolTx')}</th></tr></thead>
         <tbody>
           ${rows
             .map((t) => {
               if (t.kind === 'claim') {
                 return `<tr>
                 <td>${fmtTime(t.createdAt)}</td>
-                <td><span class="badge badge-ok">Klaim Fee</span></td>
+                <td><span class="badge badge-ok">${translate('claimBadge')}</span></td>
                 <td class="muted">—</td>
                 <td>${fmtSol(t.amountSol)}</td>
                 <td class="muted">—</td>
                 <td class="muted">—</td>
-                <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
+                <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? translate('youSuffix') : ''}</td>
                 <td class="muted">—</td>
                 <td>${txLink(t.txSignature)}</td>
               </tr>`;
@@ -1679,13 +1966,13 @@ async function renderCoin(mintAddress) {
               return `<tr>
                 <td>${fmtTime(t.createdAt)}</td>
                 <td><span class="badge ${t.side === 'buy' ? 'badge-buy' : 'badge-sell'}">${
-                  t.side === 'buy' ? 'Beli' : 'Jual'
+                  t.side === 'buy' ? translate('tabBuy') : translate('tabSell')
                 }</span></td>
                 <td>${fmtTokens(t.tokenAmount)}</td>
                 <td>${fmtSol(t.solAmount)}</td>
                 <td>${fmtSol(t.feeSol || 0)}</td>
                 <td>${fmtPriceBoth(t.priceUsd, t.price)}</td>
-                <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
+                <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? translate('youSuffix') : ''}</td>
                 <td>${txLink(t.userTxSignature)}</td>
                 <td>${txLink(t.poolTxSignature)}</td>
               </tr>`;
@@ -1693,6 +1980,182 @@ async function renderCoin(mintAddress) {
             .join('')}
         </tbody>
       </table>`;
+  }
+
+  // Burn form: amount input + MAX from the live on-chain balance, a
+  // price-effect preview (burning shrinks the token reserve, so the price
+  // rises), and the burn button (real SPL burn via Phantom).
+  function renderBurnForm() {
+    const form = document.getElementById('burnForm');
+    if (!state.wallet) {
+      form.innerHTML = `<p class="muted">${translate('tradeConnectFirst')}</p>`;
+      return;
+    }
+    const liveHoldings = state.onchainBalances[coin.mintAddress] || 0;
+    form.innerHTML = `
+      <div class="field">
+        <label>${translate('burnAmountLabel')}</label>
+        <input id="burnAmount" type="number" min="0" step="any" placeholder="1000000">
+        <div class="quick">
+          <button class="btn" id="maxBurn">${translate('burnMaxBtn', { bal: fmtTokens(liveHoldings) })}</button>
+        </div>
+        <div class="estimate" id="burnPreview"></div>
+      </div>
+      <button class="btn btn-sell" id="burnBtn">${translate('burnBtn')}</button>
+      <p class="small muted" style="margin-top:8px">${translate('burnNote')}</p>`;
+    const input = document.getElementById('burnAmount');
+    const update = () => {
+      const amount = Number(input.value);
+      const est = document.getElementById('burnPreview');
+      if (amount > 0 && amount < coin.tokenReserve) {
+        const newPrice = coin.solReserve / (coin.tokenReserve - amount);
+        const pct = ((newPrice - coin.price) / coin.price) * 100;
+        const assetUsd = Number.isFinite(coin.pairAssetUsd) ? coin.pairAssetUsd : null;
+        const newPriceUsd = assetUsd !== null ? newPrice * assetUsd : null;
+        est.textContent = translate('burnPreview', {
+          amount: fmtTokens(amount),
+          price: fmtPriceBoth(newPriceUsd, newPrice),
+          pct: fmtPct(pct),
+        });
+      } else est.textContent = '';
+    };
+    input.addEventListener('input', update);
+    document.getElementById('maxBurn').addEventListener('click', () => {
+      input.value = liveHoldings;
+      update();
+    });
+    document.getElementById('burnBtn').addEventListener('click', async () => {
+      const amount = Number(input.value);
+      if (!(amount > 0)) return toast(translate('errBurnEnterAmount'));
+      await submitBurn(amount);
+    });
+  }
+
+  function renderBurnHistory() {
+    const wrap = document.getElementById('burnHistory');
+    const list = burns || [];
+    if (!list.length) {
+      wrap.innerHTML = `<p class="muted">${translate('burnEmpty')}</p>`;
+      return;
+    }
+    wrap.innerHTML = `
+      <div class="table-wrap"><table>
+        <thead><tr><th>${translate('thTime')}</th><th>${translate('burnHistoryWallet')}</th><th>${translate('burnHistoryAmount')}</th><th>${translate('burnHistoryPrice')}</th><th>${translate('burnHistoryTx')}</th></tr></thead>
+        <tbody>
+          ${list
+            .map(
+              (b) => `<tr>
+                <td>${fmtTime(b.createdAt)}</td>
+                <td>${creatorLink(b.wallet)}${b.wallet === state.wallet ? translate('youSuffix') : ''}</td>
+                <td>${fmtTokens(b.amount)}</td>
+                <td>${fmtPriceBoth(b.priceAfterUsd, b.priceAfter)}</td>
+                <td>${txLink(b.txSignature)}</td>
+              </tr>`
+            )
+            .join('')}
+        </tbody>
+      </table></div>`;
+  }
+
+  // Real burn flow: validate against the LIVE on-chain balance (re-read
+  // from devnet RPC, never the cached value) -> build -> simulate -> sign
+  // in Phantom -> send + confirm -> server verifies the burn on-chain and
+  // shrinks the curve reserve.
+  async function submitBurn(amount) {
+    const resEl = document.getElementById('burnResult');
+    const btn = document.getElementById('burnBtn');
+    const setBusy = (msg) => {
+      if (btn) btn.disabled = true;
+      resEl.innerHTML = `<p class="muted">${esc(msg)}</p>`;
+    };
+    const fail = (msg) => {
+      if (btn) btn.disabled = false;
+      resEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
+    };
+    try {
+      if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
+      const phantom = (await waitForPhantom(3000)) || getPhantom();
+      if (!phantom) throw new Error(translate('errPhantomShort'));
+      if (!(await syncWalletAccount())) {
+        throw new Error(translate('errReadAccountShort'));
+      }
+      // Fresh on-chain balance: the burn fails on-chain when the user
+      // holds less, so check first and give a clear error instead of a
+      // doomed Phantom popup.
+      const liveBalance = await getTokenBalance(coin.mintAddress, state.wallet);
+      state.onchainBalances[coin.mintAddress] = liveBalance;
+      if (liveBalance < amount) {
+        throw new Error(
+          translate('burnInsufficient', { bal: fmtTokens(liveBalance), ticker: coin.ticker })
+        );
+      }
+      if (amount >= coin.tokenReserve) {
+        throw new Error(
+          translate('burnTooLarge', { reserve: fmtTokens(coin.tokenReserve), ticker: coin.ticker })
+        );
+      }
+      setBusy(translate('burnBuilding'));
+      const built = await buildBurnTransaction(state.wallet, coin.mintAddress, amount);
+      const sim = await simulateTransaction(built.transaction);
+      if (!sim.ok) throw new Error(`Simulasi gagal: ${sim.error}`);
+      setBusy(translate('burnSigning'));
+      const sig = await signAndSend(phantom, built.transaction);
+      setBusy(translate('burnVerifying'));
+      const res = await apiPost(`/api/coins/${coin.mintAddress}/burn`, {
+        wallet: state.wallet,
+        amount,
+        txSignature: sig,
+      });
+      const assetUsd = Number.isFinite(res.coin.pairAssetUsd) ? res.coin.pairAssetUsd : null;
+      const priceUsd = assetUsd !== null ? res.coin.price * assetUsd : null;
+      resEl.innerHTML = `<div class="alert alert-success">${translate('burnSuccess', {
+        amount: fmtTokens(amount),
+        price: fmtPriceBoth(priceUsd, res.coin.price),
+        tx: txLink(sig),
+      })}</div>`;
+      await refreshBalance();
+      renderHeader();
+      await refreshOnchainBalances();
+      setTimeout(() => renderCoin(mintAddress), 800);
+    } catch (err) {
+      fail(esc(translate('burnFailed', { msg: friendlyError(err) })));
+    }
+  }
+
+  // Transfer form on the coin detail page (for holders): recipient address
+  // + amount + MAX from the live on-chain balance.
+  function renderTransferForm() {
+    const form = document.getElementById('transferForm');
+    if (!state.wallet) {
+      form.innerHTML = `<p class="muted">${translate('tradeConnectFirst')}</p>`;
+      return;
+    }
+    const liveHoldings = state.onchainBalances[coin.mintAddress] || 0;
+    form.innerHTML = `
+      <div class="field">
+        <label>${translate('transferRecipientLabel')}</label>
+        <input id="transferTo" type="text" placeholder="${translate('transferRecipientPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>${translate('transferAmountLabel', { ticker: esc(coin.ticker) })}</label>
+        <input id="transferAmount" type="number" min="0" step="any" placeholder="1000000">
+        <div class="quick">
+          <button class="btn" id="maxTransfer">${translate('burnMaxBtn', { bal: fmtTokens(liveHoldings) })}</button>
+        </div>
+      </div>
+      <button class="btn btn-primary" id="transferBtn">${translate('transferBtn', { ticker: esc(coin.ticker) })}</button>
+      <p class="small muted" style="margin-top:8px">${translate('transferNote')}</p>`;
+    const input = document.getElementById('transferAmount');
+    document.getElementById('maxTransfer').addEventListener('click', () => {
+      input.value = liveHoldings;
+    });
+    document.getElementById('transferBtn').addEventListener('click', async () => {
+      const to = document.getElementById('transferTo').value.trim();
+      const amount = Number(input.value);
+      if (!to) return toast(translate('errTransferInvalidAddress'));
+      if (!(amount > 0)) return toast(translate('errTransferEnterAmount'));
+      await submitTransfer(coin, to, amount, document.getElementById('transferResult'));
+    });
   }
 }
 
@@ -1702,26 +2165,26 @@ async function renderCoin(mintAddress) {
 // (no transaction, no fee) — the server verifies the Ed25519 signature.
 async function toggleFollow(targetWallet, currentlyFollowing) {
   if (!state.wallet) {
-    toast('Hubungkan dompet dulu untuk mengikuti.');
+    toast(translate('errFollowConnectFirst'));
     return;
   }
   if (targetWallet === state.wallet) {
-    toast('Kamu tidak bisa mengikuti dirimu sendiri.');
+    toast(translate('errFollowSelf'));
     return;
   }
   const phantom = (await waitForPhantom(3000)) || getPhantom();
   if (!phantom) {
-    toast('Phantom tidak terdeteksi.');
+    toast(translate('errPhantomShort'));
     return;
   }
   if (typeof phantom.signMessage !== 'function') {
-    toast('Phantom-mu tidak mendukung penandatanganan pesan. Perbarui Phantom ke versi terbaru.');
+    toast(translate('errNoSignMessage'));
     return;
   }
   const action = currentlyFollowing ? 'unfollow' : 'follow';
   try {
     const message = followMessage(action, targetWallet);
-    toast('Tanda tangani pesan di Phantom untuk membuktikan dompetmu (tanpa biaya).');
+    toast(translate('toastSignFollow'));
     const signature = await signFollowMessage(phantom, message);
     const res = await apiPost('/api/follows', {
       followerWallet: state.wallet,
@@ -1734,11 +2197,11 @@ async function toggleFollow(targetWallet, currentlyFollowing) {
     else state.following.delete(targetWallet);
     toast(
       res.following
-        ? `Mengikuti ${shortAddr(targetWallet)}. Coin mereka muncul di filter "Mengikuti" di Beranda.`
-        : `Berhenti mengikuti ${shortAddr(targetWallet)}.`
+        ? translate('toastFollowed', { addr: shortAddr(targetWallet) })
+        : translate('toastUnfollowed', { addr: shortAddr(targetWallet) })
     );
   } catch (err) {
-    toast(`Gagal: ${friendlyError(err)}`);
+    toast(translate('errGeneric', { msg: friendlyError(err) }));
   }
 }
 
@@ -1747,90 +2210,291 @@ async function claimFeesForCoin(mintAddress, btn) {
   if (btn) btn.disabled = true;
   try {
     const res = await apiPost(`/api/coins/${mintAddress}/claim-fees`, { wallet: state.wallet });
-    toast(`Berhasil mengklaim ${fmtSol(res.claim.amountSol)} SOL!`);
+    toast(
+      translate('claimSuccessToast', {
+        amount: fmtSol(res.claim.amountSol),
+        asset: res.claim.assetSymbol || 'SOL',
+      })
+    );
     await refreshBalance();
     renderHeader();
     route();
   } catch (err) {
-    toast(`Klaim gagal: ${friendlyError(err)}`);
+    toast(translate('claimFailed', { msg: friendlyError(err) }));
     if (btn) btn.disabled = false;
   }
+}
+
+// Shared transfer flow (coin detail page + portfolio): validate the
+// recipient address format and the LIVE on-chain balance -> build ->
+// simulate -> sign in Phantom -> send + confirm -> server verifies the
+// SPL transfer on-chain and records it. `coin` is { mintAddress, ticker };
+// `resEl` is the element for status messages (or null for toasts only).
+async function submitTransfer(coin, toWallet, amount, resEl) {
+  const fail = (msg) => {
+    if (resEl) {
+      resEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
+    } else {
+      toast(msg);
+    }
+  };
+  const setBusy = (msg) => {
+    if (resEl) resEl.innerHTML = `<p class="muted">${esc(msg)}</p>`;
+  };
+  try {
+    if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
+    const phantom = (await waitForPhantom(3000)) || getPhantom();
+    if (!phantom) throw new Error(translate('errPhantomShort'));
+    if (!(await syncWalletAccount())) {
+      throw new Error(translate('errReadAccountShort'));
+    }
+    // Recipient address format (PublicKey parse) + self-transfer check.
+    try {
+      const recipient = new solanaWeb3.PublicKey(toWallet);
+      if (recipient.toBase58() === state.wallet) {
+        throw new Error(translate('errTransferInvalidAddress'));
+      }
+    } catch {
+      throw new Error(translate('errTransferInvalidAddress'));
+    }
+    // Fresh on-chain balance — the transfer fails on-chain when the user
+    // holds less, so check first instead of opening a doomed popup.
+    const liveBalance = await getTokenBalance(coin.mintAddress, state.wallet);
+    state.onchainBalances[coin.mintAddress] = liveBalance;
+    if (liveBalance < amount) {
+      throw new Error(
+        translate('errTransferInsufficient', { bal: fmtTokens(liveBalance), ticker: coin.ticker })
+      );
+    }
+    setBusy(translate('transferBuilding'));
+    const built = await buildTransferTransaction(state.wallet, coin.mintAddress, toWallet, amount);
+    const sim = await simulateTransaction(built.transaction);
+    if (!sim.ok) throw new Error(`Simulasi gagal: ${sim.error}`);
+    setBusy(translate('transferSigning'));
+    const sig = await signAndSend(phantom, built.transaction);
+    setBusy(translate('transferVerifying'));
+    await apiPost('/api/transfers', {
+      mintAddress: coin.mintAddress,
+      fromWallet: state.wallet,
+      toWallet,
+      amount,
+      txSignature: sig,
+    });
+    const successHtml = translate('transferSuccess', {
+      amount: fmtTokens(amount),
+      ticker: esc(coin.ticker),
+      addr: esc(shortAddr(toWallet)),
+      tx: txLink(sig),
+    });
+    if (resEl) {
+      resEl.innerHTML = `<div class="alert alert-success">${successHtml}</div>`;
+    } else {
+      toast(successHtml.replace(/<[^>]*>/g, ''));
+    }
+    await refreshBalance();
+    renderHeader();
+    await refreshOnchainBalances();
+    setTimeout(() => route(), 800);
+  } catch (err) {
+    fail(esc(translate('transferFailed', { msg: friendlyError(err) })));
+  }
+}
+
+// ---------- Deposit section (shared: portfolio + own profile) ----------
+// Shows the connected wallet's own Solana devnet address as the deposit
+// address for SOL and any coin, with a copy button and a QR code (the QR
+// library is vendored locally at /vendor/qrcode.js — no CDN). Recent
+// incoming transfers are detected live via devnet RPC
+// (GET /api/deposits) and labeled as on-chain devnet activity.
+function depositSectionHtml(walletAddress) {
+  return `
+    <h2 style="margin-top:0">${translate('depositTitle')}</h2>
+    <p class="small muted">${translate('depositIntro')}</p>
+    <div class="deposit-box">
+      <div class="deposit-qr" id="depositQr"></div>
+      <div class="deposit-addr">
+        <div class="label">${translate('depositAddressLabel')}</div>
+        <div class="mono" style="word-break:break-all">${esc(walletAddress)}</div>
+        <button class="btn btn-sm" id="copyDepositBtn" style="margin-top:8px">${translate('copyBtn')}</button>
+      </div>
+    </div>
+    <p class="small muted" style="margin-top:10px">${translate('depositNote')}</p>
+    <h3 style="margin-top:16px">${translate('depositRecentTitle')}</h3>
+    <div id="depositList"><p class="muted">${translate('depositLoading')}</p></div>`;
+}
+
+function wireDepositSection(walletAddress) {
+  // QR code of the deposit address (vendored qrcode-generator).
+  const qrEl = document.getElementById('depositQr');
+  if (qrEl && typeof window.qrcode === 'function') {
+    try {
+      const qr = qrcode(0, 'M');
+      qr.addData(walletAddress);
+      qr.make();
+      qrEl.innerHTML = `<img src="${qr.createDataURL(6, 8)}" alt="${translate('depositQrAlt')}" class="deposit-qr-img">`;
+    } catch {
+      qrEl.innerHTML = '';
+    }
+  }
+  const copyBtn = document.getElementById('copyDepositBtn');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(walletAddress).then(() => toast(translate('depositCopied')));
+    });
+  }
+  // Recent incoming on-chain transfers (server scans devnet RPC).
+  const list = document.getElementById('depositList');
+  if (!list) return;
+  apiGet(`/api/deposits?wallet=${encodeURIComponent(walletAddress)}`)
+    .then((data) => {
+      const deposits = data.deposits || [];
+      if (!deposits.length) {
+        list.innerHTML = `<p class="muted">${translate('depositEmpty')}</p>`;
+        return;
+      }
+      list.innerHTML = `
+        <div class="table-wrap"><table>
+          <thead><tr><th>${translate('thTime')}</th><th>${translate('thType')}</th><th>${translate('thToken')}</th><th>${translate('thWallet')}</th><th>${translate('burnHistoryTx')}</th></tr></thead>
+          <tbody>
+            ${deposits
+              .map(
+                (d) => `<tr>
+                  <td>${d.time ? fmtTime(d.time) : '—'}</td>
+                  <td><span class="badge badge-ok">${translate('depositIncoming')}</span></td>
+                  <td>${d.type === 'SOL' ? `${fmtSol(d.amount)} SOL` : `${fmtTokens(d.amount)} ${shortAddr(d.mint)}`}</td>
+                  <td>${creatorLink(d.from)}</td>
+                  <td>${txLink(d.signature)}</td>
+                </tr>`
+              )
+              .join('')}
+          </tbody>
+        </table></div>`;
+    })
+    .catch((err) => {
+      list.innerHTML = `<div class="alert alert-error">${esc(translate('depositFailed', { msg: err.message }))}</div>`;
+    });
 }
 
 // ---------- Creator profile ----------
 async function renderCreator(walletAddress) {
   const view = document.getElementById('view');
-  view.innerHTML = '<p class="muted">Memuat profil…</p>';
+  view.innerHTML = `<p class="muted">${translate('loadingProfile')}</p>`;
   let data;
   try {
     const params = state.wallet ? `?viewer=${encodeURIComponent(state.wallet)}` : '';
     data = await apiGet(`/api/creators/${encodeURIComponent(walletAddress)}${params}`);
   } catch (err) {
-    view.innerHTML = `<div class="alert alert-error">Gagal memuat profil: ${esc(err.message)}</div>
-      <p><a href="#/">Kembali ke Beranda</a></p>`;
+    view.innerHTML = `<div class="alert alert-error">${esc(translate('errLoadProfile', { msg: err.message }))}</div>
+      <p><a href="#/">${translate('backHome')}</a></p>`;
     return;
   }
   const isSelf = data.isSelf;
-  const initials = walletAddress.slice(0, 2).toUpperCase();
+  const profile = data.profile || null;
+  const listProfiles = data.profiles || {};
 
   const followListHtml = (list, emptyText) => {
     if (!list.length) return `<p class="muted">${emptyText}</p>`;
     return `<ul class="follow-list">${list
       .map(
-        (w) => `<li>${creatorLink(w)}${w === state.wallet ? ' <span class="muted">(kamu)</span>' : ''}</li>`
+        (w) => `<li>${avatarHtml(listProfiles[w] || null, w, 24, true)} ${creatorLink(w, displayName(listProfiles[w] || null, w))}${w === state.wallet ? ` <span class="muted">${translate('youSuffix').trim()}</span>` : ''}</li>`
       )
       .join('')}</ul>`;
   };
 
   view.innerHTML = `
+    ${profile && profile.coverUrl ? `<div class="profile-cover"><img src="${esc(profile.coverUrl)}" alt="${translate('profileCoverAlt')}"></div>` : ''}
     <div class="card">
       <div class="coin-head">
-        <div class="coin-avatar" style="width:56px;height:56px;font-size:1.3rem">${esc(initials)}</div>
+        ${avatarHtml(profile, walletAddress, 56)}
         <div>
-          <div class="coin-name" style="font-size:1.3rem">${esc(shortAddr(walletAddress))}</div>
+          <div class="coin-name" style="font-size:1.3rem">${esc(displayName(profile, walletAddress))}</div>
           <div class="small muted mono" style="word-break:break-all">${esc(walletAddress)}</div>
         </div>
-        <span class="badge ${isSelf ? 'badge-ok' : 'badge-live'}" style="margin-left:auto">${isSelf ? 'Ini profilmu' : 'Kreator / Trader'}</span>
+        <span class="badge ${isSelf ? 'badge-ok' : 'badge-live'}" style="margin-left:auto">${isSelf ? translate('profileSelf') : translate('profileCreatorTrader')}</span>
+        ${isSelf ? `<button class="btn btn-sm" id="editProfileBtn">${translate('profileEditBtn')}</button>` : ''}
         ${state.wallet && !isSelf
-          ? `<button class="btn btn-sm ${data.isFollowing ? '' : 'btn-primary'}" id="profileFollowBtn">${data.isFollowing ? '✓ Mengikuti' : '+ Ikuti'}</button>`
+          ? `<button class="btn btn-sm ${data.isFollowing ? '' : 'btn-primary'}" id="profileFollowBtn">${data.isFollowing ? translate('followFollowing') : translate('followBtn')}</button>`
           : ''}
       </div>
       <div class="stat-grid" style="margin-top:16px">
-        <div class="stat"><div class="label">Coin Dibuat</div><div class="value">${data.coins.length}</div></div>
-        <div class="stat"><div class="label">Total Volume Trading</div><div class="value">${fmtSol(data.totalVolumeSol)} SOL</div></div>
-        <div class="stat"><div class="label">Fee Kreator Terkumpul</div><div class="value">${fmtSol(data.totalFeesEarnedSol)} SOL</div></div>
-        <div class="stat"><div class="label">Fee Sudah Diklaim</div><div class="value">${fmtSol(data.totalFeesClaimedSol)} SOL</div></div>
-        <div class="stat"><div class="label">Fee Bisa Diklaim</div><div class="value">${fmtSol(data.totalFeesUnclaimedSol)} SOL</div></div>
-        <div class="stat"><div class="label">Pengikut</div><div class="value">${data.followerCount}</div></div>
-        <div class="stat"><div class="label">Mengikuti</div><div class="value">${data.followingCount}</div></div>
+        <div class="stat"><div class="label">${translate('profileCoinsCreated')}</div><div class="value">${data.coins.length}</div></div>
+        <div class="stat"><div class="label">${translate('profileVolume')}</div><div class="value">${fmtMoneyBoth(data.totalVolumeUsd, data.totalVolumeSol)}</div></div>
+        <div class="stat"><div class="label">${translate('profileFeesEarned')}</div><div class="value">${fmtMoneyBoth(data.totalFeesEarnedUsd, data.totalFeesEarnedSol)}</div></div>
+        <div class="stat"><div class="label">${translate('profileFeesClaimed')}</div><div class="value">${fmtSol(data.totalFeesClaimedSol)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('profileFeesClaimable')}</div><div class="value">${fmtSol(data.totalFeesUnclaimedSol)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('profileFollowers')}</div><div class="value">${data.followerCount}</div></div>
+        <div class="stat"><div class="label">${translate('profileFollowing')}</div><div class="value">${data.followingCount}</div></div>
       </div>
-      <p style="margin-top:12px"><a href="${EXPLORER}/address/${esc(walletAddress)}?cluster=devnet" target="_blank" rel="noopener">Lihat di Solana Explorer ↗</a></p>
+      <p style="margin-top:12px"><a href="${EXPLORER}/address/${esc(walletAddress)}?cluster=devnet" target="_blank" rel="noopener">${translate('profileExplorer')}</a></p>
     </div>
 
+    ${isSelf ? `<div class="card" id="editProfileCard" hidden>
+      <h2 style="margin-top:0">${translate('profileEditTitle')}</h2>
+      <div class="field">
+        <label for="editUsername">${translate('profileUsernameLabel')}</label>
+        <input id="editUsername" type="text" maxlength="20" placeholder="${translate('profileUsernamePlaceholder')}" value="${esc((profile && profile.username) || '')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <div class="hint">${translate('profileUsernameHint')}</div>
+      </div>
+      <div class="field">
+        <label>${translate('profileBorderLabel')}</label>
+        <div class="border-picker">
+          ${BORDER_PRESETS.map(
+            (p) => `<label class="border-option">
+              <input type="radio" name="editBorder" value="${p.key}" ${((profile && profile.border) || 'none') === p.key ? 'checked' : ''}>
+              <span class="border-swatch avatar-ring avatar-ring-${p.key}">${translate(p.labelKey)}</span>
+            </label>`
+          ).join('')}
+        </div>
+        <div class="hint">${translate('profileBorderHint')}</div>
+      </div>
+      <div class="field">
+        <label for="editAvatar">${translate('profilePhotoLabel')}</label>
+        ${profile && profile.avatarUrl ? `<div style="margin-bottom:8px">${avatarHtml(profile, walletAddress, 56)} <span class="small muted">${translate('profileCurrentPhoto')}</span></div>` : ''}
+        <input id="editAvatar" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+        <div class="hint">${translate('profilePhotoHint')}</div>
+        ${profile && profile.avatarUrl ? `<label class="check-row" style="margin-top:6px"><input type="checkbox" id="removeAvatar"> ${translate('profileRemovePhoto')}</label>` : ''}
+      </div>
+      <div class="field">
+        <label for="editCover">${translate('profileCoverLabel')}</label>
+        ${profile && profile.coverUrl ? `<div class="profile-cover profile-cover-small" style="margin-bottom:8px"><img src="${esc(profile.coverUrl)}" alt="${translate('profileCoverAlt')}"></div>` : ''}
+        <input id="editCover" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+        <div class="hint">${translate('profileCoverHint')}</div>
+        ${profile && profile.coverUrl ? `<label class="check-row" style="margin-top:6px"><input type="checkbox" id="removeCover"> ${translate('profileRemoveCover')}</label>` : ''}
+      </div>
+      <p class="small muted">${translate('profileEphemeralNote')}</p>
+      <div class="row" style="justify-content:flex-start">
+        <button class="btn btn-primary" id="saveProfileBtn">${translate('profileSaveBtn')}</button>
+        <button class="btn" id="cancelEditBtn">${translate('profileCancelBtn')}</button>
+      </div>
+      <div id="editProfileResult" style="margin-top:8px"></div>
+    </div>` : ''}
+
+    ${isSelf ? `<div class="card" id="depositCard">${depositSectionHtml(walletAddress)}</div>` : ''}
+
     <div class="card">
-      <h2 style="margin-top:0">Coin yang Dibuat (${data.coins.length})</h2>
+      <h2 style="margin-top:0">${translate('profileCoinsTitle', { n: data.coins.length })}</h2>
       ${data.coins.length === 0
-        ? '<p class="muted">Dompet ini belum membuat coin.</p>'
+        ? `<p class="muted">${translate('profileNoCoins')}</p>`
         : `<div class="coin-grid">${data.coins.map(coinCard).join('')}</div>`}
     </div>
 
     <div class="card">
-      <h2 style="margin-top:0">Callout (${(data.callouts || []).length})</h2>
+      <h2 style="margin-top:0">${translate('calloutsTitle', { n: (data.callouts || []).length })}</h2>
       ${(data.callouts || []).length === 0
-        ? '<p class="muted">Belum ada callout dari dompet ini.</p>'
+        ? `<p class="muted">${translate('profileNoCallouts')}</p>`
         : (data.callouts || []).map((c) => calloutHtml(c, { showCoin: true })).join('')}
     </div>
 
     ${isSelf && data.coins.some((c) => c.feesUnclaimedSol > 0)
       ? `<div class="card">
-          <h2 style="margin-top:0">Klaim Fee Kreator</h2>
-          <p class="small muted">Fee dikirim dari dompet pool ke dompetmu sebagai transaksi devnet asli.</p>
+          <h2 style="margin-top:0">${translate('profileClaimTitle')}</h2>
+          <p class="small muted">${translate('feeClaimNoteShort')}</p>
           ${data.coins
             .filter((c) => c.feesUnclaimedSol > 0)
             .map(
               (c) => `<div class="row" style="margin-top:8px">
-                <span><b>$${esc(c.ticker)}</b> — ${fmtSol(c.feesUnclaimedSol)} SOL bisa diklaim</span>
-                <button class="btn btn-sm btn-primary" data-claim="${esc(c.mintAddress)}">Klaim ${fmtSol(c.feesUnclaimedSol)} SOL</button>
+                <span>${translate('profileClaimRow', { ticker: esc(c.ticker), amount: fmtSol(c.feesUnclaimedSol), asset: esc((c.pairAsset && c.pairAsset.symbol) || 'SOL') })}</span>
+                <button class="btn btn-sm btn-primary" data-claim="${esc(c.mintAddress)}">${translate('feeClaimBtn', { amount: fmtSol(c.feesUnclaimedSol), asset: esc((c.pairAsset && c.pairAsset.symbol) || 'SOL') })}</button>
               </div>`
             )
             .join('')}
@@ -1839,12 +2503,12 @@ async function renderCreator(walletAddress) {
 
     <div class="grid-2">
       <div class="card">
-        <h2 style="margin-top:0">Pengikut (${data.followerCount})</h2>
-        ${followListHtml(data.followers, 'Belum ada pengikut.')}
+        <h2 style="margin-top:0">${translate('profileFollowersTitle', { n: data.followerCount })}</h2>
+        ${followListHtml(data.followers, translate('followersEmpty'))}
       </div>
       <div class="card">
-        <h2 style="margin-top:0">Mengikuti (${data.followingCount})</h2>
-        ${followListHtml(data.following, 'Belum mengikuti siapa pun.')}
+        <h2 style="margin-top:0">${translate('profileFollowingTitle', { n: data.followingCount })}</h2>
+        ${followListHtml(data.following, translate('followingEmpty'))}
       </div>
     </div>`;
 
@@ -1869,6 +2533,99 @@ async function renderCreator(walletAddress) {
   view.querySelectorAll('[data-claim]').forEach((b) => {
     b.addEventListener('click', () => claimFeesForCoin(b.dataset.claim, b));
   });
+  if (isSelf) {
+    wireDepositSection(walletAddress);
+    wireEditProfile(walletAddress, profile);
+  }
+
+  // Edit-profile form (owner only). Saving proves wallet ownership with
+  // a Phantom signMessage signature over the canonical profile message
+  // (same scheme as follows) — the server rebuilds the message from the
+  // submitted fields and verifies the signature before saving anything.
+  function wireEditProfile(wallet, currentProfile) {
+    const card = document.getElementById('editProfileCard');
+    const toggleBtn = document.getElementById('editProfileBtn');
+    if (!card || !toggleBtn) return;
+    toggleBtn.addEventListener('click', () => {
+      card.hidden = !card.hidden;
+      if (!card.hidden) card.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    });
+    document.getElementById('cancelEditBtn').addEventListener('click', () => {
+      card.hidden = true;
+    });
+    document.getElementById('saveProfileBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('saveProfileBtn');
+      const resEl = document.getElementById('editProfileResult');
+      const fail = (msg) => {
+        resEl.innerHTML = `<div class="alert alert-error">${esc(msg)}</div>`;
+        btn.disabled = false;
+      };
+      btn.disabled = true;
+      resEl.innerHTML = `<p class="muted">${translate('profileSaving')}</p>`;
+      try {
+        const usernameRaw = document.getElementById('editUsername').value.trim();
+        const username = usernameRaw === '' ? null : usernameRaw;
+        if (username !== null && !/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+          fail(translate('errUsernameInvalid'));
+          return;
+        }
+        const border =
+          document.querySelector('input[name="editBorder"]:checked')?.value || 'none';
+        // New images (if any): read as base64, same as the coin-logo
+        // upload. A checked "remove" box clears the image instead.
+        const readImageFile = (file) =>
+          new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = reader.result;
+              resolve({
+                dataBase64: dataUrl.split(',')[1],
+                mimeType: file.type,
+              });
+            };
+            reader.onerror = () => reject(new Error('read'));
+            reader.readAsDataURL(file);
+          });
+        let avatar;
+        const avatarFile = document.getElementById('editAvatar').files[0];
+        if (avatarFile) avatar = await readImageFile(avatarFile);
+        else if (document.getElementById('removeAvatar')?.checked) avatar = null;
+        let cover;
+        const coverFile = document.getElementById('editCover').files[0];
+        if (coverFile) cover = await readImageFile(coverFile);
+        else if (document.getElementById('removeCover')?.checked) cover = null;
+
+        const phantom = (await waitForPhantom(3000)) || getPhantom();
+        if (!phantom) throw new Error(translate('errPhantomShort'));
+        if (typeof phantom.signMessage !== 'function') {
+          throw new Error(translate('errNoSignMessage'));
+        }
+        // The message binds the submitted fields (image content via its
+        // sha256) — the server rebuilds it identically and verifies.
+        const message = profileMessage({
+          wallet,
+          username: username || '',
+          border,
+          avatarHash: avatar ? await sha256Hex(avatar.dataBase64) : '',
+          coverHash: cover ? await sha256Hex(cover.dataBase64) : '',
+        });
+        toast(translate('profileSigning'));
+        const signature = await signWalletMessage(phantom, message);
+        await apiPost(`/api/profiles/${wallet}`, {
+          username,
+          border,
+          avatar,
+          cover,
+          message,
+          signature,
+        });
+        toast(translate('profileSaved'));
+        renderCreator(wallet);
+      } catch (err) {
+        fail(translate('profileSaveFailed', { msg: friendlyError(err) }));
+      }
+    });
+  }
 }
 
 // ---------- Chart (SVG area chart with time axis + tooltip) ----------
@@ -1879,7 +2636,7 @@ function renderChartEl(wrap, points, range) {
   }
   if (pts.length < 2) {
     wrap.innerHTML =
-      '<p class="muted" style="padding:40px 0;text-align:center">Belum ada transaksi — grafik muncul setelah ada trading.</p>';
+      `<p class="muted" style="padding:40px 0;text-align:center">${translate('chartEmpty')}</p>`;
     return;
   }
   const W = 1000;
@@ -1947,9 +2704,117 @@ function renderChartEl(wrap, points, range) {
     tip.style.display = 'block';
     tip.style.left = `${Math.min(Math.max(e.clientX - rect.left + 12, 0), rect.width - 180)}px`;
     tip.style.top = `${Math.max(e.clientY - rect.top - 40, 0)}px`;
-    tip.innerHTML = `${esc(fmtTime(best.t))}<br><b>${fmtPriceBoth(best.priceUsd, best.price)}</b>${
-      best.side ? ` • ${best.side === 'buy' ? 'Beli' : 'Jual'}` : ' • Peluncuran'
-    }`;
+    const sideLabel = !best.side
+      ? translate('chartLaunch')
+      : best.side === 'burn'
+        ? translate('chartBurn')
+        : best.side === 'buy'
+          ? translate('chartBuy')
+          : translate('chartSell');
+    tip.innerHTML = `${esc(fmtTime(best.t))}<br><b>${fmtPriceBoth(best.priceUsd, best.price)}</b> • ${sideLabel}`;
+  });
+  svg.addEventListener('mouseleave', () => {
+    tip.style.display = 'none';
+  });
+}
+
+// ---------- Candlestick chart (SVG, OHLC per time bucket + volume bars) ----------
+// Candles come from the server (GET /api/coins/:mint/candles) — one
+// implementation, shared with the tests. Green/red use the pump.fun
+// gain/loss colors; empty buckets produce no candle (gaps, never zeroes).
+async function renderCandleChartEl(wrap, mintAddress, timeframe) {
+  let data;
+  try {
+    data = await apiGet(`/api/coins/${mintAddress}/candles?timeframe=${timeframe}`);
+  } catch (err) {
+    wrap.innerHTML = `<div class="alert alert-error">${esc(translate('errLoadCoin', { msg: err.message }))}</div>`;
+    return;
+  }
+  const candles = data.candles || [];
+  if (!candles.length) {
+    wrap.innerHTML =
+      `<p class="muted" style="padding:40px 0;text-align:center">${translate('candlesEmpty')}</p>`;
+    return;
+  }
+  const W = 1000;
+  const H = 300;
+  const PAD_L = 8;
+  const PAD_R = 8;
+  const PAD_T = 12;
+  const PAD_B = 24;
+  const CHART_H = H - PAD_T - PAD_B - 40; // leave 40px at the bottom for volume bars
+  const t0 = candles[0].t;
+  const t1 = candles[candles.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+  let min = Infinity;
+  let max = -Infinity;
+  let maxVol = 0;
+  for (const c of candles) {
+    if (c.low < min) min = c.low;
+    if (c.high > max) max = c.high;
+    if (c.volume > maxVol) maxVol = c.volume;
+  }
+  if (max === min) {
+    max = min * 1.1 || 1;
+    min = min * 0.9;
+  }
+  const padY = (max - min) * 0.1;
+  min -= padY;
+  max += padY;
+  const x = (t) => PAD_L + ((t - t0) / span) * (W - PAD_L - PAD_R);
+  const y = (v) => PAD_T + (1 - (v - min) / (max - min)) * CHART_H;
+  // Candle width from the spacing between bucket starts (bounded so one
+  // candle doesn't fill the chart).
+  const spacing = candles.length > 1 ? (x(candles[1].t) - x(candles[0].t)) : 40;
+  const bodyW = Math.max(2, Math.min(24, spacing * 0.6));
+  const fmtAxisTime = (t) =>
+    new Date(t).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+  const priceLabel = (c) => {
+    const usd = (v) => (Number.isFinite(c.openUsd) ? fmtPriceUsd(v) : null);
+    return translate('candleTooltip', {
+      open: usd(c.openUsd) || fmtPrice(c.open),
+      high: usd(c.highUsd) || fmtPrice(c.high),
+      low: usd(c.lowUsd) || fmtPrice(c.low),
+      close: usd(c.closeUsd) || fmtPrice(c.close),
+      volume: fmtSol(c.volume),
+    });
+  };
+  const bodies = candles
+    .map((c) => {
+      const up = c.close >= c.open;
+      const color = up ? '#5ddf6c' : '#f87171'; // pump.fun gain/loss
+      const cx = x(c.t);
+      const top = y(Math.max(c.open, c.close));
+      const bottom = y(Math.min(c.open, c.close));
+      const h = Math.max(1, bottom - top);
+      const volH = maxVol > 0 ? (c.volume / maxVol) * 36 : 0;
+      return `<g data-candle="${c.t}" data-tip="${esc(priceLabel(c))}">
+        <line x1="${cx}" y1="${y(c.high)}" x2="${cx}" y2="${y(c.low)}" stroke="${color}" stroke-width="1.5"/>
+        <rect x="${cx - bodyW / 2}" y="${top}" width="${bodyW}" height="${h}" fill="${color}"/>
+        <rect x="${cx - bodyW / 2}" y="${PAD_T + CHART_H + 40 - volH}" width="${bodyW}" height="${volH}" fill="${color}" opacity="0.45"/>
+      </g>`;
+    })
+    .join('');
+  wrap.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" id="chartSvg">
+      ${bodies}
+      <text x="${PAD_L}" y="${H - 6}" fill="#a1a1aa" font-size="13">${esc(fmtAxisTime(t0))}</text>
+      <text x="${W - PAD_R}" y="${H - 6}" fill="#a1a1aa" font-size="13" text-anchor="end">${esc(fmtAxisTime(t1))}</text>
+    </svg>
+    <div class="chart-tip" id="chartTip"></div>`;
+  const svg = document.getElementById('chartSvg');
+  const tip = document.getElementById('chartTip');
+  svg.addEventListener('mousemove', (e) => {
+    const g = e.target.closest('[data-candle]');
+    if (!g) {
+      tip.style.display = 'none';
+      return;
+    }
+    const rect = svg.getBoundingClientRect();
+    tip.style.display = 'block';
+    tip.style.left = `${Math.min(Math.max(e.clientX - rect.left + 12, 0), rect.width - 220)}px`;
+    tip.style.top = `${Math.max(e.clientY - rect.top - 40, 0)}px`;
+    tip.innerHTML = `${esc(fmtTime(Number(g.dataset.candle)))}<br>${g.dataset.tip}`;
   });
   svg.addEventListener('mouseleave', () => {
     tip.style.display = 'none';
@@ -1959,18 +2824,18 @@ function renderChartEl(wrap, points, range) {
 // ---------- Portfolio ----------
 async function renderPortfolio() {
   const view = document.getElementById('view');
-  view.innerHTML = '<h1>Portofolio Saya</h1>';
+  view.innerHTML = `<h1>${translate('navPortfolio')}</h1>`;
   if (!state.wallet) {
     view.innerHTML += `
       <div class="card empty">
-        <h2>Hubungkan dompet dulu</h2>
-        <p>Portofolio menampilkan posisi trading devnet dari dompet yang terhubung.</p>
-        <p><button class="btn btn-primary" id="connectPf">Hubungkan Phantom</button></p>
+        <h2>${translate('portfolioConnectTitle')}</h2>
+        <p>${translate('portfolioConnectBody')}</p>
+        <p><button class="btn btn-primary" id="connectPf">${translate('headerConnect')}</button></p>
       </div>`;
     document.getElementById('connectPf').onclick = connectWallet;
     return;
   }
-  view.innerHTML += '<p class="muted">Memuat portofolio…</p>';
+  view.innerHTML += `<p class="muted">${translate('loadingPortfolio')}</p>`;
   let data;
   try {
     [data] = await Promise.all([
@@ -1978,54 +2843,142 @@ async function renderPortfolio() {
       refreshOnchainBalances(),
     ]);
   } catch (err) {
-    view.innerHTML += `<div class="alert alert-error">Gagal memuat portofolio: ${esc(err.message)}</div>`;
+    view.innerHTML += `<div class="alert alert-error">${esc(translate('errLoadPortfolio', { msg: err.message }))}</div>`;
     return;
   }
   const s = data.summary;
   const cls = s.totalPnlSol >= 0 ? 'profit' : 'loss';
   view.innerHTML = `
-    <h1>Portofolio Saya</h1>
-    <p class="muted">Dompet <span class="mono">${esc(state.wallet)}</span> • Semua angka dari trading devnet yang tercatat. Kolom "Saldo On-chain" dibaca langsung dari devnet.</p>
+    <h1>${translate('navPortfolio')}</h1>
+    <p class="muted">${translate('portfolioIntro', { wallet: esc(state.wallet) })}</p>
     <div class="card">
       <div class="stat-grid">
-        <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtMoneyBoth(s.totalPnlUsd, s.totalPnlSol, true)} (${fmtPct(s.totalPnlPct)})</div></div>
-        <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtMoneyBoth(s.totalCurrentValueUsd, s.totalCurrentValueSol)}</div></div>
-        <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtMoneyBoth(s.totalCostBasisUsd, s.totalCostBasisSol)}</div></div>
-        <div class="stat"><div class="label">Realized PnL</div><div class="value ${s.totalRealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(s.totalRealizedPnlUsd, s.totalRealizedPnlSol, true)}</div></div>
-        <div class="stat"><div class="label">Unrealized PnL</div><div class="value ${s.totalUnrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(s.totalUnrealizedPnlUsd, s.totalUnrealizedPnlSol, true)}</div></div>
-        <div class="stat"><div class="label">Total Beli</div><div class="value">${fmtSol(s.totalBuySol)} SOL</div></div>
-        <div class="stat"><div class="label">Total Jual</div><div class="value">${fmtSol(s.totalSellSol)} SOL</div></div>
-        <div class="stat"><div class="label">Coin • Transaksi</div><div class="value">${s.coinCount} • ${s.totalTrades}</div></div>
+        <div class="stat"><div class="label">${translate('pnlTotal')}</div><div class="value ${cls}">${fmtMoneyBoth(s.totalPnlUsd, s.totalPnlSol, true)} (${fmtPct(s.totalPnlPct)})</div></div>
+        <div class="stat"><div class="label">${translate('pnlCurrentValue')}</div><div class="value">${fmtMoneyBoth(s.totalCurrentValueUsd, s.totalCurrentValueSol)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlCostBasis')}</div><div class="value">${fmtMoneyBoth(s.totalCostBasisUsd, s.totalCostBasisSol)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlRealized')}</div><div class="value ${s.totalRealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(s.totalRealizedPnlUsd, s.totalRealizedPnlSol, true)}</div></div>
+        <div class="stat"><div class="label">${translate('pnlUnrealized')}</div><div class="value ${s.totalUnrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(s.totalUnrealizedPnlUsd, s.totalUnrealizedPnlSol, true)}</div></div>
+        <div class="stat"><div class="label">${translate('portfolioTotalBuy')}</div><div class="value">${fmtSol(s.totalBuySol)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('portfolioTotalSell')}</div><div class="value">${fmtSol(s.totalSellSol)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('portfolioCoinsTrades')}</div><div class="value">${s.coinCount} • ${s.totalTrades}</div></div>
       </div>
     </div>
+    <div class="card" id="depositCard">${depositSectionHtml(state.wallet)}</div>
     <div class="card">
-      <h2 style="margin-top:0">Posisi per Coin</h2>
+      <h2 style="margin-top:0">${translate('portfolioPositionsTitle')}</h2>
       ${
         data.positions.length === 0
-          ? '<p class="muted">Belum ada posisi. Mulai trading di salah satu coin.</p>'
+          ? `<p class="muted">${translate('portfolioEmpty')}</p>`
           : `<div class="table-wrap"><table>
-              <thead><tr><th>Coin</th><th>Holdings</th><th>Saldo On-chain</th><th>Harga Rata-rata</th><th>Harga Kini</th><th>Market Cap</th><th>Nilai</th><th>PnL</th><th>ROI</th><th></th></tr></thead>
+              <thead><tr><th>${translate('pfCoin')}</th><th>${translate('pfHoldings')}</th><th>${translate('pfOnchain')}</th><th>${translate('pfAvgPrice')}</th><th>${translate('pfCurrentPrice')}</th><th>${translate('pfMarketCap')}</th><th>${translate('pfValue')}</th><th>${translate('pfPnl')}</th><th>${translate('pfRoi')}</th><th></th></tr></thead>
               <tbody>
                 ${data.positions
                   .map(
-                    (p) => `<tr>
-                      <td><a href="#/coin/${esc(p.mintAddress)}"><b>${esc(p.name)}</b> <span class="muted">$${esc(p.ticker)}</span></a></td>
+                    (p) => {
+                      const asset = (p.pairAsset && p.pairAsset.symbol) || 'SOL';
+                      return `<tr>
+                      <td><a href="#/coin/${esc(p.mintAddress)}"><b>${esc(p.name)}</b> <span class="muted">$${esc(p.ticker)}</span></a><div class="small muted">${esc(p.pairLabel || '')}</div></td>
                       <td>${fmtTokens(p.holdings)}</td>
                       <td>${fmtTokens(state.onchainBalances[p.mintAddress] || 0)}</td>
                       <td>${fmtPriceBoth(p.avgBuyPriceUsd, p.avgBuyPrice)}</td>
                       <td>${fmtPriceBoth(p.priceUsd, p.price)}</td>
                       <td>${fmtMarketCap(p)}</td>
-                      <td>${fmtMoneyBoth(p.currentValueUsd, p.currentValueSol)}</td>
-                      <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.totalPnlUsd, p.totalPnlSol, true)}</td>
+                      <td>${fmtMoneyBoth(p.currentValueUsd, p.currentValueSol, false, asset)}</td>
+                      <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.totalPnlUsd, p.totalPnlSol, true, asset)}</td>
                       <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtPct(p.roiPct)}</td>
-                      <td><a class="btn btn-sm" href="#/coin/${esc(p.mintAddress)}">Lihat</a></td>
-                    </tr>`
+                      <td><a class="btn btn-sm" href="#/coin/${esc(p.mintAddress)}">${translate('viewBtn')}</a> <button class="btn btn-sm" data-transfer="${esc(p.mintAddress)}" data-ticker="${esc(p.ticker)}">${translate('transferSendBtn')}</button></td>
+                    </tr>`;
+                    }
                   )
                   .join('')}
               </tbody>
             </table></div>`
       }
+    </div>
+    <div class="card" id="portfolioTransferCard" hidden>
+      <h2 style="margin-top:0">${translate('transferTitle')}</h2>
+      <div id="portfolioTransferForm"></div>
+      <div id="portfolioTransferResult" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">${translate('transferHistoryTitle')}</h2>
+      <div id="transferHistory"></div>
     </div>`;
+
+  wireDepositSection(state.wallet);
+  renderTransferHistory(data.transfers || []);
+
+  // Per-holding transfer: clicking "Kirim" opens the transfer card below
+  // the positions table, pre-filled with that coin.
+  view.querySelectorAll('[data-transfer]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const mint = b.dataset.transfer;
+      const ticker = b.dataset.ticker;
+      const card = document.getElementById('portfolioTransferCard');
+      const form = document.getElementById('portfolioTransferForm');
+      const liveHoldings = state.onchainBalances[mint] || 0;
+      card.hidden = false;
+      form.innerHTML = `
+        <div class="field">
+          <label>${translate('transferRecipientLabel')}</label>
+          <input id="pfTransferTo" type="text" placeholder="${translate('transferRecipientPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>${translate('transferAmountLabel', { ticker: esc(ticker) })}</label>
+          <input id="pfTransferAmount" type="number" min="0" step="any" placeholder="1000000">
+          <div class="quick">
+            <button class="btn" id="pfMaxTransfer">${translate('burnMaxBtn', { bal: fmtTokens(liveHoldings) })}</button>
+          </div>
+        </div>
+        <button class="btn btn-primary" id="pfTransferBtn">${translate('transferBtn', { ticker: esc(ticker) })}</button>
+        <p class="small muted" style="margin-top:8px">${translate('transferNote')}</p>`;
+      const input = document.getElementById('pfTransferAmount');
+      document.getElementById('pfMaxTransfer').addEventListener('click', () => {
+        input.value = liveHoldings;
+      });
+      document.getElementById('pfTransferBtn').addEventListener('click', async () => {
+        const to = document.getElementById('pfTransferTo').value.trim();
+        const amount = Number(input.value);
+        if (!to) return toast(translate('errTransferInvalidAddress'));
+        if (!(amount > 0)) return toast(translate('errTransferEnterAmount'));
+        await submitTransfer(
+          { mintAddress: mint, ticker },
+          to,
+          amount,
+          document.getElementById('portfolioTransferResult')
+        );
+      });
+      card.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    });
+  });
+
+  function renderTransferHistory(transfers) {
+    const wrap = document.getElementById('transferHistory');
+    if (!transfers.length) {
+      wrap.innerHTML = `<p class="muted">${translate('transferEmpty')}</p>`;
+      return;
+    }
+    wrap.innerHTML = `
+      <div class="table-wrap"><table>
+        <thead><tr><th>${translate('thTime')}</th><th>${translate('thType')}</th><th>${translate('pfCoin')}</th><th>${translate('thToken')}</th><th>${translate('thWallet')}</th><th>${translate('burnHistoryTx')}</th></tr></thead>
+        <tbody>
+          ${transfers
+            .map((tr) => {
+              const sent = tr.fromWallet === state.wallet;
+              const other = sent ? tr.toWallet : tr.fromWallet;
+              return `<tr>
+                <td>${fmtTime(tr.createdAt)}</td>
+                <td><span class="badge ${sent ? 'badge-sell' : 'badge-buy'}">${sent ? translate('transferSent') : translate('transferReceived')}</span></td>
+                <td><a href="#/coin/${esc(tr.mintAddress)}"><b>${esc(tr.coinName || tr.coinTicker || shortAddr(tr.mintAddress))}</b> <span class="muted">$${esc(tr.coinTicker || '')}</span></a></td>
+                <td>${fmtTokens(tr.amount)}</td>
+                <td>${creatorLink(other)}${other === state.wallet ? translate('youSuffix') : ''}</td>
+                <td>${txLink(tr.txSignature)}</td>
+              </tr>`;
+            })
+            .join('')}
+        </tbody>
+      </table></div>`;
+  }
 }
 
 // ---------- Boot ----------
@@ -2065,7 +3018,7 @@ async function wirePhantom() {
       await refreshBalance();
       await refreshOnchainBalances();
       await loadFollowing();
-      toast(`Akun Phantom berubah ke ${shortAddr(state.wallet)} — saldo diperbarui.`);
+      toast(translate('toastAccountChanged', { addr: shortAddr(state.wallet) }));
     }
     renderHeader();
     route();
@@ -2088,12 +3041,17 @@ async function wirePhantom() {
   }
 }
 
-loadPoolAddress().then(() => {
+// Fill the footer pool-address slot. Re-run after a language switch:
+// applyStaticI18n rebuilds the footer's innerHTML (the pool address link
+// is inside the translated footer text), so the link must be restored.
+function fillPoolAddress() {
   const el = document.getElementById('poolAddress');
   if (el && state.poolAddress) {
     el.innerHTML = `<a class="mono" href="${EXPLORER}/address/${esc(state.poolAddress)}?cluster=devnet" target="_blank" rel="noopener">${esc(shortAddr(state.poolAddress))} ↗</a>`;
   }
-});
+}
+
+loadPoolAddress().then(fillPoolAddress);
 wirePhantom();
 window.addEventListener('load', wirePhantom);
 

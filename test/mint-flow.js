@@ -9,7 +9,11 @@
 //      code path (needs a funded fee payer for simulation — found via an
 //      airdrop attempt, then a recent devnet block, like simulate-mint.js)
 //   5. Funding / buy / sell transaction construction (instruction contents)
-//   6. friendlyError message mapping
+//   6. Burn / transfer / pair-buy transaction construction (instruction
+//      contents): BurnChecked with the exact amount, TransferChecked to a
+//      recipient ATA (created when missing), and pair-asset TransferChecked
+//      from the buyer's pair ATA to the pool's pair ATA
+//   7. friendlyError message mapping
 // Nothing here signs or sends a real transaction. The Phantom signature
 // step itself cannot be exercised here (no wallet extension).
 // Run with:
@@ -111,6 +115,9 @@ async function main() {
     buildFundingTransaction,
     buildBuyTransaction,
     buildSellTransaction,
+    buildBurnTransaction,
+    buildTransferTransaction,
+    buildPairBuyTransaction,
     simulateTransaction,
     friendlyError,
   } = client;
@@ -214,6 +221,79 @@ async function main() {
   const sellAmount = sellIx[0].data.readBigUInt64LE(1);
   assert(sellAmount === 1234567000000n, `sell transfers exactly 1,234,567 tokens (raw ${sellAmount})`);
   assert(sell.transaction.feePayer.toBase58() === payer, 'sell tx fee payer is the seller');
+
+  // ---------- 4b. Burn / transfer / pair-buy tx construction ----------
+  console.log('burn + transfer + pair-buy transactions:');
+  const burn = await buildBurnTransaction(payer, built.mintAddress, 2500000);
+  const burnIx = burn.transaction.instructions;
+  assert(burnIx.length === 1, 'burn tx is a single instruction');
+  assert(burnIx[0].programId.equals(splToken.TOKEN_PROGRAM_ID), 'burn is a Token instruction');
+  assert(burnIx[0].data[0] === 15, 'burn is BurnChecked (discriminator 15)');
+  const burnAmount = burnIx[0].data.readBigUInt64LE(1);
+  assert(burnAmount === 2500000000000n, `burn burns exactly 2,500,000 tokens (raw ${burnAmount})`);
+  assert(burnIx[0].data[9] === 6, 'burn uses 6 decimals');
+  const userAta = await splToken.getAssociatedTokenAddress(
+    new PublicKey(built.mintAddress),
+    new PublicKey(payer)
+  );
+  assert(
+    burnIx[0].keys[0].pubkey.equals(userAta),
+    'burn source is the user ATA for that mint'
+  );
+  assert(burn.transaction.feePayer.toBase58() === payer, 'burn tx fee payer is the holder');
+
+  const recipient = Keypair.generate().publicKey.toBase58();
+  const transfer = await buildTransferTransaction(payer, built.mintAddress, recipient, 777);
+  const transferIxList = transfer.transaction.instructions;
+  assert(transferIxList.length === 2, 'transfer tx creates the recipient ATA + transfers (2 ix)');
+  assert(
+    transferIxList[0].programId.equals(splToken.ASSOCIATED_TOKEN_PROGRAM_ID),
+    'transfer ix0 creates the recipient ATA'
+  );
+  const transferSendIx = transferIxList[1];
+  assert(transferSendIx.data[0] === 12, 'transfer is TransferChecked');
+  const transferAmount = transferSendIx.data.readBigUInt64LE(1);
+  assert(transferAmount === 777000000n, `transfer moves exactly 777 tokens (raw ${transferAmount})`);
+  const recipientAta = await splToken.getAssociatedTokenAddress(
+    new PublicKey(built.mintAddress),
+    new PublicKey(recipient)
+  );
+  assert(
+    transferSendIx.keys[0].pubkey.equals(userAta) &&
+      transferSendIx.keys[2].pubkey.equals(recipientAta),
+    'transfer goes from the sender ATA to the recipient ATA'
+  );
+  assert(transfer.transaction.feePayer.toBase58() === payer, 'transfer tx fee payer is the sender');
+
+  const pairMint = Keypair.generate().publicKey.toBase58();
+  const pairBuy = await buildPairBuyTransaction(payer, built.mintAddress, pairMint, pool, 100000);
+  const pairBuyIx = pairBuy.transaction.instructions;
+  // Both ATAs are missing on-chain (fresh mints), so both are created.
+  assert(pairBuyIx.length === 3, 'pair buy tx creates both ATAs + transfers (3 ix)');
+  assert(
+    pairBuyIx[0].programId.equals(splToken.ASSOCIATED_TOKEN_PROGRAM_ID) &&
+      pairBuyIx[1].programId.equals(splToken.ASSOCIATED_TOKEN_PROGRAM_ID),
+    'pair buy ix0/ix1 create the buyer ATA and the pool pair ATA'
+  );
+  const pairTransferIx = pairBuyIx[2];
+  assert(pairTransferIx.data[0] === 12, 'pair buy transfer is TransferChecked');
+  const pairAmount = pairTransferIx.data.readBigUInt64LE(1);
+  assert(pairAmount === 100000000000n, `pair buy pays exactly 100,000 pair tokens (raw ${pairAmount})`);
+  assert(pairTransferIx.data[9] === 6, 'pair buy transfer uses 6 decimals');
+  const userPairAta = await splToken.getAssociatedTokenAddress(
+    new PublicKey(pairMint),
+    new PublicKey(payer)
+  );
+  const poolPairAta = await splToken.getAssociatedTokenAddress(
+    new PublicKey(pairMint),
+    new PublicKey(pool)
+  );
+  assert(
+    pairTransferIx.keys[0].pubkey.equals(userPairAta) &&
+      pairTransferIx.keys[2].pubkey.equals(poolPairAta),
+    'pair buy pays pair tokens from the buyer pair ATA to the pool pair ATA'
+  );
+  assert(pairBuy.transaction.feePayer.toBase58() === payer, 'pair buy tx fee payer is the buyer');
 
   // ---------- 5. friendlyError ----------
   console.log('friendlyError:');

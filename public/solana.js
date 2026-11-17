@@ -194,41 +194,71 @@ async function signAndSend(phantom, tx, extraSigners = []) {
   return sendAndConfirm(signed, { blockhash, lastValidBlockHeight });
 }
 
+// i18n accessor: when public/i18n.js is loaded, messages are translated
+// through the global t(); when it is not (e.g. the mint-flow test sandbox
+// loads solana.js alone), the Indonesian fallback below is used as-is —
+// so the exact-Indonesian assertions in test/mint-flow.js keep passing.
+function tx(key, fallback) {
+  if (typeof window !== 'undefined' && typeof window.t === 'function') {
+    return window.t(key, fallback);
+  }
+  return fallback;
+}
+
 // Plain-text hint appended to the errors that usually mean Phantom is on
 // the wrong network: a website cannot read or switch Phantom's network, so
 // when Phantom is on Mainnet its own simulation fails and its balance reads
 // as ~0 even though the site's devnet check passed. Keep it plain text
 // (no links/markup) — toasts render it with textContent.
-const DEVNET_NETWORK_HINT =
-  ' Periksa juga jaringan Phantom: harus di Devnet (Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih Devnet). Kalau Phantom di Mainnet, transaksi devnet selalu gagal meski saldo devnet-mu cukup.';
+function devnetNetworkHint() {
+  return tx(
+    'errDevnetHint',
+    ' Periksa juga jaringan Phantom: harus di Devnet (Phantom → Pengaturan → Developer Settings → Testnet Mode → pilih Devnet). Kalau Phantom di Mainnet, transaksi devnet selalu gagal meski saldo devnet-mu cukup.'
+  );
+}
 
-// Friendly Indonesian messages for the errors users actually hit.
+// Friendly messages for the errors users actually hit (Indonesian by
+// default, translated when i18n.js is loaded).
 function friendlyError(err) {
   const msg = (err && err.message) || String(err);
-  if (/user rejected/i.test(msg)) return 'Kamu membatalkan tanda tangan di Phantom.';
+  if (/user rejected/i.test(msg)) {
+    return tx('errRejected', 'Kamu membatalkan tanda tangan di Phantom.');
+  }
   if (/insufficient funds|insufficient lamports/i.test(msg)) {
     return (
-      'Saldo SOL devnet tidak cukup untuk transaksi ini. Ambil SOL gratis di faucet.solana.com.' +
-      DEVNET_NETWORK_HINT
+      tx(
+        'errInsufficientFunds',
+        'Saldo SOL devnet tidak cukup untuk transaksi ini. Ambil SOL gratis di faucet.solana.com.'
+      ) + devnetNetworkHint()
+    );
+  }
+  if (/insufficient.*token|TokenAccount.*balance|0x1$|custom program error: 0x1/i.test(msg)) {
+    return tx(
+      'errInsufficientTokens',
+      'Saldo token tidak cukup untuk transaksi ini. Kurangi jumlahnya atau isi saldo dulu.'
     );
   }
   if (/failed to simulate|simulation failed|simulasi gagal/i.test(msg)) {
     return (
-      'Phantom tidak bisa mensimulasikan transaksi ini. Biasanya karena Phantom di jaringan yang salah (Mainnet, bukan Devnet) atau dompet aktif di Phantom tidak punya SOL devnet.' +
-      DEVNET_NETWORK_HINT
+      tx(
+        'errSimFailed',
+        'Phantom tidak bisa mensimulasikan transaksi ini. Biasanya karena Phantom di jaringan yang salah (Mainnet, bukan Devnet) atau dompet aktif di Phantom tidak punya SOL devnet.'
+      ) + devnetNetworkHint()
     );
   }
   if (/blockhash not found/i.test(msg)) {
     return (
-      'Transaksi kedaluwarsa sebelum ditandatangani (blockhash tidak ditemukan). Coba lagi — transaksi baru akan dibuat.' +
-      DEVNET_NETWORK_HINT
+      tx(
+        'errBlockhash',
+        'Transaksi kedaluwarsa sebelum ditandatangani (blockhash tidak ditemukan). Coba lagi — transaksi baru akan dibuat.'
+      ) + devnetNetworkHint()
     );
   }
   if (/429|rate limit/i.test(msg)) {
-    return 'RPC devnet sedang sibuk (rate limit). Tunggu sebentar lalu coba lagi.';
+    return tx('errRateLimit', 'RPC devnet sedang sibuk (rate limit). Tunggu sebentar lalu coba lagi.');
   }
   if (/failed to fetch|network error|network request failed/i.test(msg)) {
-    return 'Gagal terhubung ke RPC devnet. Periksa koneksimu lalu coba lagi.';
+    return tx('errNetwork', 'Gagal terhubung ke RPC devnet. Periksa koneksimu lalu coba lagi.');
   }
   return msg;
 }
@@ -246,6 +276,12 @@ async function signFollowMessage(phantom, message) {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
+}
+
+// Generic alias: the same signer is used for profile edits (and any other
+// wallet-proved action), not just follows.
+async function signWalletMessage(phantom, message) {
+  return signFollowMessage(phantom, message);
 }
 
 // ---------- Mint ----------
@@ -386,6 +422,105 @@ async function buildSellTransaction(payerPubkey, mintAddress, poolAddress, token
       userAta,
       mint,
       poolAta,
+      payer,
+      BigInt(Math.round(tokenAmount * 10 ** TOKEN_DECIMALS)),
+      TOKEN_DECIMALS
+    )
+  );
+  tx.feePayer = payer;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  return { transaction: tx };
+}
+
+// Buy on a coin pair: transfer pair tokens (user's pair ATA -> pool's pair
+// ATA) instead of SOL. Also creates the buyer's ATA for the new coin
+// (user pays the rent) when it does not exist yet, so the pool can deliver
+// the tokens. The server verifies the pair-token transfer on-chain.
+async function buildPairBuyTransaction(payerPubkey, mintAddress, pairMintAddress, poolAddress, pairAmount) {
+  const connection = getConnection();
+  const payer = new solanaWeb3.PublicKey(payerPubkey);
+  const mint = new solanaWeb3.PublicKey(mintAddress);
+  const pairMint = new solanaWeb3.PublicKey(pairMintAddress);
+  const pool = new solanaWeb3.PublicKey(poolAddress);
+  const buyerAta = await splToken.getAssociatedTokenAddress(mint, payer);
+  const userPairAta = await splToken.getAssociatedTokenAddress(pairMint, payer);
+  const poolPairAta = await splToken.getAssociatedTokenAddress(pairMint, pool);
+
+  const tx = new solanaWeb3.Transaction();
+  const ataInfo = await connection.getAccountInfo(buyerAta);
+  if (!ataInfo) {
+    tx.add(splToken.createAssociatedTokenAccountInstruction(payer, buyerAta, payer, mint));
+  }
+  // The pool's pair ATA may not exist yet (no pair-token buy has happened);
+  // create it (buyer pays the rent) so the transfer has a destination.
+  const poolPairAtaInfo = await connection.getAccountInfo(poolPairAta);
+  if (!poolPairAtaInfo) {
+    tx.add(splToken.createAssociatedTokenAccountInstruction(payer, poolPairAta, pool, pairMint));
+  }
+  tx.add(
+    splToken.createTransferCheckedInstruction(
+      userPairAta,
+      pairMint,
+      poolPairAta,
+      payer,
+      BigInt(Math.round(pairAmount * 10 ** TOKEN_DECIMALS)),
+      TOKEN_DECIMALS
+    )
+  );
+  tx.feePayer = payer;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  return { transaction: tx };
+}
+
+// ---------- Burn ----------
+// Burn tokens from the holder's own ATA (BurnChecked). The burn is
+// permanent: the tokens are destroyed, the server verifies the burn
+// on-chain and shrinks the coin's curve token_reserve, which raises the
+// price. The caller must validate the amount against the live on-chain
+// balance before opening the wallet.
+async function buildBurnTransaction(payerPubkey, mintAddress, tokenAmount) {
+  const connection = getConnection();
+  const payer = new solanaWeb3.PublicKey(payerPubkey);
+  const mint = new solanaWeb3.PublicKey(mintAddress);
+  const userAta = await splToken.getAssociatedTokenAddress(mint, payer);
+
+  const tx = new solanaWeb3.Transaction();
+  tx.add(
+    splToken.createBurnCheckedInstruction(
+      userAta,
+      mint,
+      payer,
+      BigInt(Math.round(tokenAmount * 10 ** TOKEN_DECIMALS)),
+      TOKEN_DECIMALS
+    )
+  );
+  tx.feePayer = payer;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  return { transaction: tx };
+}
+
+// ---------- Transfer ----------
+// Send tokens to any Solana address: create the recipient's ATA first
+// (sender pays the rent) when it does not exist, then TransferChecked.
+// The server verifies the transfer on-chain and records it.
+async function buildTransferTransaction(payerPubkey, mintAddress, recipientAddress, tokenAmount) {
+  const connection = getConnection();
+  const payer = new solanaWeb3.PublicKey(payerPubkey);
+  const mint = new solanaWeb3.PublicKey(mintAddress);
+  const recipient = new solanaWeb3.PublicKey(recipientAddress);
+  const senderAta = await splToken.getAssociatedTokenAddress(mint, payer);
+  const recipientAta = await splToken.getAssociatedTokenAddress(mint, recipient);
+
+  const tx = new solanaWeb3.Transaction();
+  const recipientAtaInfo = await connection.getAccountInfo(recipientAta);
+  if (!recipientAtaInfo) {
+    tx.add(splToken.createAssociatedTokenAccountInstruction(payer, recipientAta, recipient, mint));
+  }
+  tx.add(
+    splToken.createTransferCheckedInstruction(
+      senderAta,
+      mint,
+      recipientAta,
       payer,
       BigInt(Math.round(tokenAmount * 10 ** TOKEN_DECIMALS)),
       TOKEN_DECIMALS

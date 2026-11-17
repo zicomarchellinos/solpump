@@ -91,6 +91,15 @@ async function getPoolSolBalance() {
   return withRetry(() => connection.getBalance(poolPubkey), { label: 'getPoolSolBalance' });
 }
 
+// SOL balance (lamports) of any wallet — used by the trade pre-check so a
+// buy is rejected before signing when the buyer cannot pay for their leg.
+async function getSolBalanceOf(walletAddress) {
+  return withRetry(
+    () => connection.getBalance(new PublicKey(walletAddress)),
+    { label: 'getSolBalanceOf' }
+  );
+}
+
 async function getPoolAta(mintAddress) {
   return getAssociatedTokenAddress(new PublicKey(mintAddress), poolPubkey);
 }
@@ -196,6 +205,7 @@ async function sendTokens(mintAddress, destinationAddress, amountRaw) {
 module.exports = {
   getPoolAddress,
   getPoolSolBalance,
+  getSolBalanceOf,
   getPoolAta,
   getPoolTokenBalance,
   getTokenBalanceOf,

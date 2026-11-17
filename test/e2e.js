@@ -17,12 +17,37 @@
 //   8. follows: signature verification (wrong message/signature 401,
 //      self-follow 400), follow/unfollow + lists, creator profile
 //      aggregation, and the feed's ?following= filter
-//   9. market cap = price x 1B supply, everywhere it is exposed — in SOL
-//      and in USD (x SOL/USD), with the $K/$M/$B suffix formatter, and a
-//      fresh coin starting near a $5K USD market cap at current SOL prices
+//   9. market cap = price x circulating supply (1B minus total burned),
+//      everywhere it is exposed — in SOL and in USD (x SOL/USD), with
+//      the $K/$M/$B suffix formatter, and a fresh coin starting near a
+//      $5K USD market cap at current SOL prices
 //  10. SOL/USD price: /api/sol-price, the *Usd fields on coins/stats/
 //      trades/PnL/callouts, and the price-API fallback (stale cache, then
 //      null — never a crash or NaN)
+//  11. burn: circulating supply, price-after-burn math, market cap on
+//      circulating supply, and the burn endpoint's validation (fake burn
+//      signature rejected on-chain, amount >= reserve rejected)
+//  12. candles: OHLC aggregation per time bucket (empty buckets produce
+//      no candle) and the /api/coins/:mint/candles endpoint
+//  13. transfers: validation (bad recipient, self-transfer, bad amount,
+//      unknown coin, fake signature rejected on-chain) + transfer history
+//  14. custom pairs: pair-asset registry + USD resolution through a pair
+//      chain (module level), the /api/pairs endpoint, pair-coin pricing
+//      on the detail endpoint, cycle/self/unknown-pair rejection at
+//      registration, pair-aware prepare (min buy in pair tokens, pool
+//      pair-asset checks), and the graceful unresolvable-pair fallback
+//      (pair coin missing from the registry: price in pair asset only,
+//      trading disabled, no crash)
+//  15. one wallet, many coins: no UNIQUE constraint or per-wallet limit
+//      on creator_wallet (schema + register endpoint), and the same
+//      wallet's coins all appear in the feed and on its creator profile
+//      with their own stats
+//  16. editable profiles: username validation + case-insensitive
+//      uniqueness, the signature requirement (no signature / wrong
+//      wallet / wrong message all 401), non-owner cannot edit, avatar
+//      upload validation, and the profile surfacing on the creator
+//      endpoint, feed coin cards (creatorProfile), callouts
+//      (authorProfile), and follow lists (profiles map)
 // The actual Phantom signature steps cannot be exercised here (no wallet
 // extension), so no real on-chain trade is executed by this test — and the
 // claim success path (a real pool payout) cannot be tested without
@@ -30,12 +55,15 @@
 // Run with:
 //   node test/e2e.js [baseUrl]
 
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const { Keypair } = require('@solana/web3.js');
 const bonding = require('../src/bonding');
+const pairs = require('../src/pairs');
 const solprice = require('../src/solprice');
+const { profileMessage, sha256Hex } = require('../src/signverify');
 
 // A throwaway wallet that can sign follow messages: a real Solana keypair,
 // signed with Node's built-in Ed25519 (same scheme Phantom uses).
@@ -127,12 +155,183 @@ async function main() {
   assert(bonding.CREATOR_FEE_BPS === 100, 'creator fee is 1% (100 bps)');
   assert(approx(bonding.creatorFeeSol(1.5), 0.015), 'creatorFeeSol(1.5 SOL) = 0.015 SOL');
   assert(approx(bonding.creatorFeeSol(0.0005), 0.000005), 'creatorFeeSol(0.0005 SOL) = 0.000005 SOL');
-  // Market cap = current price x 1B total supply.
+  // Market cap = current price x CIRCULATING supply (1B minus total
+  // burned); with zero burns it equals the old price x 1B formula.
   const mcFresh = { sol_reserve: bonding.VIRTUAL_SOL, token_reserve: 800000000 };
   assert(
     approx(bonding.marketCapSol(mcFresh), bonding.currentPrice(mcFresh) * 1000000000),
-    'marketCapSol = price x 1B supply'
+    'marketCapSol = price x 1B supply (zero burns)'
   );
+  assert(
+    approx(bonding.circulatingSupply(0), 1000000000),
+    'circulatingSupply(0) = 1B'
+  );
+  assert(
+    approx(bonding.circulatingSupply(100000000), 900000000),
+    'circulatingSupply(100M burned) = 900M'
+  );
+  assert(
+    approx(bonding.circulatingSupply(2000000000), 0),
+    'circulatingSupply never goes below 0'
+  );
+  assert(
+    approx(bonding.marketCapSol(mcFresh, 100000000), bonding.currentPrice(mcFresh) * 900000000),
+    'marketCapSol with 100M burned = price x 900M circulating'
+  );
+  // Burning raises the price: price = sol_reserve / token_reserve, and a
+  // burn shrinks token_reserve (the burned tokens belonged to the user,
+  // not the pool, so the pool invariant is untouched).
+  const priceBefore = bonding.currentPrice(mcFresh);
+  const priceAfter100M = bonding.priceAfterBurn(mcFresh, 100000000);
+  assert(
+    approx(priceAfter100M, 55 / 700000000),
+    `priceAfterBurn(100M) = ${priceAfter100M} (was ${priceBefore})`
+  );
+  assert(priceAfter100M > priceBefore, 'burning 100M tokens raises the price');
+  const effect = bonding.burnPriceEffect(mcFresh, 100000000);
+  assert(
+    approx(effect.pctChange, (priceAfter100M / priceBefore - 1) * 100),
+    `burnPriceEffect pct = ${effect.pctChange.toFixed(2)}%`
+  );
+  assert(
+    bonding.priceAfterBurn(mcFresh, 800000000) === null,
+    'priceAfterBurn is null when the burn would empty the reserve'
+  );
+  assert(
+    bonding.priceAfterBurn(mcFresh, 900000000) === null,
+    'priceAfterBurn is null when the burn exceeds the reserve'
+  );
+  // Candle aggregation: OHLC per bucket, volume sums trade amounts,
+  // empty buckets produce NO candle (never a zero candle).
+  const candlePts = [
+    { t: 60000, price: 10, amount: 1 },
+    { t: 90000, price: 12, amount: 2 },
+    { t: 119000, price: 11, amount: 3 },
+    { t: 300000, price: 20, amount: 5 },
+  ];
+  const candles = bonding.buildCandles(candlePts, 60000);
+  assert(candles.length === 2, `buildCandles(1m) yields 2 candles for 2 non-empty buckets, got ${candles.length}`);
+  assert(
+    candles[0].t === 60000 && candles[0].open === 10 && candles[0].high === 12 &&
+      candles[0].low === 10 && candles[0].close === 11 && candles[0].volume === 6 &&
+      candles[0].count === 3,
+    'first candle OHLC/volume/count are correct'
+  );
+  assert(
+    candles[1].t === 300000 && candles[1].open === 20 && candles[1].close === 20 &&
+      candles[1].volume === 5 && candles[1].count === 1,
+    'second candle (single trade) OHLC/volume/count are correct'
+  );
+  assert(
+    bonding.buildCandles([], 60000).length === 0,
+    'buildCandles with no points yields no candles'
+  );
+  assert(
+    bonding.buildCandles([{ t: 0, price: 5, amount: 0 }], 60000)[0].volume === 0,
+    'a launch/burn point (amount 0) adds no volume'
+  );
+  // Chart points merge burns as price-only points (side 'burn').
+  const chartWithBurn = bonding.chartPoints(
+    mcFresh,
+    [],
+    null,
+    [{ created_at: Date.now(), price_after: 9.5e-8 }]
+  );
+  assert(
+    chartWithBurn.length === 2 && chartWithBurn[1].side === 'burn' && chartWithBurn[1].amount === 0,
+    'chartPoints merges burns as price-only points'
+  );
+  // computeStats reports burns.
+  const statsWithBurn = bonding.computeStats(mcFresh, [], null, 250000000);
+  assert(
+    statsWithBurn.totalBurned === 250000000 && statsWithBurn.circulatingSupply === 750000000,
+    'computeStats reports totalBurned + circulatingSupply'
+  );
+
+  // ---------- 1a. Custom pairs (module level) ----------
+  console.log('custom pairs (module):');
+  const pairMap = new Map([
+    ['MINT_SOL', { mint_address: 'MINT_SOL', ticker: 'BASE', name: 'Base', sol_reserve: 55, token_reserve: 800000000, pair_mint: null }],
+    ['MINT_L1', { mint_address: 'MINT_L1', ticker: 'L1', name: 'Level 1', sol_reserve: 100, token_reserve: 700000000, pair_mint: 'MINT_SOL' }],
+    ['MINT_L2', { mint_address: 'MINT_L2', ticker: 'L2', name: 'Level 2', sol_reserve: 50, token_reserve: 600000000, pair_mint: 'MINT_L1' }],
+    ['MINT_ORPHAN', { mint_address: 'MINT_ORPHAN', ticker: 'ORPH', name: 'Orphan', sol_reserve: 55, token_reserve: 800000000, pair_mint: 'MINT_GONE' }],
+  ]);
+  const solAsset = pairs.pairAssetOf(pairMap.get('MINT_SOL'), pairMap);
+  assert(solAsset.type === 'SOL' && solAsset.symbol === 'SOL' && solAsset.available === true, 'SOL pair asset for a NULL pair_mint');
+  const coinAsset = pairs.pairAssetOf(pairMap.get('MINT_L1'), pairMap);
+  assert(coinAsset.type === 'COIN' && coinAsset.symbol === 'BASE' && coinAsset.available === true, 'coin pair asset resolves the pair ticker');
+  const orphanAsset = pairs.pairAssetOf(pairMap.get('MINT_ORPHAN'), pairMap);
+  assert(orphanAsset.type === 'COIN' && orphanAsset.available === false && orphanAsset.symbol === '?', 'missing pair coin reports available=false');
+  assert(pairs.pairLabel('L1', coinAsset) === 'L1/BASE', 'pairLabel is TICKER/PAIR-TICKER');
+  assert(pairs.pairLabel('BASE', solAsset) === 'BASE/SOL', 'pairLabel is TICKER/SOL for SOL pairs');
+  // USD resolution through the chain: L2 price (in L1) x L1 price (in
+  // BASE) x BASE price (in SOL) x SOL/USD.
+  const baseUsd = (55 / 800000000) * 100;
+  const l1Usd = (100 / 700000000) * baseUsd;
+  const l2Usd = (50 / 600000000) * l1Usd;
+  assert(
+    approx(pairs.resolveTokenUsdPrice('MINT_SOL', pairMap, 100), baseUsd),
+    'SOL-pair USD price = price x SOL/USD'
+  );
+  assert(
+    approx(pairs.resolveTokenUsdPrice('MINT_L1', pairMap, 100), l1Usd),
+    '1-hop pair-chain USD price resolves'
+  );
+  assert(
+    approx(pairs.resolveTokenUsdPrice('MINT_L2', pairMap, 100), l2Usd),
+    '2-hop pair-chain USD price resolves'
+  );
+  assert(
+    pairs.resolveTokenUsdPrice('MINT_ORPHAN', pairMap, 100) === null,
+    'unresolvable chain (missing pair coin) yields null, never a crash'
+  );
+  assert(
+    pairs.resolveTokenUsdPrice('MINT_SOL', pairMap, null) === null,
+    'no SOL/USD price yields null'
+  );
+  assert(
+    approx(pairs.resolvePairAssetUsdPrice(pairMap.get('MINT_L1'), pairMap, 100), baseUsd),
+    'resolvePairAssetUsdPrice returns the pair coin USD price'
+  );
+  assert(
+    pairs.resolvePairAssetUsdPrice(pairMap.get('MINT_SOL'), pairMap, 100) === 100,
+    'resolvePairAssetUsdPrice returns SOL/USD for SOL pairs'
+  );
+  // Cycle detection: A -> B -> A must resolve to null, not loop forever.
+  const cyclicMap = new Map([
+    ['A', { mint_address: 'A', ticker: 'A', sol_reserve: 55, token_reserve: 800000000, pair_mint: 'B' }],
+    ['B', { mint_address: 'B', ticker: 'B', sol_reserve: 55, token_reserve: 800000000, pair_mint: 'A' }],
+  ]);
+  assert(
+    pairs.resolveTokenUsdPrice('A', cyclicMap, 100) === null,
+    'cyclic pair chain resolves to null (cycle detection)'
+  );
+  // Depth limit: a 7-hop chain exceeds MAX_PAIR_DEPTH (5) and is null.
+  const deepMap = new Map([
+    ['D0', { mint_address: 'D0', ticker: 'D0', sol_reserve: 55, token_reserve: 800000000, pair_mint: null }],
+  ]);
+  for (let i = 1; i <= 7; i++) {
+    deepMap.set(`D${i}`, { mint_address: `D${i}`, ticker: `D${i}`, sol_reserve: 55, token_reserve: 800000000, pair_mint: `D${i - 1}` });
+  }
+  assert(
+    pairs.resolveTokenUsdPrice('D7', deepMap, 100) === null,
+    'chain deeper than MAX_PAIR_DEPTH resolves to null'
+  );
+  assert(
+    Number.isFinite(pairs.resolveTokenUsdPrice('D5', deepMap, 100)),
+    'chain at exactly MAX_PAIR_DEPTH still resolves'
+  );
+  // validatePairChoice.
+  assert(pairs.validatePairChoice(null, 'NEW', pairMap).ok, 'SOL pair is always valid');
+  assert(pairs.validatePairChoice('MINT_SOL', 'NEW', pairMap).ok, 'pair with an existing coin is valid');
+  const selfPair = pairs.validatePairChoice('MINT_L1', 'MINT_L1', pairMap);
+  assert(!selfPair.ok && /dirinya sendiri/.test(selfPair.reason), 'a coin cannot pair with itself');
+  const unknownPair = pairs.validatePairChoice('MINT_NOPE', 'NEW', pairMap);
+  assert(!unknownPair.ok && /tidak ditemukan/.test(unknownPair.reason), 'unknown pair coin is rejected');
+  const cyclicChoice = pairs.validatePairChoice('B', 'A', cyclicMap);
+  assert(!cyclicChoice.ok && /melingkar/.test(cyclicChoice.reason), 'a pair forming a cycle is rejected');
+  const deepChoice = pairs.validatePairChoice('D7', 'NEW', deepMap);
+  assert(!deepChoice.ok && /terlalu dalam/.test(deepChoice.reason), 'a pair chain that is too deep is rejected');
   assert(approx(bonding.marketCapSol(mcFresh), 68.75), `fresh-coin market cap is 68.75 SOL`);
   // Starting market cap in USD at a mocked current SOL price: ~$5K.
   const mockedSolUsd = 72.85; // SOL/USD on 2026-11-17 (Jupiter / CoinGecko)
@@ -247,21 +446,24 @@ async function main() {
     if (savedEnvPrice !== undefined) process.env.SOL_USD_PRICE = savedEnvPrice;
   }
 
-  // ---------- 2. Server: seed two coins ----------
+  // ---------- 2. Server: seed four coins ----------
   const db = new Database(path.join(__dirname, '..', 'data', 'solpump.db'));
   const mintUnfunded = Keypair.generate().publicKey.toBase58();
   const mint = Keypair.generate().publicKey.toBase58();
+  const mintPair = Keypair.generate().publicKey.toBase58();
+  const mintOrphan = Keypair.generate().publicKey.toBase58();
+  const mintGone = Keypair.generate().publicKey.toBase58(); // never registered
   const now = Date.now();
   const insertCoin = db.prepare(
     `INSERT INTO coins
        (mint_address, name, ticker, description, logo_url, creator_wallet, tx_signature,
-        sol_reserve, token_reserve, trading_enabled, funding_tx_signature, created_at)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+        sol_reserve, token_reserve, trading_enabled, funding_tx_signature, pair_mint, created_at)
+     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   // Coin A: unfunded, trading disabled.
   insertCoin.run(
     mintUnfunded, 'Unfunded Cat', 'UCAT', 'Unfunded test coin', WALLET_A,
-    'u'.repeat(88), 30, 800000000, 0, null, now
+    'u'.repeat(88), 30, 800000000, 0, null, null, now
   );
   // Coin B: "funded" in the DB (the pool holds 0 of this mint on-chain,
   // which is exactly what the pool-short tests rely on). Four real-style
@@ -274,7 +476,19 @@ async function main() {
   const finalTok = tokAfterSell - 1000000;
   insertCoin.run(
     mint, 'Test Cat', 'TCAT', 'Test coin (e2e)', WALLET_A,
-    'x'.repeat(88), finalSol, finalTok, 1, 'f'.repeat(88), now - 60000
+    'x'.repeat(88), finalSol, finalTok, 1, 'f'.repeat(88), null, now - 60000
+  );
+  // Coin C: paired with TCAT (creator WALLET_B, so WALLET_A's counts in
+  // the profile/feed assertions stay at 2). Fresh curve, trading on.
+  insertCoin.run(
+    mintPair, 'Pair Dog', 'PDOG', 'Coin paired with TCAT (e2e)', WALLET_B,
+    'p'.repeat(88), 55, 800000000, 1, 'q'.repeat(88), mint, now - 30000
+  );
+  // Coin D: paired with a mint that is NOT in the registry — the
+  // unresolvable-pair fallback (e.g. after a database reset).
+  insertCoin.run(
+    mintOrphan, 'Orphan Fox', 'OFOX', 'Coin with a missing pair (e2e)', WALLET_B,
+    'r'.repeat(88), 55, 800000000, 1, 's'.repeat(88), mintGone, now - 20000
   );
   const insertTrade = db.prepare(
     `INSERT INTO trades
@@ -810,12 +1024,562 @@ async function main() {
     const otherCallouts = await get(`/api/callouts?following=${WALLET_A}`);
     assert(otherCallouts.callouts.length === 0, 'following feed is empty when nobody followed posts');
 
+    // ---------- 10. Pair picker options ----------
+    console.log('pairs endpoint:');
+    const pairsRes = await get('/api/pairs');
+    assert(Array.isArray(pairsRes.pairs), 'GET /api/pairs returns a pairs array');
+    const solPair = pairsRes.pairs.find((p) => p.type === 'SOL');
+    assert(solPair && solPair.symbol === 'SOL', 'pairs list starts with SOL');
+    const tcatPair = pairsRes.pairs.find((p) => p.mint === mint);
+    assert(tcatPair && tcatPair.symbol === 'TCAT' && tcatPair.type === 'COIN', 'pairs list includes the listed TCAT coin');
+    const pdogPair = pairsRes.pairs.find((p) => p.mint === mintPair);
+    assert(pdogPair && pdogPair.symbol === 'PDOG', 'pairs list includes PDOG');
+
+    // ---------- 11. Custom-pair pricing + fallbacks ----------
+    console.log('custom-pair pricing:');
+    const pairDetail = await get(`/api/coins/${mintPair}`);
+    assert(pairDetail.coin.pairLabel === 'PDOG/TCAT', `pair coin label is PDOG/TCAT (got ${pairDetail.coin.pairLabel})`);
+    assert(
+      pairDetail.coin.pairAsset.type === 'COIN' && pairDetail.coin.pairAsset.symbol === 'TCAT' &&
+        pairDetail.coin.pairAsset.available === true,
+      'pair coin reports its TCAT pair asset as available'
+    );
+    const tcatPriceUsd = funded.priceUsd; // TCAT USD price from the feed
+    if (Number.isFinite(tcatPriceUsd) && Number.isFinite(solUsd)) {
+      const pdogPrice = 55 / 800000000; // PDOG price in TCAT
+      assert(
+        approx(pairDetail.stats.price, pdogPrice),
+        'pair coin price is quoted in the pair asset'
+      );
+      assert(
+        approx(pairDetail.coin.pairAssetUsd, tcatPriceUsd),
+        'pairAssetUsd is the pair coin USD price'
+      );
+      assert(
+        approx(pairDetail.stats.priceUsd, pdogPrice * tcatPriceUsd),
+        'pair coin USD price = price in pair asset x pair coin USD price'
+      );
+      assert(
+        approx(pairDetail.stats.marketCapUsd, pdogPrice * tcatPriceUsd * 1000000000),
+        'pair coin market cap USD = USD price x 1B supply'
+      );
+    }
+    // Unresolvable pair: the pair coin is missing from the registry, so
+    // the price shows in the pair asset only (no USD, no crash) and
+    // trading is disabled with a clear explanation.
+    const orphanDetail = await get(`/api/coins/${mintOrphan}`);
+    assert(
+      orphanDetail.coin.pairAsset.available === false,
+      'orphan coin reports its pair as unavailable'
+    );
+    assert(orphanDetail.coin.pairLabel === 'OFOX/?', `orphan pair label is OFOX/? (got ${orphanDetail.coin.pairLabel})`);
+    assert(orphanDetail.stats.priceUsd === null, 'orphan coin has no USD price');
+    assert(orphanDetail.stats.marketCapUsd === null, 'orphan coin has no USD market cap');
+    assert(
+      approx(orphanDetail.stats.marketCapSol, (55 / 800000000) * 1000000000),
+      'orphan market cap is shown in the pair asset instead'
+    );
+    const orphanPrepare = await post(
+      '/api/trades/prepare',
+      { mintAddress: mintOrphan, wallet: WALLET_A, side: 'buy', solAmount: 1000 },
+      400
+    );
+    assert(
+      /tidak ditemukan di registry/.test(orphanPrepare.error),
+      `prepare on a coin with a missing pair is rejected with an explanation: ${orphanPrepare.error}`
+    );
+
+    // Pair-aware prepare: the min buy is 1,000 pair tokens (not 0.001
+    // SOL), and the pool-short check still runs for the new coin.
+    const pairTooSmall = await post(
+      '/api/trades/prepare',
+      { mintAddress: mintPair, wallet: WALLET_A, side: 'buy', solAmount: 500 },
+      400
+    );
+    assert(
+      /Beli minimal 1.000 TCAT/.test(pairTooSmall.error),
+      `pair-coin min buy is 1,000 pair tokens: ${pairTooSmall.error}`
+    );
+    const pairPoolShort = await post(
+      '/api/trades/prepare',
+      { mintAddress: mintPair, wallet: WALLET_A, side: 'buy', solAmount: 100000 },
+      400
+    );
+    assert(
+      /Pool kehabisan token/.test(pairPoolShort.error),
+      `pair-coin buy rejected when the pool holds 0 of the new coin: ${pairPoolShort.error}`
+    );
+    const pairSellShort = await post(
+      '/api/trades/prepare',
+      { mintAddress: mintPair, wallet: WALLET_A, side: 'sell', tokenAmount: 100 },
+      400
+    );
+    assert(
+      /Saldo token tidak cukup/.test(pairSellShort.error),
+      'pair-coin sell rejected when the user holds 0 of the coin'
+    );
+
+    // Register-time pair validation runs BEFORE the mint verification,
+    // so these rejections need no RPC call.
+    const selfPairReg = await post(
+      '/api/coins/register',
+      {
+        mintAddress: mintPair,
+        name: 'Self',
+        ticker: 'SELF',
+        creatorWallet: WALLET_A,
+        txSignature: 'z'.repeat(88),
+        pairMint: mintPair,
+      },
+      400
+    );
+    assert(/dirinya sendiri/.test(selfPairReg.error), 'register with a self-pair is 400');
+    const unknownPairReg = await post(
+      '/api/coins/register',
+      {
+        mintAddress: Keypair.generate().publicKey.toBase58(),
+        name: 'Ghost',
+        ticker: 'GHOST',
+        creatorWallet: WALLET_A,
+        txSignature: 'z'.repeat(88),
+        pairMint: mintGone,
+      },
+      400
+    );
+    assert(/tidak ditemukan/.test(unknownPairReg.error), 'register with an unknown pair coin is 400');
+    const badPairAddr = await post(
+      '/api/coins/register',
+      {
+        mintAddress: Keypair.generate().publicKey.toBase58(),
+        name: 'Bad',
+        ticker: 'BAD',
+        creatorWallet: WALLET_A,
+        txSignature: 'z'.repeat(88),
+        pairMint: 'not-an-address',
+      },
+      400
+    );
+    assert(/tidak valid/.test(badPairAddr.error), 'register with a malformed pair address is 400');
+
+    // ---------- 12. Candles ----------
+    console.log('candles:');
+    const candles5m = await get(`/api/coins/${mint}/candles?timeframe=5m`);
+    assert(candles5m.timeframe === '5m', 'candles endpoint echoes the timeframe');
+    assert(
+      candles5m.candles.length >= 1 && candles5m.candles.length <= 2,
+      `5m candles: 1-2 buckets for 4 trades + launch (got ${candles5m.candles.length})`
+    );
+    const totalVol = candles5m.candles.reduce((s, c) => s + c.volume, 0);
+    const totalCount = candles5m.candles.reduce((s, c) => s + c.count, 0);
+    assert(
+      approx(totalVol, 1.5 + 0.5 + solOut + sol3),
+      'candle volume sums all trade SOL'
+    );
+    assert(totalCount === 5, 'candle counts sum to 5 points (launch + 4 trades)');
+    assert(
+      candles5m.candles.every((c) => c.high >= c.low && c.high >= c.open && c.high >= c.close &&
+        c.low <= c.open && c.low <= c.close && c.open > 0),
+      'every candle has valid OHLC (high >= open/close >= low, no zero candles)'
+    );
+    if (Number.isFinite(solUsd)) {
+      assert(
+        candles5m.candles.every((c) => approx(c.openUsd, c.open * solUsd) && approx(c.volumeUsd, c.volume * solUsd)),
+        'candles carry USD fields = pair-asset fields x SOL/USD'
+      );
+    }
+    const candles1m = await get(`/api/coins/${mint}/candles?timeframe=1m`);
+    assert(candles1m.timeframe === '1m', '1m timeframe is honored');
+    assert(
+      candles1m.candles.length >= 1 && candles1m.candles.length <= 2,
+      `1m candles: 1-2 buckets (got ${candles1m.candles.length})`
+    );
+    const candlesDefault = await get(`/api/coins/${mint}/candles`);
+    assert(candlesDefault.timeframe === '5m', 'candles default to the 5m timeframe');
+    const candlesBadTf = await get(`/api/coins/${mint}/candles?timeframe=2m`);
+    assert(candlesBadTf.timeframe === '5m', 'an unknown timeframe falls back to 5m');
+    const candlesUnknown = await fetch(`${BASE}/api/coins/${Keypair.generate().publicKey.toBase58()}/candles`);
+    assert(candlesUnknown.status === 404, 'candles on an unknown coin are 404');
+    const candlesEmpty = await get(`/api/coins/${mintPair}/candles?timeframe=1m`);
+    assert(
+      candlesEmpty.candles.length === 1 && candlesEmpty.candles[0].volume === 0,
+      'a coin with no trades has only the launch candle (zero volume, no zero-price candle)'
+    );
+
+    // ---------- 13. Burns ----------
+    console.log('burns:');
+    const burnsEmpty = await get(`/api/coins/${mint}/burns`);
+    assert(
+      burnsEmpty.burns.length === 0 && burnsEmpty.totalBurned === 0 &&
+        burnsEmpty.circulatingSupply === 1000000000,
+      'burn history starts empty with 1B circulating'
+    );
+    assert(
+      detail.burnStats && detail.burnStats.totalBurned === 0 &&
+        detail.burnStats.circulatingSupply === 1000000000,
+      'coin detail carries burnStats (0 burned, 1B circulating)'
+    );
+    assert(
+      detail.stats.totalBurned === 0 && detail.stats.circulatingSupply === 1000000000,
+      'coin stats carry totalBurned + circulatingSupply'
+    );
+    const burnZero = await post(
+      `/api/coins/${mint}/burn`,
+      { wallet: WALLET_A, amount: 0, txSignature: 'k'.repeat(88) },
+      400
+    );
+    assert(/lebih dari 0/.test(burnZero.error), 'burn of 0 is 400');
+    const burnTooBig = await post(
+      `/api/coins/${mint}/burn`,
+      { wallet: WALLET_A, amount: finalTok, txSignature: 'k'.repeat(88) },
+      400
+    );
+    assert(/melebihi|kurang dari/.test(burnTooBig.error), `burn >= token reserve is 400: ${burnTooBig.error}`);
+    const burnBadWallet = await post(
+      `/api/coins/${mint}/burn`,
+      { wallet: 'not-an-address', amount: 100, txSignature: 'k'.repeat(88) },
+      400
+    );
+    assert(/tidak valid/.test(burnBadWallet.error), 'burn with an invalid wallet is 400');
+    const burnUnknown = await post(
+      `/api/coins/${Keypair.generate().publicKey.toBase58()}/burn`,
+      { wallet: WALLET_A, amount: 100, txSignature: 'k'.repeat(88) },
+      404
+    );
+    assert(/tidak ditemukan/.test(burnUnknown.error), 'burn on an unknown coin is 404');
+    // Fake burn signature: the server verifies the burn on-chain (~10s).
+    const fakeBurn = await post(
+      `/api/coins/${mint}/burn`,
+      { wallet: WALLET_A, amount: 100, txSignature: 'k'.repeat(88) },
+      422
+    );
+    assert(/Verifikasi burn gagal/.test(fakeBurn.error), `fake burn rejected: ${fakeBurn.error}`);
+
+    // ---------- 14. Transfers ----------
+    console.log('transfers:');
+    const transfersEmpty = await get(`/api/transfers?wallet=${WALLET_A}`);
+    assert(
+      Array.isArray(transfersEmpty.transfers) && transfersEmpty.transfers.length === 0,
+      'transfer history starts empty'
+    );
+    assert(
+      Array.isArray(pf.transfers) && pf.transfers.length === 0,
+      'portfolio carries the (empty) transfer history'
+    );
+    const transferBadTo = await post(
+      '/api/transfers',
+      { mintAddress: mint, fromWallet: WALLET_A, toWallet: 'not-an-address', amount: 100, txSignature: 'm'.repeat(88) },
+      400
+    );
+    assert(/tidak valid/.test(transferBadTo.error), 'transfer to an invalid address is 400');
+    const transferSelf = await post(
+      '/api/transfers',
+      { mintAddress: mint, fromWallet: WALLET_A, toWallet: WALLET_A, amount: 100, txSignature: 'm'.repeat(88) },
+      400
+    );
+    assert(/tidak boleh sama/.test(transferSelf.error), `self-transfer is 400: ${transferSelf.error}`);
+    const transferZero = await post(
+      '/api/transfers',
+      { mintAddress: mint, fromWallet: WALLET_A, toWallet: WALLET_B, amount: 0, txSignature: 'm'.repeat(88) },
+      400
+    );
+    assert(/lebih dari 0/.test(transferZero.error), 'transfer of 0 is 400');
+    const transferUnknown = await post(
+      '/api/transfers',
+      { mintAddress: Keypair.generate().publicKey.toBase58(), fromWallet: WALLET_A, toWallet: WALLET_B, amount: 100, txSignature: 'm'.repeat(88) },
+      404
+    );
+    assert(/tidak ditemukan/.test(transferUnknown.error), 'transfer of an unknown coin is 404');
+    // Fake transfer signature: the server verifies the transfer on-chain.
+    const fakeTransfer = await post(
+      '/api/transfers',
+      { mintAddress: mint, fromWallet: WALLET_A, toWallet: WALLET_B, amount: 100, txSignature: 'm'.repeat(88) },
+      422
+    );
+    assert(
+      /Verifikasi transfer/.test(fakeTransfer.error),
+      `fake transfer rejected: ${fakeTransfer.error}`
+    );
+
+    // ---------- 15. One wallet, many coins ----------
+    console.log('one wallet, many coins:');
+    // (a) Schema: creator_wallet has NO unique constraint — the only
+    // unique key on coins is the mint address (PRIMARY KEY).
+    const coinsSql = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'coins'")
+      .get().sql;
+    assert(
+      !/creator_wallet[^,]*UNIQUE/i.test(coinsSql),
+      'coins.creator_wallet has no UNIQUE constraint in the schema'
+    );
+    const coinsIndexes = db
+      .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'coins'")
+      .all();
+    assert(
+      coinsIndexes.every((i) => i.sql === null || !/creator_wallet/i.test(i.sql)),
+      'no index on coins.creator_wallet (only the PK autoindex)'
+    );
+    // (b) WALLET_A already owns two coins (TCAT + UCAT, seeded above):
+    // a register attempt for a THIRD coin from the same wallet must not
+    // be rejected on per-wallet grounds — it reaches the on-chain mint
+    // verification (422 for the fake mint), not a 400/409 limit error.
+    const thirdCoinMint = Keypair.generate().publicKey.toBase58();
+    const thirdCoin = await post(
+      '/api/coins/register',
+      {
+        mintAddress: thirdCoinMint,
+        name: 'Third Cat',
+        ticker: 'TCAT3',
+        creatorWallet: WALLET_A,
+        txSignature: 'y'.repeat(88),
+      },
+      422
+    );
+    assert(
+      /Verifikasi mint gagal/.test(thirdCoin.error),
+      `a third coin from the same wallet is not blocked by any per-wallet limit (reaches mint verification): ${thirdCoin.error}`
+    );
+    // (c) Both of WALLET_A's coins appear in the feed.
+    const allFeed = await get('/api/coins');
+    const aCoinsInFeed = allFeed.coins.filter((c) => c.creatorWallet === WALLET_A);
+    assert(
+      aCoinsInFeed.length === 2 &&
+        aCoinsInFeed.some((c) => c.mintAddress === mint) &&
+        aCoinsInFeed.some((c) => c.mintAddress === mintUnfunded),
+      'feed shows both coins from the same creator wallet'
+    );
+    // (d) Both appear on the creator profile, each with its own stats
+    // (TCAT traded, UCAT never traded — different txCount/volume).
+    const profileA = await get(`/api/creators/${WALLET_A}`);
+    assert(profileA.coins.length === 2, 'creator profile lists all 2 coins from the wallet');
+    const pTcat = profileA.coins.find((c) => c.mintAddress === mint);
+    const pUcat = profileA.coins.find((c) => c.mintAddress === mintUnfunded);
+    assert(pTcat && pUcat, 'profile contains both the funded and the unfunded coin');
+    assert(
+      pTcat.txCount === 4 && pUcat.txCount === 0,
+      `each profile coin carries its own stats (TCAT txCount=${pTcat.txCount}, UCAT txCount=${pUcat.txCount})`
+    );
+    assert(
+      pTcat.volumeSol > 0 && pUcat.volumeSol === 0,
+      'each profile coin carries its own volume'
+    );
+    assert(
+      approx(pTcat.feesUnclaimedSol, totalFees) && pUcat.feesUnclaimedSol === 0,
+      'each profile coin carries its own unclaimed creator fees'
+    );
+
+    // ---------- 16. Editable profiles ----------
+    console.log('editable profiles:');
+    const owner = makeTestWallet();
+    const other = makeTestWallet();
+    // A 1x1 transparent PNG (valid upload fixture).
+    const tinyPng =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const profileBody = (wallet, fields, signer) => {
+      const message = profileMessage({
+        wallet,
+        username: fields.username === undefined ? '' : fields.username || '',
+        border: fields.border === undefined ? 'none' : fields.border,
+        avatarHash: fields.avatar ? sha256Hex(fields.avatar.dataBase64) : '',
+        coverHash: fields.cover ? sha256Hex(fields.cover.dataBase64) : '',
+      });
+      return { ...fields, message, signature: signer.sign(message) };
+    };
+
+    const noProfile = await get(`/api/profiles/${owner.address}`);
+    assert(noProfile.profile === null, 'a wallet with no profile returns profile=null');
+
+    // No signature, no edit (401).
+    const unsigned = await post(
+      `/api/profiles/${owner.address}`,
+      { username: 'smokecat', border: 'gold' },
+      401
+    );
+    assert(/tanda tangan/i.test(unsigned.error), `unsigned edit is 401: ${unsigned.error}`);
+
+    // Username validation (field rules are checked before the signature,
+    // so these need no valid signature).
+    const nameTooShort = await post(
+      `/api/profiles/${owner.address}`,
+      { username: 'ab', border: 'gold' },
+      400
+    );
+    assert(/3–20/.test(nameTooShort.error), 'username under 3 chars is 400');
+    const nameTooLong = await post(
+      `/api/profiles/${owner.address}`,
+      { username: 'a'.repeat(21), border: 'gold' },
+      400
+    );
+    assert(/3–20/.test(nameTooLong.error), 'username over 20 chars is 400');
+    const nameBadChars = await post(
+      `/api/profiles/${owner.address}`,
+      { username: 'bad name!', border: 'gold' },
+      400
+    );
+    assert(/3–20/.test(nameBadChars.error), 'username with spaces/punctuation is 400');
+    const nameBadBorder = await post(
+      `/api/profiles/${owner.address}`,
+      { username: 'smokecat', border: 'neon' },
+      400
+    );
+    assert(/border/i.test(nameBadBorder.error), 'unknown border preset is 400');
+    const nameBadImage = await post(
+      `/api/profiles/${owner.address}`,
+      {
+        username: 'smokecat',
+        border: 'gold',
+        avatar: { dataBase64: Buffer.from('not an image').toString('base64'), mimeType: 'text/plain' },
+      },
+      400
+    );
+    assert(/PNG\/JPEG/.test(nameBadImage.error), 'non-image avatar upload is 400');
+
+    // A signature from another wallet cannot edit this profile (the
+    // wallet is part of the signed message).
+    const wrongWallet = await post(
+      `/api/profiles/${owner.address}`,
+      profileBody(owner.address, { username: 'smokecat', border: 'gold' }, other),
+      401
+    );
+    assert(/tidak valid/.test(wrongWallet.error), `non-owner edit is 401: ${wrongWallet.error}`);
+    // A signature over a different message than the submitted fields.
+    const wrongMessage = profileMessage({
+      wallet: owner.address,
+      username: 'different',
+      border: 'gold',
+      avatarHash: '',
+      coverHash: '',
+    });
+    const wrongMsgRes = await post(
+      `/api/profiles/${owner.address}`,
+      {
+        username: 'smokecat',
+        border: 'gold',
+        message: wrongMessage,
+        signature: owner.sign(wrongMessage),
+      },
+      401
+    );
+    assert(/tidak sesuai/.test(wrongMsgRes.error), `signature over a different message is 401: ${wrongMsgRes.error}`);
+
+    // Successful edit (username + border).
+    const saved = await post(
+      `/api/profiles/${owner.address}`,
+      profileBody(owner.address, { username: 'smokecat', border: 'gold' }, owner)
+    );
+    assert(saved.profile.username === 'smokecat', 'saved profile returns the username');
+    assert(saved.profile.border === 'gold', 'saved profile returns the border');
+    assert(saved.profile.avatarUrl === null, 'no avatar yet');
+    const gotProfile = await get(`/api/profiles/${owner.address}`);
+    assert(
+      gotProfile.profile.username === 'smokecat' && gotProfile.profile.border === 'gold',
+      'GET returns the saved profile'
+    );
+
+    // Username uniqueness is case-insensitive.
+    const taken = await post(
+      `/api/profiles/${other.address}`,
+      profileBody(other.address, { username: 'SmokeCat', border: 'blue' }, other),
+      409
+    );
+    assert(/sudah dipakai/.test(taken.error), `case-insensitive duplicate username is 409: ${taken.error}`);
+    // But the owner can re-save their own username (e.g. change border).
+    const resaved = await post(
+      `/api/profiles/${owner.address}`,
+      profileBody(owner.address, { username: 'smokecat', border: 'blue' }, owner)
+    );
+    assert(
+      resaved.profile.username === 'smokecat' && resaved.profile.border === 'blue',
+      'owner can re-save their own username with a new border'
+    );
+
+    // Avatar upload (1x1 PNG) + clearing the username.
+    const withAvatar = await post(
+      `/api/profiles/${owner.address}`,
+      profileBody(
+        owner.address,
+        {
+          username: null,
+          border: 'blue',
+          avatar: { dataBase64: tinyPng, mimeType: 'image/png' },
+        },
+        owner
+      )
+    );
+    assert(
+      withAvatar.profile.username === null,
+      'username null clears the username'
+    );
+    assert(
+      typeof withAvatar.profile.avatarUrl === 'string' &&
+        withAvatar.profile.avatarUrl.startsWith('/uploads/') &&
+        withAvatar.profile.avatarUrl.endsWith('.png'),
+      `avatar upload returns an uploads URL (${withAvatar.profile.avatarUrl})`
+    );
+    const avatarPath = path.join(__dirname, '..', 'data', 'uploads', `${owner.address}-avatar.png`);
+    assert(
+      fs.existsSync(avatarPath),
+      'avatar file exists under data/uploads'
+    );
+
+    // Profiles surface on the read paths: seed profiles for the two
+    // seeded wallets directly in the DB (their private keys are unknown,
+    // so the signed write path above covers writes).
+    db.prepare(
+      `INSERT INTO profiles (wallet, username, avatar_url, border, cover_url, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(WALLET_A, 'testcat', '/uploads/test-avatar.png', 'purple', '/uploads/test-cover.png', now);
+    db.prepare(
+      `INSERT INTO profiles (wallet, username, avatar_url, border, cover_url, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(WALLET_B, 'traderbee', null, 'blue', null, now);
+    const creatorWithProfile = await get(`/api/creators/${WALLET_A}`);
+    assert(
+      creatorWithProfile.profile.username === 'testcat' &&
+        creatorWithProfile.profile.border === 'purple' &&
+        creatorWithProfile.profile.coverUrl === '/uploads/test-cover.png',
+      'creator endpoint carries the editable profile (username/border/cover)'
+    );
+    const feedWithProfiles = await get('/api/coins');
+    const feedTcat = feedWithProfiles.coins.find((c) => c.mintAddress === mint);
+    assert(
+      feedTcat.creatorProfile && feedTcat.creatorProfile.username === 'testcat',
+      'feed coin card carries creatorProfile with the username'
+    );
+    const detailWithProfiles = await get(`/api/coins/${mint}`);
+    assert(
+      detailWithProfiles.callouts.length === 1 &&
+        detailWithProfiles.callouts[0].authorProfile &&
+        detailWithProfiles.callouts[0].authorProfile.username === 'traderbee',
+      'coin detail callout carries authorProfile with the username'
+    );
+    // The follower follows WALLET_B (from the callouts section).
+    const followListsWithProfiles = await get(`/api/follows/${follower.address}`);
+    assert(
+      followListsWithProfiles.profiles &&
+        followListsWithProfiles.profiles[WALLET_B] &&
+        followListsWithProfiles.profiles[WALLET_B].username === 'traderbee',
+      'follow lists carry the profiles map with usernames'
+    );
+    // Cleanup for this section (the outer finally handles coins/trades).
+    db.prepare('DELETE FROM profiles WHERE wallet IN (?, ?, ?, ?)').run(
+      owner.address, other.address, WALLET_A, WALLET_B
+    );
+    try {
+      fs.unlinkSync(avatarPath);
+    } catch {
+      // already gone — fine
+    }
+
     console.log('\nALL E2E CHECKS PASSED');
   } finally {
-    db.prepare('DELETE FROM trades WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
-    db.prepare('DELETE FROM fee_claims WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
-    db.prepare('DELETE FROM callouts WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
-    db.prepare('DELETE FROM coins WHERE mint_address IN (?, ?)').run(mint, mintUnfunded);
+    const allMints = [mint, mintUnfunded, mintPair, mintOrphan];
+    const placeholders = allMints.map(() => '?').join(', ');
+    db.prepare(`DELETE FROM trades WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM fee_claims WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM callouts WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM burns WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM transfers WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM coins WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare('DELETE FROM follows WHERE follower_wallet = ? OR following_wallet = ?').run(
       WALLET_A, WALLET_A
     );

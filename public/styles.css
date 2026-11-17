@@ -191,11 +191,6 @@ a.wallet-chip:hover { border-color: var(--green); text-decoration: none; }
 }
 .callout:last-child { margin-bottom: 0; }
 .callout-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.callout-avatar {
-  width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  font-weight: 700; font-size: 0.7rem; color: var(--green-on); background: var(--green);
-}
 .callout-text { margin: 10px 0; white-space: pre-wrap; word-break: break-word; }
 .callout-coin {
   display: flex; gap: 10px; align-items: center;
@@ -456,6 +451,65 @@ th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
   border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem;
 }
 .footer p { max-width: 1200px; margin: 0 auto 8px; }
+
+/* ---- Language switcher (topbar) ---- */
+.lang-switcher { display: flex; gap: 2px; background: var(--card2); border: 1px solid var(--border); border-radius: 999px; padding: 2px; margin-left: 8px; }
+.lang-btn {
+  border: none; background: transparent; color: var(--muted);
+  border-radius: 999px; padding: 4px 10px; font-size: 0.8rem; font-weight: 700;
+  cursor: pointer; font-family: inherit; height: 28px;
+}
+.lang-btn:hover { color: var(--text); }
+.lang-btn.active { background: var(--green); color: var(--green-on); }
+
+/* ---- Pair picker (create form) ---- */
+.pair-option {
+  display: flex; gap: 8px; align-items: center;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 8px 10px; margin-bottom: 6px; cursor: pointer; background: var(--card2);
+}
+.pair-option:hover { border-color: var(--green); }
+.pair-option.selected { border-color: var(--green); background: var(--green-dim); }
+.pair-option .pair-name { font-weight: 700; }
+.pair-option .pair-ticker { color: var(--muted); font-size: 0.85rem; }
+.pair-list { max-height: 240px; overflow-y: auto; }
+
+/* ---- Burn section ---- */
+.burn-preview { font-size: 0.9rem; color: var(--muted); margin: 8px 0; min-height: 1.2em; }
+.burn-preview b { color: var(--text); }
+
+/* ---- Deposit section ---- */
+.deposit-box { display: flex; gap: 16px; align-items: flex-start; margin-top: 12px; flex-wrap: wrap; }
+.deposit-qr { flex-shrink: 0; }
+.deposit-qr-img { width: 140px; height: 140px; border-radius: var(--radius-sm); background: #fff; padding: 6px; }
+.deposit-addr { min-width: 0; flex: 1; }
+.deposit-addr .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* ---- Candlestick chart ---- */
+#chartSvg g[data-candle] { cursor: pointer; }
+
+/* ---- Editable profiles: cover banner, avatar rings, border picker ---- */
+.profile-cover { border-radius: var(--radius); overflow: hidden; margin-bottom: 16px; }
+.profile-cover img { width: 100%; height: 160px; object-fit: cover; display: block; }
+.profile-cover-small img { height: 90px; }
+.profile-avatar-img { border-radius: var(--radius-sm); object-fit: cover; flex-shrink: 0; }
+/* Avatar border presets: a decorative ring around the avatar, as a
+   box-shadow so it follows the avatar's own border-radius (tile, circle,
+   or photo). Rainbow is three concentric rings. */
+.avatar-ring-green { box-shadow: 0 0 0 2px #5ddf6c; }
+.avatar-ring-gold { box-shadow: 0 0 0 2px #fbbf24; }
+.avatar-ring-blue { box-shadow: 0 0 0 2px #60a5fa; }
+.avatar-ring-purple { box-shadow: 0 0 0 2px #c084fc; }
+.avatar-ring-rainbow { box-shadow: 0 0 0 2px #f87171, 0 0 0 4px #fbbf24, 0 0 0 6px #5ddf6c; }
+.border-picker { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.border-option { cursor: pointer; }
+.border-option input { display: none; }
+.border-swatch {
+  display: inline-block; padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--border2); background: var(--card2);
+  font-size: 0.85rem; font-weight: 600;
+}
+.border-option input:checked + .border-swatch { border-color: var(--green); color: var(--text); }
 
 /* ---- Layar kecil: sidebar jadi baris atas, brand pindah ke header ---- */
 @media (max-width: 767px) {

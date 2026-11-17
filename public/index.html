@@ -15,20 +15,21 @@
     <aside class="sidebar">
       <a class="brand" href="#/"><span class="brand-mark">S</span>sol<span>pump</span></a>
       <nav class="nav">
-        <a href="#/" data-nav="feed"><span class="nav-ic">⌂</span>Beranda</a>
-        <a href="#/create" data-nav="create"><span class="nav-ic">+</span>Buat Coin</a>
-        <a href="#/portfolio" data-nav="portfolio"><span class="nav-ic">◈</span>Portofolio Saya</a>
+        <a href="#/" data-nav="feed"><span class="nav-ic">⌂</span><span class="nav-label" data-i18n="navHome">Beranda</span></a>
+        <a href="#/create" data-nav="create"><span class="nav-ic">+</span><span class="nav-label" data-i18n="navCreate">Buat Coin</span></a>
+        <a href="#/portfolio" data-nav="portfolio"><span class="nav-ic">◈</span><span class="nav-label" data-i18n="navPortfolio">Portofolio Saya</span></a>
       </nav>
       <div class="sidebar-foot">
         <span class="net-pill">DEVNET</span>
-        <p class="small muted">Solana Devnet — token testnet, tanpa nilai uang.</p>
-        <p class="small"><a href="https://faucet.solana.com" target="_blank" rel="noopener">Ambil SOL devnet gratis ↗</a></p>
+        <p class="small muted" data-i18n="sidebarDevnetNote">Solana Devnet — token testnet, tanpa nilai uang.</p>
+        <p class="small"><a href="https://faucet.solana.com" target="_blank" rel="noopener" data-i18n="sidebarFaucet">Ambil SOL devnet gratis ↗</a></p>
       </div>
     </aside>
 
     <div class="main-col">
       <header class="topbar">
         <div class="topbar-spacer"></div>
+        <div class="lang-switcher" id="langBox" role="group" aria-label="Language"></div>
         <div class="wallet-box" id="walletBox">
           <button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>
         </div>
@@ -36,16 +37,16 @@
 
       <div class="infobar">
         <span class="net-pill">DEVNET</span>
-        <span class="muted small">Trading asli di devnet — SOL dan token beneran berpindah on-chain.</span>
+        <span class="muted small" data-i18n="infobarText">Trading asli di devnet — SOL dan token beneran berpindah on-chain.</span>
       </div>
 
       <main class="container" id="view">
-        <p class="muted">Memuat…</p>
+        <p class="muted" data-i18n="loadingGeneric">Memuat…</p>
       </main>
 
       <footer class="footer">
-        <p><strong>solpump</strong> berjalan di <a href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Solana Devnet</a> — token yang di-mint adalah token SPL asli di devnet (tanpa nilai uang sungguhan). Trading memakai SOL devnet asli yang berpindah on-chain lewat <strong>dompet pool kustodian</strong> di <span id="poolAddress">…</span> — server yang memegang kunci pool dan menyelesaikan sisi kedua setiap trade. Devnet hanya untuk percobaan; token di sini tidak punya nilai uang.</p>
-        <p class="muted">Butuh SOL devnet? Ambil gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</p>
+        <p data-i18n-html="footerAbout"><strong>solpump</strong> berjalan di <a href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Solana Devnet</a> — token yang di-mint adalah token SPL asli di devnet (tanpa nilai uang sungguhan). Trading memakai SOL devnet asli yang berpindah on-chain lewat <strong>dompet pool kustodian</strong> di <span id="poolAddress">…</span> — server yang memegang kunci pool dan menyelesaikan sisi kedua setiap trade. Devnet hanya untuk percobaan; token di sini tidak punya nilai uang.</p>
+        <p class="muted" data-i18n-html="footerFaucet">Butuh SOL devnet? Ambil gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</p>
       </footer>
     </div>
   </div>
@@ -54,6 +55,10 @@
 
   <!-- Solana libraries: one bundle built by build.js (see README). -->
   <script src="/vendor-solana.js"></script>
+  <!-- QR code generator (qrcode-generator, MIT) vendored locally — no CDN. -->
+  <script src="/vendor/qrcode.js"></script>
+  <!-- i18n strings (Indonesian / English / Simplified Chinese). -->
+  <script src="/i18n.js"></script>
   <script src="/solana.js"></script>
   <script src="/app.js"></script>
 </body>

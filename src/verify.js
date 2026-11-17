@@ -238,7 +238,56 @@ async function verifyTokenTransfer({ signature, fromAta, toAta, amountRaw }) {
   if (!match) {
     return {
       ok: false,
-      reason: 'Transaksi tidak berisi transfer token yang sesuai ke pool.',
+      reason: 'Transaksi tidak berisi transfer token yang sesuai.',
+    };
+  }
+  return { ok: true };
+}
+
+// A parsed transaction burned exactly `amountRaw` token units of `mint`
+// from the wallet's own token account (burn or burnChecked), signed by the
+// wallet (the burn authority), succeeded, and is recent.
+async function verifyBurn({ signature, mintAddress, wallet, amountRaw }) {
+  let tx;
+  try {
+    tx = await getParsedTransactionRetry(signature, 'verifyBurn');
+  } catch (err) {
+    return { ok: false, reason: `Transaksi tidak ditemukan di devnet: ${err.message}` };
+  }
+  if (tx.meta && tx.meta.err) {
+    return { ok: false, reason: 'Transaksi gagal di jaringan.' };
+  }
+  if (tx.blockTime && Date.now() / 1000 - tx.blockTime > TX_RECENCY_SECONDS) {
+    return { ok: false, reason: 'Transaksi terlalu lama (maksimal 15 menit).' };
+  }
+  const mintPubkey = parsePubkey(mintAddress);
+  const walletPubkey = parsePubkey(wallet);
+  if (!mintPubkey || !walletPubkey) {
+    return { ok: false, reason: 'Alamat mint atau dompet tidak valid.' };
+  }
+  const userAta = (await getAssociatedTokenAddress(mintPubkey, walletPubkey)).toBase58();
+  const instructions = tx.transaction.message.instructions || [];
+  const match = instructions.find((ix) => {
+    if (ix.program !== 'spl-token' || !ix.parsed) return false;
+    const info = ix.parsed.info || {};
+    const amount =
+      ix.parsed.type === 'burnChecked'
+        ? info.tokenAmount && info.tokenAmount.amount
+        : ix.parsed.type === 'burn'
+          ? info.amount
+          : null;
+    return (
+      amount !== null &&
+      info.account === userAta &&
+      info.mint === mintAddress &&
+      info.authority === wallet &&
+      BigInt(amount) === amountRaw
+    );
+  });
+  if (!match) {
+    return {
+      ok: false,
+      reason: 'Transaksi tidak berisi burn token yang sesuai dari dompetmu.',
     };
   }
   return { ok: true };
@@ -249,5 +298,6 @@ module.exports = {
   verifyFunding,
   verifySolTransfer,
   verifyTokenTransfer,
+  verifyBurn,
   DEVNET_RPC,
 };

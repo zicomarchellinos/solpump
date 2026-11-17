@@ -109,6 +109,67 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_callouts_mint ON callouts (mint_address, created_at);
   CREATE INDEX IF NOT EXISTS idx_callouts_wallet ON callouts (wallet, created_at);
+
+  -- Burns: real SPL burns (a holder destroys their own tokens via Phantom).
+  -- Each burn is verified on-chain before recording, and reduces the coin's
+  -- bonding-curve token_reserve by the burned amount — since price =
+  -- sol_reserve / token_reserve, burning raises the price. price_after is
+  -- the curve price right after the burn (for the chart). tx_signature is
+  -- unique: one burn transaction can only be recorded once.
+  -- Pool invariant: burned tokens belonged to the USER, not the pool, so
+  -- the pool's on-chain token balance stays >= token_reserve after burns
+  -- and trade pre-checks keep working (the pool ends up holding slightly
+  -- more tokens than the curve accounts for).
+  CREATE TABLE IF NOT EXISTS burns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+    wallet TEXT NOT NULL,
+    amount REAL NOT NULL,
+    price_after REAL NOT NULL,
+    tx_signature TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_burns_mint ON burns (mint_address, created_at);
+  CREATE INDEX IF NOT EXISTS idx_burns_wallet ON burns (wallet, created_at);
+
+  -- Transfers: real SPL transfers of a site coin between two user wallets
+  -- (the pool is not involved). Verified on-chain before recording.
+  -- Transfers move tokens without touching the curve or the recorded PnL
+  -- (PnL is computed from trades only) — the UI shows the live on-chain
+  -- balance next to the trade-based holdings so the difference is visible.
+  CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+    from_wallet TEXT NOT NULL,
+    to_wallet TEXT NOT NULL,
+    amount REAL NOT NULL,
+    tx_signature TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_transfers_mint ON transfers (mint_address, created_at);
+  CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers (from_wallet, created_at);
+  CREATE INDEX IF NOT EXISTS idx_transfers_to ON transfers (to_wallet, created_at);
+
+  -- Editable profiles, keyed by wallet (one profile per wallet). Username
+  -- is UNIQUE with NOCASE collation, so uniqueness is case-insensitive
+  -- ('SmokeCat' and 'smokecat' collide); NULL usernames are allowed and
+  -- do not collide with each other. avatar_url / cover_url point at files
+  -- under data/uploads (same ephemeral-on-Render caveat as coin logos:
+  -- a redeploy wipes them; the profile row survives only in the DB, which
+  -- is itself ephemeral on the free tier). border is a preset key
+  -- ('none', 'green', 'gold', 'blue', 'purple', 'rainbow') rendered as a
+  -- CSS ring around the avatar. Edits require a Phantom signMessage
+  -- signature over a canonical message (see src/signverify.js).
+  CREATE TABLE IF NOT EXISTS profiles (
+    wallet TEXT PRIMARY KEY,
+    username TEXT UNIQUE COLLATE NOCASE,
+    avatar_url TEXT,
+    border TEXT NOT NULL DEFAULT 'none',
+    cover_url TEXT,
+    updated_at INTEGER NOT NULL
+  );
 `);
 
 // Lightweight migrations for databases created before these columns existed.
@@ -132,6 +193,15 @@ if (!hasColumn('trades', 'pool_tx_signature')) {
 }
 if (!hasColumn('trades', 'fee_sol')) {
   db.exec('ALTER TABLE trades ADD COLUMN fee_sol REAL NOT NULL DEFAULT 0');
+}
+// Custom pairs: NULL = SOL pair, otherwise the pair coin's mint address.
+if (!hasColumn('coins', 'pair_mint')) {
+  db.exec('ALTER TABLE coins ADD COLUMN pair_mint TEXT');
+}
+// Creator-fee claims are paid in the pair asset (SOL for SOL pairs, pair
+// tokens for coin pairs); asset_symbol records which one the amount is in.
+if (!hasColumn('fee_claims', 'asset_symbol')) {
+  db.exec("ALTER TABLE fee_claims ADD COLUMN asset_symbol TEXT NOT NULL DEFAULT 'SOL'");
 }
 // Replay protection: one user transaction can only settle one trade.
 db.exec(
