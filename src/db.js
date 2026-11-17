@@ -203,6 +203,20 @@ if (!hasColumn('coins', 'pair_mint')) {
 if (!hasColumn('fee_claims', 'asset_symbol')) {
   db.exec("ALTER TABLE fee_claims ADD COLUMN asset_symbol TEXT NOT NULL DEFAULT 'SOL'");
 }
+// Burns record their source: 'holder' (any holder burning their own
+// tokens), 'dev' (the creator burning their own holdings via the dev panel),
+// 'pool' (the pool wallet burning its own reserve tokens, server-signed).
+// Pre-existing rows are holder burns.
+if (!hasColumn('burns', 'source')) {
+  db.exec("ALTER TABLE burns ADD COLUMN source TEXT NOT NULL DEFAULT 'holder'");
+}
+// Fee claims record their kind: 'claim' (a payout to the creator's wallet)
+// or 'buyback' (fees spent buying the coin back from the curve — the
+// tokens go to the creator instead of a payout). Both reduce the
+// unclaimed balance; the kind only distinguishes them in history.
+if (!hasColumn('fee_claims', 'kind')) {
+  db.exec("ALTER TABLE fee_claims ADD COLUMN kind TEXT NOT NULL DEFAULT 'claim'");
+}
 // Replay protection: one user transaction can only settle one trade.
 db.exec(
   'CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_user_sig ON trades (user_tx_signature) WHERE user_tx_signature IS NOT NULL'

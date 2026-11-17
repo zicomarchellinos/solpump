@@ -74,7 +74,14 @@ const {
 const { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const { PublicKey } = require('@solana/web3.js');
 const { connection, withRetry } = require('./rpc');
-const { followMessage, profileMessage, sha256Hex, verifyWalletSignature } = require('./signverify');
+const {
+  followMessage,
+  profileMessage,
+  devBurnMessage,
+  buybackMessage,
+  sha256Hex,
+  verifyWalletSignature,
+} = require('./signverify');
 
 const CREATOR_FEE_PCT = bonding.CREATOR_FEE_BPS / 100; // 1
 const CALLOUT_MAX_CHARS = 280;
@@ -297,6 +304,9 @@ function publicFeeClaim(row) {
     creatorWallet: row.creator_wallet,
     amountSol: row.amount_sol,
     assetSymbol: row.asset_symbol || 'SOL',
+    // 'claim' = payout to the creator's wallet; 'buyback' = fees spent
+    // buying the coin back from the curve (tokens to the creator).
+    kind: row.kind || 'claim',
     txSignature: row.tx_signature,
     createdAt: row.created_at,
   };
@@ -310,6 +320,9 @@ function publicBurn(row, assetUsd = null) {
     mintAddress: row.mint_address,
     wallet: row.wallet,
     amount: row.amount,
+    // 'holder' = any holder's own tokens; 'dev' = the creator's holdings
+    // via the dev panel; 'pool' = the pool reserve, server-signed.
+    source: row.source || 'holder',
     priceAfter: row.price_after,
     priceAfterUsd,
     txSignature: row.tx_signature,
@@ -706,6 +719,102 @@ router.get('/coins/:mint/burns', async (req, res) => {
       .prepare('SELECT COUNT(*) AS n FROM burns WHERE mint_address = ?')
       .get(row.mint_address).n,
     burns: burns.map((b) => publicBurn(b, assetUsd)),
+  });
+});
+
+// ---- GET /api/coins/:mint/burn-preview?amount= ----
+// Full dev-burn calculation for the creator panel: current price /
+// circulating supply / market cap, and the projected values after burning
+// `amount` tokens (price, supply, market cap, % of supply burned, price
+// increase %). Pure computation from the current reserves — no auth, no
+// state change. Market-cap figures are in the pair asset and USD.
+router.get('/coins/:mint/burn-preview', async (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  const amount = Number(req.query.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return badRequest(res, 'Jumlah burn harus lebih dari 0.');
+  }
+  if (amount >= row.token_reserve) {
+    return badRequest(
+      res,
+      `Jumlah burn melebihi cadangan kurva (${row.token_reserve.toLocaleString('id-ID')} ${row.ticker}).`
+    );
+  }
+  const ctx = await priceCtx();
+  const assetUsd = coinAssetUsd(row, ctx);
+  const totalBurned = ctx.burnedMap.get(row.mint_address) || 0;
+  const price = bonding.currentPrice(row);
+  const supply = bonding.circulatingSupply(totalBurned);
+  const newPrice = bonding.priceAfterBurn(row, amount);
+  const newSupply = supply - amount;
+  const toUsd = (v) => (Number.isFinite(assetUsd) && assetUsd > 0 ? v * assetUsd : null);
+  res.json({
+    mintAddress: row.mint_address,
+    amount,
+    current: {
+      price,
+      priceUsd: toUsd(price),
+      circulatingSupply: supply,
+      marketCapSol: price * supply,
+      marketCapUsd: toUsd(price * supply),
+    },
+    projected: {
+      price: newPrice,
+      priceUsd: toUsd(newPrice),
+      circulatingSupply: newSupply,
+      marketCapSol: newPrice * newSupply,
+      marketCapUsd: toUsd(newPrice * newSupply),
+    },
+    pctSupplyBurned: supply > 0 ? (amount / supply) * 100 : 0,
+    priceIncreasePct: price > 0 ? ((newPrice - price) / price) * 100 : 0,
+    maxBurn: row.token_reserve,
+    pairAsset: pairs.pairAssetOf(row, ctx.coinMap),
+    assetUsd,
+  });
+});
+
+// ---- GET /api/coins/:mint/buyback-preview?amount= ----
+// Buyback preview for the creator panel: how many tokens `amount` of
+// unclaimed creator fees buys from the curve (or 'all' for the full
+// unclaimed balance), the new price after the buyback, the unclaimed
+// balance, and the minimum buy. Pure computation — no auth, no state
+// change. Amounts are denominated in the pair asset.
+router.get('/coins/:mint/buyback-preview', async (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  const totals = coinFeeTotals(row.mint_address);
+  const pairAsset = pairs.pairAssetOf(row, loadCoinMap());
+  const minBuy = pairAsset.type === 'SOL' ? MIN_BUY_SOL : MIN_BUY_TOKENS;
+  const raw = req.query.amount;
+  const spend = raw === 'all' ? totals.unclaimedSol : Number(raw);
+  if (!Number.isFinite(spend) || spend <= 0) {
+    return badRequest(res, 'Jumlah buyback harus lebih dari 0.');
+  }
+  if (spend > totals.unclaimedSol) {
+    return badRequest(
+      res,
+      `Jumlah buyback melebihi fee yang belum diklaim (${totals.unclaimedSol} ${pairAsset.symbol}).`
+    );
+  }
+  const ctx = await priceCtx();
+  const assetUsd = coinAssetUsd(row, ctx);
+  const tokenAmount = bonding.quoteBuy(row, spend);
+  const newPrice = (row.sol_reserve + spend) / (row.token_reserve - tokenAmount);
+  const toUsd = (v) => (Number.isFinite(assetUsd) && assetUsd > 0 ? v * assetUsd : null);
+  res.json({
+    mintAddress: row.mint_address,
+    amount: spend,
+    isAll: raw === 'all',
+    tokenAmount,
+    price: bonding.currentPrice(row),
+    priceUsd: toUsd(bonding.currentPrice(row)),
+    newPrice,
+    newPriceUsd: toUsd(newPrice),
+    unclaimedSol: totals.unclaimedSol,
+    minBuy,
+    pairAsset,
+    assetUsd,
   });
 });
 
@@ -1587,8 +1696,8 @@ router.post('/coins/:mint/burn', async (req, res) => {
         return db
           .prepare(
             `INSERT INTO burns
-               (mint_address, wallet, amount, price_after, tx_signature, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)`
+               (mint_address, wallet, amount, source, price_after, tx_signature, created_at)
+             VALUES (?, ?, ?, 'holder', ?, ?, ?)`
           )
           .run(req.params.mint, wallet, amountNum, priceAfter, txSignature, now).lastInsertRowid;
       })();
@@ -1609,6 +1718,151 @@ router.post('/coins/:mint/burn', async (req, res) => {
       return res.status(409).json({ error: 'Burn ini sudah tercatat.' });
     }
     res.status(502).json({ error: `Gagal mencatat burn: ${err.message}` });
+  }
+});
+
+// ---- POST /api/coins/:mint/dev-burn ----
+// Creator-only dev burn with two sources. Body:
+//   { wallet, amount, source: 'holdings' | 'pool',
+//     txSignature? (holdings only), message?, signature? (pool only) }
+//   - 'holdings': the creator burns their OWN tokens — a real SPL
+//     BurnChecked signed in Phantom, verified on-chain exactly like a
+//     holder burn (the burn transaction itself proves the creator signed
+//     it, so no signMessage is needed). Recorded with source 'dev'.
+//   - 'pool': the pool wallet burns its own reserve tokens of this coin,
+//     server-signed (pool.burnTokens). No user transaction exists, so the
+//     creator must prove authorization by signing the canonical dev-burn
+//     message (Ed25519, same scheme as follows/profile edits). The burn
+//     reduces BOTH the pool's on-chain token balance and the curve's
+//     token_reserve by the same amount. Recorded with source 'pool' and
+//     the pool address as the wallet.
+// Both sources raise the price (token_reserve shrinks, sol_reserve
+// unchanged). Creator-only: anyone else gets 403.
+router.post('/coins/:mint/dev-burn', async (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  const { wallet, amount, source, txSignature, message, signature } = req.body || {};
+  if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  if (wallet !== row.creator_wallet) {
+    return res.status(403).json({ error: 'Hanya kreator coin ini yang bisa melakukan dev burn.' });
+  }
+  if (source !== 'holdings' && source !== 'pool') {
+    return badRequest(res, 'source harus "holdings" atau "pool".');
+  }
+  const amountNum = Number(amount);
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    return badRequest(res, 'Jumlah burn harus lebih dari 0.');
+  }
+  const amountRaw = toRawTokens(amountNum);
+  if (amountRaw <= 0n) {
+    return badRequest(res, 'Jumlah terlalu kecil.');
+  }
+  // Pool burns are server-signed and destructive, so they need the
+  // creator's signature over the canonical message (holdings burns are
+  // authenticated by the on-chain burn transaction itself).
+  if (source === 'pool') {
+    const expected = devBurnMessage({
+      wallet,
+      mint: req.params.mint,
+      amount: String(amountNum),
+      source: 'pool',
+    });
+    if (message !== expected) {
+      return res.status(401).json({ error: 'Pesan tanda tangan tidak sesuai dengan dev burn ini.' });
+    }
+    if (!verifyWalletSignature({ walletAddress: wallet, message, signatureBase64: signature })) {
+      return res.status(401).json({ error: 'Tanda tangan tidak valid untuk dompet ini.' });
+    }
+  } else if (typeof txSignature !== 'string' || !SIGNATURE_RE.test(txSignature)) {
+    return badRequest(res, 'Tanda tangan transaksi tidak valid.');
+  }
+  if (source === 'holdings') {
+    const existing = db.prepare('SELECT id FROM burns WHERE tx_signature = ?').get(txSignature);
+    if (existing) {
+      return res.status(409).json({ error: 'Burn ini sudah tercatat.' });
+    }
+  }
+  try {
+    const result = await withTradeLock(async () => {
+      // Re-read reserves inside the lock: another burn/trade may have
+      // landed. The reserve must stay positive after the burn.
+      const fresh = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+      if (amountNum >= fresh.token_reserve) {
+        return {
+          status: 400,
+          error: `Jumlah burn melebihi cadangan kurva (${fresh.token_reserve.toLocaleString('id-ID')} ${fresh.ticker}).`,
+        };
+      }
+      let poolSignature = null;
+      if (source === 'holdings') {
+        const verified = await verifyBurn({
+          signature: txSignature,
+          mintAddress: req.params.mint,
+          wallet,
+          amountRaw,
+        });
+        if (!verified.ok) {
+          return { status: 422, error: `Verifikasi burn gagal: ${verified.reason}` };
+        }
+      } else {
+        // Pool reserve: the pool must actually hold the tokens it is
+        // about to burn.
+        const poolTokens = await pool.getPoolTokenBalance(req.params.mint);
+        if (poolTokens < amountNum) {
+          return {
+            status: 400,
+            error: `Pool hanya memegang ${poolTokens.toLocaleString('id-ID')} ${fresh.ticker} — kurangi jumlah burn.`,
+          };
+        }
+        try {
+          poolSignature = await pool.burnTokens(req.params.mint, amountRaw);
+        } catch (err) {
+          return { status: 502, error: `Burn dari pool gagal on-chain: ${err.message}` };
+        }
+      }
+      const newReserve = fresh.token_reserve - amountNum;
+      const priceAfter = fresh.sol_reserve / newReserve;
+      const now = Date.now();
+      const burnId = db.transaction(() => {
+        db.prepare('UPDATE coins SET token_reserve = ? WHERE mint_address = ?').run(
+          newReserve,
+          req.params.mint
+        );
+        return db
+          .prepare(
+            `INSERT INTO burns
+               (mint_address, wallet, amount, source, price_after, tx_signature, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            req.params.mint,
+            source === 'pool' ? pool.getPoolAddress() : wallet,
+            amountNum,
+            source === 'pool' ? 'pool' : 'dev',
+            priceAfter,
+            source === 'pool' ? poolSignature : txSignature,
+            now
+          ).lastInsertRowid;
+      })();
+      return { status: 200, burnId, priceAfter };
+    });
+    if (result.status !== 200) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    const ctx = await priceCtx();
+    const updated = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+    const burnRow = db.prepare('SELECT * FROM burns WHERE id = ?').get(result.burnId);
+    res.status(201).json({
+      burn: publicBurn(burnRow, coinAssetUsd(updated, ctx)),
+      coin: publicCoin(updated, coinTradesAsc(req.params.mint), ctx),
+    });
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE constraint')) {
+      return res.status(409).json({ error: 'Burn ini sudah tercatat.' });
+    }
+    res.status(502).json({ error: `Gagal mencatat dev burn: ${err.message}` });
   }
 });
 
@@ -1985,6 +2239,185 @@ router.post('/coins/:mint/claim-fees', async (req, res) => {
     });
   } catch (err) {
     res.status(502).json({ error: `Gagal mengklaim fee: ${err.message}` });
+  }
+});
+
+// ---- POST /api/coins/:mint/buyback ----
+// Creator-only buyback: spend the coin's unclaimed creator-fee balance to
+// buy the coin back from the bonding curve. Body:
+//   { wallet, amount (number, or 'all' for the full unclaimed balance),
+//     message, signature }
+// The creator signs the canonical buyback message (Ed25519, same scheme
+// as follows/profile edits) — the pool pays the bought tokens to the
+// creator from a server-signed transfer, so the request needs proof it
+// came from the creator. Creator-only: anyone else gets 403.
+// Execution, inside the trade lock:
+//   1. The spend is the requested amount ('all' = whatever is unclaimed
+//      at execution time). Blocked when unclaimed fees are 0 or the spend
+//      is below the minimum buy (0.001 SOL / 1,000 pair tokens).
+//   2. The pool sends the bought tokens (curve quote) to the creator as a
+//      real on-chain transfer; on failure nothing is recorded and the fee
+//      ledger is untouched.
+//   3. Atomically: the curve's pair-asset reserve increases by the spend
+//      (the pool already holds those fees — no on-chain payment moves for
+//      that leg), token_reserve decreases by the tokens bought, the spend
+//      is recorded as a fee_claims row (kind 'buyback') so the unclaimed
+//      balance drops, and the buyback is recorded as a trade (side 'buy',
+//      wallet = creator, fee 0) so the chart, stats, and volume reflect it.
+// Accounting note: the fee ledger and the curve stay consistent — the
+// invariant poolAssetActual = (assetReserve - VIRTUAL) + unclaimedFees
+// holds before and after, because the reserve grows by the spend while
+// the unclaimed balance shrinks by the same amount. Buybacks accrue NO
+// creator fee (the spend IS the fees — charging a fee on it would be
+// circular). Works for SOL pairs and coin pairs (fees accrue in the pair
+// asset either way).
+router.post('/coins/:mint/buyback', async (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  const { wallet, amount, message, signature } = req.body || {};
+  if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  if (wallet !== row.creator_wallet) {
+    return res.status(403).json({ error: 'Hanya kreator coin ini yang bisa melakukan buyback.' });
+  }
+  const isAll = amount === 'all';
+  const amountNum = isAll ? NaN : Number(amount);
+  if (!isAll && (!Number.isFinite(amountNum) || amountNum <= 0)) {
+    return badRequest(res, 'Jumlah buyback harus lebih dari 0.');
+  }
+  const amountStr = isAll ? 'all' : String(amountNum);
+  const expected = buybackMessage({ wallet, mint: req.params.mint, amount: amountStr });
+  if (message !== expected) {
+    return res.status(401).json({ error: 'Pesan tanda tangan tidak sesuai dengan buyback ini.' });
+  }
+  if (!verifyWalletSignature({ walletAddress: wallet, message, signatureBase64: signature })) {
+    return res.status(401).json({ error: 'Tanda tangan tidak valid untuk dompet ini.' });
+  }
+  if (row.trading_enabled !== 1) {
+    return badRequest(
+      res,
+      'Trading belum aktif untuk coin ini: kreator belum memindahkan 800.000.000 token ke pool.'
+    );
+  }
+  const pairAsset = pairs.pairAssetOf(row, loadCoinMap());
+  if (!pairAsset.available) {
+    return badRequest(
+      res,
+      'Buyback tidak dapat dilakukan: coin pasangan untuk coin ini tidak ditemukan di registry.'
+    );
+  }
+  const minBuy = pairAsset.type === 'SOL' ? MIN_BUY_SOL : MIN_BUY_TOKENS;
+
+  try {
+    const result = await withTradeLock(async () => {
+      // Re-read reserves + fee totals inside the lock: a trade may have
+      // landed meanwhile.
+      const fresh = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+      const totals = coinFeeTotals(req.params.mint);
+      if (totals.unclaimedSol <= 0) {
+        return {
+          status: 400,
+          error: 'Tidak ada fee untuk buyback — belum ada trading yang menghasilkan fee, atau semuanya sudah diklaim.',
+        };
+      }
+      const spend = isAll ? totals.unclaimedSol : amountNum;
+      if (spend > totals.unclaimedSol) {
+        return {
+          status: 400,
+          error: `Jumlah buyback melebihi fee yang belum diklaim (${totals.unclaimedSol} ${pairAsset.symbol}).`,
+        };
+      }
+      if (spend < minBuy) {
+        const minLabel = pairAsset.type === 'SOL' ? String(minBuy) : minBuy.toLocaleString('id-ID');
+        return { status: 400, error: `Buyback minimal ${minLabel} ${pairAsset.symbol}.` };
+      }
+      const tokenAmount = bonding.quoteBuy(fresh, spend);
+      const tokenRaw = toRawTokens(tokenAmount);
+      if (tokenRaw <= 0n) {
+        return { status: 400, error: 'Jumlah terlalu kecil untuk kurva saat ini.' };
+      }
+      const poolTokens = await pool.getPoolTokenBalance(req.params.mint);
+      if (poolTokens < tokenAmount) {
+        return {
+          status: 400,
+          error: `Pool kehabisan token: pool hanya memegang ${poolTokens.toLocaleString('id-ID')} ${fresh.ticker}.`,
+        };
+      }
+      // The pool pays the bought tokens to the creator first — only then
+      // is anything recorded, so a failed transfer leaves the fee ledger
+      // untouched.
+      const exactTokens = Number(tokenRaw) / 1e6;
+      let poolSignature;
+      try {
+        poolSignature = await pool.sendTokens(req.params.mint, wallet, tokenRaw);
+      } catch (err) {
+        return { status: 502, error: `Pengiriman token buyback dari pool gagal: ${err.message}` };
+      }
+      const price = spend / exactTokens;
+      const now = Date.now();
+      const ids = db.transaction(() => {
+        db.prepare('UPDATE coins SET sol_reserve = ?, token_reserve = ? WHERE mint_address = ?').run(
+          fresh.sol_reserve + spend,
+          fresh.token_reserve - exactTokens,
+          req.params.mint
+        );
+        const tradeId = db
+          .prepare(
+            `INSERT INTO trades
+               (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
+                user_tx_signature, pool_tx_signature, created_at)
+             VALUES (?, ?, 'buy', ?, ?, ?, 0, NULL, ?, ?)`
+          )
+          .run(req.params.mint, wallet, spend, exactTokens, price, poolSignature, now).lastInsertRowid;
+        const claimId = db
+          .prepare(
+            `INSERT INTO fee_claims
+               (mint_address, creator_wallet, amount_sol, asset_symbol, kind, tx_signature, created_at)
+             VALUES (?, ?, ?, ?, 'buyback', ?, ?)`
+          )
+          .run(req.params.mint, wallet, spend, pairAsset.symbol, poolSignature, now).lastInsertRowid;
+        return { tradeId, claimId };
+      })();
+      return { status: 200, ...ids, spend, tokenAmount: exactTokens, price, poolSignature, now };
+    });
+    if (result.status !== 200) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    const ctx = await priceCtx();
+    const updated = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+    const trades = coinTradesAsc(req.params.mint);
+    res.json({
+      buyback: {
+        tradeId: result.tradeId,
+        claimId: result.claimId,
+        amountSol: result.spend,
+        tokenAmount: result.tokenAmount,
+        price: result.price,
+        txSignature: result.poolSignature,
+        createdAt: result.now,
+      },
+      trade: publicTrade(
+        {
+          id: result.tradeId,
+          mint_address: req.params.mint,
+          wallet,
+          side: 'buy',
+          sol_amount: result.spend,
+          token_amount: result.tokenAmount,
+          price: result.price,
+          fee_sol: 0,
+          user_tx_signature: null,
+          pool_tx_signature: result.poolSignature,
+          created_at: result.now,
+        },
+        coinAssetUsd(updated, ctx)
+      ),
+      coin: publicCoin(updated, trades, ctx),
+      creatorFees: coinFeeTotals(req.params.mint),
+    });
+  } catch (err) {
+    res.status(502).json({ error: `Gagal menjalankan buyback: ${err.message}` });
   }
 });
 

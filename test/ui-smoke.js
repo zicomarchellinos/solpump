@@ -10,9 +10,11 @@
 //   node test/ui-smoke.js [baseUrl]
 
 const path = require('path');
+const { webcrypto } = require('crypto');
 const Database = require('better-sqlite3');
 const { Keypair } = require('@solana/web3.js');
 const { JSDOM } = require('jsdom');
+const { profileMessage: serverProfileMessage, sha256Hex: serverSha256Hex } = require('../src/signverify');
 
 const BASE = process.argv[2] || process.env.BASE_URL || 'http://localhost:3100';
 const WALLET_A = 'HyevJPsT3Yf5MTWMph4LaArUqtKS27ScfHF5Cqim6eek';
@@ -93,6 +95,10 @@ async function main() {
               : input;
           return nodeFetch(url, init);
         };
+        // jsdom exposes no SubtleCrypto: inject Node's WebCrypto so the
+        // page's sha256Hex runs against a real implementation (which, like
+        // browsers, only recognizes the standard 'SHA-256' name).
+        Object.defineProperty(window, 'crypto', { value: webcrypto, configurable: true });
       },
     });
     const { window } = dom;
@@ -204,6 +210,33 @@ async function main() {
     for (const [value, expected] of mcCases) {
       assert(window.fmtMarketCapUsd(value) === expected, `fmtMarketCapUsd(${value}) = ${expected}`);
     }
+    // Profile-save signing path: the page's sha256Hex must call
+    // crypto.subtle.digest with the WebCrypto-standard name 'SHA-256' —
+    // the bare 'sha256' throws "Unrecognized name" in browsers, which is
+    // exactly the error users hit when saving their profile. Its output
+    // and the canonical profile message must also match the server's, or
+    // the server's signature verification would reject every save.
+    assert(
+      (await window.sha256Hex('abc')) ===
+        'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      'client sha256Hex(abc) matches the known SHA-256 digest'
+    );
+    const samplePayload = Buffer.from('smoke-image-bytes').toString('base64');
+    assert(
+      (await window.sha256Hex(samplePayload)) === serverSha256Hex(samplePayload),
+      'client sha256Hex matches the server hash for a base64 image payload'
+    );
+    const profileFields = {
+      wallet: WALLET_A,
+      username: 'smokecat',
+      border: 'gold',
+      avatarHash: 'aa11',
+      coverHash: 'bb22',
+    };
+    assert(
+      window.profileMessage(profileFields) === serverProfileMessage(profileFields),
+      'client profileMessage matches the server canonical message'
+    );
     // Footer shows the pool wallet address (loaded from /api/pool).
     const poolAddr = await waitFor(() => {
       const el = document.querySelector('#poolAddress a');
@@ -388,6 +421,16 @@ async function main() {
     assert(
       document.querySelector('#transferCard').textContent.includes('Hubungkan dompet'),
       'transfer form asks to connect a wallet first'
+    );
+    // Creator-only panels are hidden without a wallet: no dev burn card,
+    // no buyback section (the fee card shows the non-creator note).
+    assert(
+      !document.querySelector('#devBurnCard'),
+      'dev burn panel does not render without a wallet'
+    );
+    assert(
+      !document.querySelector('#buybackBox'),
+      'buyback section does not render without a wallet'
     );
     // Candlestick chart: Area/Candles toggle + timeframe pills; switching
     // to candles renders real candles from the seeded trades.
@@ -587,6 +630,8 @@ async function main() {
               : input;
           return nodeFetch(url, init);
         };
+        // Same WebCrypto injection as page 1 (jsdom has no SubtleCrypto).
+        Object.defineProperty(window, 'crypto', { value: webcrypto, configurable: true });
         window.localStorage.setItem('solpump-wallet', WALLET_A);
       },
     });
@@ -683,6 +728,53 @@ async function main() {
     assert(
       !doc2.querySelector('#editProfileBtn'),
       'no edit button on another wallet profile'
+    );
+
+    // Creator coin detail (connected wallet IS the creator): dev burn
+    // panel + buyback section both render.
+    win2.location.hash = `#/coin/${mint}`;
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(() => doc2.querySelector('#devBurnBtn'), 15000, 'dev burn card for the creator');
+    assert(true, 'dev burn panel renders for the coin creator');
+    assert(
+      doc2.querySelector('#devBurnCard').textContent.includes('Dev Burn'),
+      'dev burn panel carries its title'
+    );
+    assert(doc2.querySelector('#devBurnSource'), 'dev burn panel has a source selector');
+    assert(
+      doc2.querySelector('#devBurnSource').options.length === 2,
+      'dev burn source selector offers holdings + pool reserve'
+    );
+    assert(doc2.querySelector('#devBurnAmount'), 'dev burn panel has an amount input');
+    assert(doc2.querySelector('#devBurnMax'), 'dev burn panel has a MAX button');
+    assert(doc2.querySelector('#devBurnBtn'), 'dev burn panel has a burn button');
+    assert(doc2.querySelector('#devBurnCalc'), 'dev burn panel has a calculation area');
+    await waitFor(() => doc2.querySelector('#buybackBox'), 15000, 'buyback section for the creator');
+    assert(true, 'buyback section renders for the coin creator');
+    assert(
+      doc2.querySelector('#buybackBox').textContent.includes('Buyback dari Fee'),
+      'buyback section carries its title'
+    );
+    assert(doc2.querySelector('#buybackAmount'), 'buyback section has an amount input');
+    assert(doc2.querySelector('#buybackAllBtn'), 'buyback section has a buyback-all button');
+    assert(doc2.querySelector('#buybackBtn'), 'buyback section has a buyback button');
+    assert(doc2.querySelector('#buybackPreview'), 'buyback section has a preview area');
+    // The dev burn calculation fetches the server preview on input:
+    // typing an amount renders the current → projected table.
+    doc2.querySelector('#devBurnAmount').value = '1000000';
+    doc2.querySelector('#devBurnAmount').dispatchEvent(new win2.Event('input', { bubbles: true }));
+    await waitFor(
+      () => doc2.querySelector('#devBurnCalc table'),
+      15000,
+      'dev burn calculation table'
+    );
+    assert(
+      doc2.querySelector('#devBurnCalc').textContent.includes('Setelah Burn'),
+      'dev burn calculation shows the projected column'
+    );
+    assert(
+      doc2.querySelector('#devBurnCalc').textContent.includes('Kenaikan Harga'),
+      'dev burn calculation shows the price gain row'
     );
 
     console.log('\nALL UI SMOKE CHECKS PASSED');

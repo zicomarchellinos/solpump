@@ -30,6 +30,7 @@ const {
 const {
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountInstruction,
+  createBurnCheckedInstruction,
   createTransferCheckedInstruction,
   getAssociatedTokenAddress,
   getAccount,
@@ -202,6 +203,23 @@ async function sendTokens(mintAddress, destinationAddress, amountRaw) {
   }, `sendTokens ${amountRaw.toString()} of ${mintAddress} -> ${destinationAddress}`);
 }
 
+// Burn raw token units (BigInt) from the pool's own ATA for a mint — the
+// pool wallet is the burn authority and signs the transaction itself.
+// Used by creator-only dev burns from the pool reserve: burning shrinks
+// the mint's on-chain supply AND the curve's token reserve by the same
+// amount, so the price rises. Returns the confirmed signature.
+async function burnTokens(mintAddress, amountRaw) {
+  const mint = new PublicKey(mintAddress);
+  const poolAta = await getPoolAta(mintAddress);
+  return sendPoolTransaction(async () => {
+    const tx = new Transaction();
+    tx.add(
+      createBurnCheckedInstruction(poolAta, mint, poolPubkey, amountRaw, TOKEN_DECIMALS)
+    );
+    return tx;
+  }, `burnTokens ${amountRaw.toString()} of ${mintAddress} (pool reserve)`);
+}
+
 module.exports = {
   getPoolAddress,
   getPoolSolBalance,
@@ -211,6 +229,7 @@ module.exports = {
   getTokenBalanceOf,
   sendSol,
   sendTokens,
+  burnTokens,
   TOKEN_DECIMALS,
   FEE_BUFFER_LAMPORTS,
   LAMPORTS_PER_SOL,

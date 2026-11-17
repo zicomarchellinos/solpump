@@ -13,6 +13,16 @@
 //              border:<border>\navatar:<sha256 of the avatar's base64
 //              payload, or ''>\ncover:<sha256 of the cover's base64
 //              payload, or ''>"
+//   dev-burn:  "solpump:dev-burn:<wallet>\nmint:<mint>\namount:<amount>\n
+//              source:pool" — only for pool-reserve burns (the pool wallet
+//              burns its own tokens, server-signed, so the creator's
+//              signature is the only proof of authorization; a holdings
+//              burn needs no message because the on-chain burn transaction
+//              itself is signed by the creator's wallet).
+//   buyback:   "solpump:buyback:<wallet>\nmint:<mint>\namount:<amount|all>"
+//              — spending the creator's unclaimed fees needs the creator's
+//              signature, because the pool pays the bought tokens to the
+//              creator from a server-signed transfer.
 // The profile message binds the submitted fields (including the image
 // CONTENT via its hash) to the signature, so a signed edit cannot be
 // replayed with different values. The wallet is in the message too, so a
@@ -46,6 +56,26 @@ function sha256Hex(text) {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
+// Canonical dev-burn message (pool source only). `amount` is the exact
+// string the client sends (String of the burn amount); the server rebuilds
+// it from the request body the same way, so both sides must format the
+// number identically (plain JS String(number)).
+function devBurnMessage({ wallet, mint, amount, source }) {
+  return [
+    `solpump:dev-burn:${wallet}`,
+    `mint:${mint}`,
+    `amount:${amount}`,
+    `source:${source}`,
+  ].join('\n');
+}
+
+// Canonical buyback message. `amount` is the exact amount string the
+// client sends — a number, or 'all' for a full buyback of whatever is
+// unclaimed at execution time.
+function buybackMessage({ wallet, mint, amount }) {
+  return [`solpump:buyback:${wallet}`, `mint:${mint}`, `amount:${amount}`].join('\n');
+}
+
 // Verify an Ed25519 signature (base64) over a UTF-8 message, made by the
 // holder of `walletAddress` (base58 Solana address). Returns false on any
 // malformed input instead of throwing.
@@ -75,4 +105,11 @@ function verifyWalletSignature({ walletAddress, message, signatureBase64 }) {
   }
 }
 
-module.exports = { followMessage, profileMessage, sha256Hex, verifyWalletSignature };
+module.exports = {
+  followMessage,
+  profileMessage,
+  devBurnMessage,
+  buybackMessage,
+  sha256Hex,
+  verifyWalletSignature,
+};

@@ -300,8 +300,29 @@ function profileMessage({ wallet, username, border, avatarHash, coverHash }) {
   ].join('\n');
 }
 
+// Canonical dev-burn message (pool source only — holdings burns are
+// authenticated by the on-chain burn transaction itself). Must match
+// src/signverify.js exactly.
+function devBurnMessage({ wallet, mint, amount, source }) {
+  return [
+    `solpump:dev-burn:${wallet}`,
+    `mint:${mint}`,
+    `amount:${amount}`,
+    `source:${source}`,
+  ].join('\n');
+}
+
+// Canonical buyback message — `amount` is the spend, or 'all' for a full
+// buyback of whatever is unclaimed at execution time. Must match
+// src/signverify.js exactly.
+function buybackMessage({ wallet, mint, amount }) {
+  return [`solpump:buyback:${wallet}`, `mint:${mint}`, `amount:${amount}`].join('\n');
+}
+
 async function sha256Hex(text) {
-  const bytes = await crypto.subtle.digest('sha256', new TextEncoder().encode(text));
+  // WebCrypto only recognizes the hyphenated name 'SHA-256' — the bare
+  // 'sha256' throws "Unrecognized name" in browsers (and Node's WebCrypto).
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -1404,6 +1425,15 @@ async function renderCoin(mintAddress) {
       <div id="burnHistory"></div>
     </div>
 
+    ${isCreator ? `
+    <div class="card" id="devBurnCard">
+      <h2 style="margin-top:0">${translate('devBurnTitle')}</h2>
+      <p class="small muted">${translate('devBurnIntro')}</p>
+      <div id="devBurnForm" style="margin-top:12px"></div>
+      <div id="devBurnCalc" style="margin-top:12px"></div>
+      <div id="devBurnResult" style="margin-top:8px"></div>
+    </div>` : ''}
+
     <div class="card">
       <h2 style="margin-top:0">${translate('tradesTitle')}</h2>
       <div class="tabs">
@@ -1455,6 +1485,20 @@ async function renderCoin(mintAddress) {
               <button class="btn btn-primary" id="claimFeesBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>${translate('feeClaimBtn', { amount: fmtSol(creatorFees.unclaimedSol), asset: esc(pairAsset) })}</button>
               <div id="claimResult" style="margin-top:8px"></div>
               <p class="small muted">${translate('feeClaimNote')}</p>
+              <div id="buybackBox" style="margin-top:16px">
+                <h3 style="margin:0 0 4px">${translate('buybackTitle')}</h3>
+                <p class="small muted">${translate('buybackIntro')}</p>
+                <div class="field">
+                  <label>${translate('buybackAmountLabel', { asset: esc(pairAsset) })}</label>
+                  <input id="buybackAmount" type="number" min="0" step="any" placeholder="0.01" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>
+                  <div class="quick">
+                    <button class="btn" id="buybackAllBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>${translate('buybackAllBtn', { amount: fmtSol(creatorFees.unclaimedSol), asset: esc(pairAsset) })}</button>
+                  </div>
+                  <div class="estimate" id="buybackPreview"></div>
+                </div>
+                <button class="btn btn-buy" id="buybackBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>${translate('buybackBtn')}</button>
+                <div id="buybackResult" style="margin-top:8px"></div>
+              </div>
             </div>`
           : `<p class="small muted" style="margin-top:12px">${translate('feeNonCreatorNote', { asset: esc(pairAsset), creator: creatorLink(coin.creatorWallet) })}</p>`}
       </div>
@@ -1496,6 +1540,98 @@ async function renderCoin(mintAddress) {
       } catch (err) {
         resEl.innerHTML = `<div class="alert alert-error">${esc(translate('claimFailed', { msg: friendlyError(err) }))}</div>`;
         claimBtn.disabled = false;
+      }
+    });
+  }
+
+  // Creator buyback: spend unclaimed creator fees buying the coin back
+  // from the curve. Preview comes from the server (single source of
+  // truth for the quote); the creator signs the canonical buyback message
+  // in Phantom to authorize the server-signed token payout.
+  const buybackBtn = document.getElementById('buybackBtn');
+  if (buybackBtn) {
+    const buybackInput = document.getElementById('buybackAmount');
+    const buybackPreview = document.getElementById('buybackPreview');
+    const buybackResult = document.getElementById('buybackResult');
+    let buybackAll = false;
+    let previewTimer = null;
+    const updateBuybackPreview = () => {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(async () => {
+        const amount = buybackAll ? 'all' : Number(buybackInput.value);
+        if (!buybackAll && !(amount > 0)) {
+          buybackPreview.textContent = '';
+          return;
+        }
+        try {
+          const prev = await apiGet(
+            `/api/coins/${coin.mintAddress}/buyback-preview?amount=${encodeURIComponent(amount)}`
+          );
+          buybackPreview.textContent = translate('buybackPreview', {
+            tokens: fmtTokens(prev.tokenAmount),
+            ticker: coin.ticker,
+            price: fmtPriceBoth(prev.newPriceUsd, prev.newPrice),
+          });
+        } catch {
+          buybackPreview.textContent = '';
+        }
+      }, 300);
+    };
+    buybackInput.addEventListener('input', () => {
+      buybackAll = false;
+      updateBuybackPreview();
+    });
+    document.getElementById('buybackAllBtn').addEventListener('click', () => {
+      buybackAll = true;
+      buybackInput.value = '';
+      buybackInput.placeholder = translate('buybackAllPlaceholder', {
+        amount: fmtSol(creatorFees.unclaimedSol),
+        asset: pairAsset,
+      });
+      updateBuybackPreview();
+    });
+    buybackBtn.addEventListener('click', async () => {
+      const amount = buybackAll ? 'all' : Number(buybackInput.value);
+      if (!buybackAll && !(amount > 0)) return toast(translate('errBuybackEnterAmount'));
+      buybackBtn.disabled = true;
+      buybackResult.innerHTML = `<p class="muted">${translate('buybackSigning')}</p>`;
+      try {
+        if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
+        const phantom = (await waitForPhantom(3000)) || getPhantom();
+        if (!phantom) throw new Error(translate('errPhantomShort'));
+        if (typeof phantom.signMessage !== 'function') {
+          throw new Error(translate('errNoSignMessage'));
+        }
+        if (!(await syncWalletAccount())) {
+          throw new Error(translate('errReadAccountShort'));
+        }
+        const message = buybackMessage({
+          wallet: state.wallet,
+          mint: coin.mintAddress,
+          amount: buybackAll ? 'all' : String(amount),
+        });
+        const signature = await signWalletMessage(phantom, message);
+        buybackResult.innerHTML = `<p class="muted">${translate('buybackSending')}</p>`;
+        const res = await apiPost(`/api/coins/${coin.mintAddress}/buyback`, {
+          wallet: state.wallet,
+          amount,
+          message,
+          signature,
+        });
+        buybackResult.innerHTML = `<div class="alert alert-success">${translate('buybackSuccess', {
+          tokens: fmtTokens(res.buyback.tokenAmount),
+          ticker: coin.ticker,
+          tx: txLink(res.buyback.txSignature),
+        })}</div>`;
+        buybackAll = false;
+        buybackInput.value = '';
+        await refreshBalance();
+        renderHeader();
+        await refreshOnchainBalances();
+        setTimeout(() => renderCoin(mintAddress), 1200);
+      } catch (err) {
+        buybackResult.innerHTML = `<div class="alert alert-error">${esc(translate('buybackFailed', { msg: friendlyError(err) }))}</div>`;
+        buybackBtn.disabled = false;
       }
     });
   }
@@ -1603,6 +1739,7 @@ async function renderCoin(mintAddress) {
   renderTradeForm();
   renderPnlCard();
   renderBurnForm();
+  renderDevBurnForm();
   renderBurnHistory();
   renderTransferForm();
   renderTradesTable();
@@ -2031,6 +2168,183 @@ async function renderCoin(mintAddress) {
     });
   }
 
+  // Dev burn panel (creator-only — the card is only rendered for the
+  // creator): full calculation before confirming. Two sources: the
+  // creator's own holdings (a real SPL BurnChecked signed in Phantom,
+  // verified on-chain exactly like a holder burn) or the pool reserve
+  // (server-signed; the creator signs the canonical dev-burn message to
+  // authorize it). Both reduce the curve's token reserve, so the price
+  // rises. The preview comes from the server (single source of truth).
+  function renderDevBurnForm() {
+    const form = document.getElementById('devBurnForm');
+    if (!form) return;
+    const calcEl = document.getElementById('devBurnCalc');
+    const resultEl = document.getElementById('devBurnResult');
+    const maxHoldings = state.onchainBalances[coin.mintAddress] || 0;
+    form.innerHTML = `
+      <div class="field">
+        <label>${translate('devBurnSourceLabel')}</label>
+        <select id="devBurnSource">
+          <option value="holdings">${translate('devBurnSourceHoldings')}</option>
+          <option value="pool">${translate('devBurnSourcePool')}</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>${translate('devBurnAmountLabel', { ticker: esc(coin.ticker) })}</label>
+        <div style="display:flex;gap:8px">
+          <input id="devBurnAmount" type="number" min="0" step="any" placeholder="1000000" style="flex:1">
+          <button class="btn" id="devBurnMax">${translate('maxBtn')}</button>
+        </div>
+        <p class="small muted" id="devBurnMaxHint"></p>
+      </div>
+      <button class="btn btn-sell" id="devBurnBtn">${translate('devBurnBtn')}</button>`;
+    const sourceEl = document.getElementById('devBurnSource');
+    const amountEl = document.getElementById('devBurnAmount');
+    let calcTimer = null;
+    let poolBalance = null;
+    const updateMaxHint = async () => {
+      if (sourceEl.value === 'holdings') {
+        document.getElementById('devBurnMaxHint').textContent = translate('devBurnMaxHoldings', {
+          amount: fmtTokens(maxHoldings),
+          ticker: coin.ticker,
+        });
+        return;
+      }
+      if (poolBalance === null) {
+        document.getElementById('devBurnMaxHint').textContent = translate('loadingGeneric');
+        try {
+          const poolAddress = await loadPoolAddress();
+          poolBalance = await getTokenBalance(coin.mintAddress, poolAddress);
+        } catch {
+          poolBalance = 0;
+        }
+      }
+      document.getElementById('devBurnMaxHint').textContent = translate('devBurnMaxPool', {
+        amount: fmtTokens(poolBalance),
+        ticker: coin.ticker,
+      });
+    };
+    const updateCalc = () => {
+      clearTimeout(calcTimer);
+      calcTimer = setTimeout(async () => {
+        const amount = Number(amountEl.value);
+        if (!(amount > 0)) {
+          calcEl.innerHTML = '';
+          return;
+        }
+        try {
+          const prev = await apiGet(
+            `/api/coins/${coin.mintAddress}/burn-preview?amount=${encodeURIComponent(amount)}`
+          );
+          calcEl.innerHTML = `
+            <div class="table-wrap"><table>
+              <thead><tr><th></th><th>${translate('devBurnCurrent')}</th><th>${translate('devBurnProjected')}</th></tr></thead>
+              <tbody>
+                <tr><td>${translate('thPrice')}</td><td>${fmtPriceBoth(prev.current.priceUsd, prev.current.price)}</td><td><strong>${fmtPriceBoth(prev.projected.priceUsd, prev.projected.price)}</strong></td></tr>
+                <tr><td>${translate('devBurnSupply')}</td><td>${fmtTokens(prev.current.circulatingSupply)}</td><td><strong>${fmtTokens(prev.projected.circulatingSupply)}</strong></td></tr>
+                <tr><td>${translate('cardMarketCap')}</td><td>${fmtUsd(prev.current.marketCapUsd)}</td><td><strong>${fmtUsd(prev.projected.marketCapUsd)}</strong></td></tr>
+                <tr><td>${translate('devBurnPctBurned')}</td><td colspan="2"><strong>${prev.pctSupplyBurned.toFixed(2)}%</strong></td></tr>
+                <tr><td>${translate('devBurnPriceGain')}</td><td colspan="2"><strong class="positive">${fmtPct(prev.priceIncreasePct)}</strong></td></tr>
+              </tbody>
+            </table></div>`;
+        } catch {
+          calcEl.innerHTML = '';
+        }
+      }, 300);
+    };
+    sourceEl.addEventListener('change', () => {
+      updateMaxHint();
+      updateCalc();
+    });
+    amountEl.addEventListener('input', updateCalc);
+    document.getElementById('devBurnMax').addEventListener('click', async () => {
+      if (sourceEl.value === 'holdings') {
+        amountEl.value = maxHoldings;
+      } else {
+        if (poolBalance === null) await updateMaxHint();
+        amountEl.value = poolBalance || 0;
+      }
+      updateCalc();
+    });
+    updateMaxHint();
+    document.getElementById('devBurnBtn').addEventListener('click', async () => {
+      const amount = Number(amountEl.value);
+      const source = sourceEl.value;
+      if (!(amount > 0)) return toast(translate('errDevBurnEnterAmount'));
+      const btn = document.getElementById('devBurnBtn');
+      btn.disabled = true;
+      const fail = (msg) => {
+        btn.disabled = false;
+        resultEl.innerHTML = `<div class="alert alert-error">${esc(msg)}</div>`;
+      };
+      try {
+        if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
+        const phantom = (await waitForPhantom(3000)) || getPhantom();
+        if (!phantom) throw new Error(translate('errPhantomShort'));
+        if (!(await syncWalletAccount())) {
+          throw new Error(translate('errReadAccountShort'));
+        }
+        const body = { wallet: state.wallet, amount, source };
+        if (source === 'holdings') {
+          // Fresh on-chain balance first: the burn fails on-chain when
+          // the creator holds less, so check before opening Phantom.
+          const liveBalance = await getTokenBalance(coin.mintAddress, state.wallet);
+          state.onchainBalances[coin.mintAddress] = liveBalance;
+          if (liveBalance < amount) {
+            throw new Error(
+              translate('burnInsufficient', { bal: fmtTokens(liveBalance), ticker: coin.ticker })
+            );
+          }
+          if (amount >= coin.tokenReserve) {
+            throw new Error(
+              translate('burnTooLarge', { reserve: fmtTokens(coin.tokenReserve), ticker: coin.ticker })
+            );
+          }
+          resultEl.innerHTML = `<p class="muted">${translate('burnBuilding')}</p>`;
+          const built = await buildBurnTransaction(state.wallet, coin.mintAddress, amount);
+          const sim = await simulateTransaction(built.transaction);
+          if (!sim.ok) throw new Error(`Simulasi gagal: ${sim.error}`);
+          resultEl.innerHTML = `<p class="muted">${translate('burnSigning')}</p>`;
+          const sig = await signAndSend(phantom, built.transaction);
+          resultEl.innerHTML = `<p class="muted">${translate('burnVerifying')}</p>`;
+          body.txSignature = sig;
+        } else {
+          // Pool reserve: the pool burns its own tokens, server-signed —
+          // the creator's signature over the canonical message is the
+          // only proof of authorization.
+          if (typeof phantom.signMessage !== 'function') {
+            throw new Error(translate('errNoSignMessage'));
+          }
+          resultEl.innerHTML = `<p class="muted">${translate('devBurnSigning')}</p>`;
+          const message = devBurnMessage({
+            wallet: state.wallet,
+            mint: coin.mintAddress,
+            amount: String(amount),
+            source: 'pool',
+          });
+          body.message = message;
+          body.signature = await signWalletMessage(phantom, message);
+          resultEl.innerHTML = `<p class="muted">${translate('devBurnSending')}</p>`;
+        }
+        const res = await apiPost(`/api/coins/${coin.mintAddress}/dev-burn`, body);
+        resultEl.innerHTML = `<div class="alert alert-success">${translate('devBurnSuccess', {
+          amount: fmtTokens(amount),
+          ticker: coin.ticker,
+          price: fmtPriceBoth(res.burn.priceAfterUsd, res.burn.priceAfter),
+          tx: txLink(res.burn.txSignature),
+        })}</div>`;
+        amountEl.value = '';
+        calcEl.innerHTML = '';
+        await refreshBalance();
+        renderHeader();
+        await refreshOnchainBalances();
+        setTimeout(() => renderCoin(mintAddress), 1200);
+      } catch (err) {
+        fail(translate('devBurnFailed', { msg: friendlyError(err) }));
+      }
+    });
+  }
+
   function renderBurnHistory() {
     const wrap = document.getElementById('burnHistory');
     const list = burns || [];
@@ -2038,15 +2352,18 @@ async function renderCoin(mintAddress) {
       wrap.innerHTML = `<p class="muted">${translate('burnEmpty')}</p>`;
       return;
     }
+    const sourceLabel = (s) =>
+      s === 'dev' ? translate('burnSourceDev') : s === 'pool' ? translate('burnSourcePool') : translate('burnSourceHolder');
     wrap.innerHTML = `
       <div class="table-wrap"><table>
-        <thead><tr><th>${translate('thTime')}</th><th>${translate('burnHistoryWallet')}</th><th>${translate('burnHistoryAmount')}</th><th>${translate('burnHistoryPrice')}</th><th>${translate('burnHistoryTx')}</th></tr></thead>
+        <thead><tr><th>${translate('thTime')}</th><th>${translate('burnHistoryWallet')}</th><th>${translate('burnHistorySource')}</th><th>${translate('burnHistoryAmount')}</th><th>${translate('burnHistoryPrice')}</th><th>${translate('burnHistoryTx')}</th></tr></thead>
         <tbody>
           ${list
             .map(
               (b) => `<tr>
                 <td>${fmtTime(b.createdAt)}</td>
                 <td>${creatorLink(b.wallet)}${b.wallet === state.wallet ? translate('youSuffix') : ''}</td>
+                <td>${esc(sourceLabel(b.source))}</td>
                 <td>${fmtTokens(b.amount)}</td>
                 <td>${fmtPriceBoth(b.priceAfterUsd, b.priceAfter)}</td>
                 <td>${txLink(b.txSignature)}</td>

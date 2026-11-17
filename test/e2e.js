@@ -48,10 +48,26 @@
 //      upload validation, and the profile surfacing on the creator
 //      endpoint, feed coin cards (creatorProfile), callouts
 //      (authorProfile), and follow lists (profiles map)
+//  17. dev burn: the burn-preview calculation (current vs projected
+//      price / supply / market cap, % burned, price gain) against
+//      hand-computed values, creator-only guards (403), the pool-burn
+//      signature requirement (401 without a valid signature), the
+//      pool-short guard, fake holdings-burn rejection on-chain (422),
+//      and the burn source (holder/dev/pool) in burn history
+//  18. buyback: the buyback-preview calculation (tokens out, new price)
+//      against the bonding module, creator-only guards (403), the
+//      signature requirement (401), the no-fees / below-minimum /
+//      above-unclaimed / pool-short guards (400), and the fee-claim
+//      kind ('claim' vs 'buyback') on the detail endpoint
 // The actual Phantom signature steps cannot be exercised here (no wallet
 // extension), so no real on-chain trade is executed by this test — and the
 // claim success path (a real pool payout) cannot be tested without
 // funding the pool with devnet SOL, so only its validation paths are.
+// The same holds for the pool-burn and buyback success paths: the pool
+// holds 0 of the seeded fake mints on-chain, so only their validation
+// paths are testable here; the pool-burn transaction construction is a
+// single standard BurnChecked instruction (the same instruction the
+// client burn already exercises in test/mint-flow.js).
 // Run with:
 //   node test/e2e.js [baseUrl]
 
@@ -63,7 +79,12 @@ const { Keypair } = require('@solana/web3.js');
 const bonding = require('../src/bonding');
 const pairs = require('../src/pairs');
 const solprice = require('../src/solprice');
-const { profileMessage, sha256Hex } = require('../src/signverify');
+const {
+  profileMessage,
+  devBurnMessage,
+  buybackMessage,
+  sha256Hex,
+} = require('../src/signverify');
 
 // A throwaway wallet that can sign follow messages: a real Solana keypair,
 // signed with Node's built-in Ed25519 (same scheme Phantom uses).
@@ -490,6 +511,27 @@ async function main() {
     mintOrphan, 'Orphan Fox', 'OFOX', 'Coin with a missing pair (e2e)', WALLET_B,
     'r'.repeat(88), 55, 800000000, 1, 's'.repeat(88), mintGone, now - 20000
   );
+  // Coins E + F: dev-burn / buyback test coins. Their creator is a
+  // throwaway wallet whose private key the test controls (WALLET_A/B
+  // private keys are unknown), so valid creator signatures can be made.
+  // Coin E has one seeded 2 SOL buy (0.02 SOL unclaimed creator fees);
+  // its reserves are the post-trade values. Coin F has no trades at all
+  // (0 fees) for the no-fees buyback guard.
+  const devWallet = makeTestWallet();
+  const otherWallet = makeTestWallet();
+  const mintDev = Keypair.generate().publicKey.toBase58();
+  const mintNoFees = Keypair.generate().publicKey.toBase58();
+  const tokDev = (800000000 * 2) / (55 + 2);
+  const devSol = 57;
+  const devTok = 800000000 - tokDev;
+  insertCoin.run(
+    mintDev, 'Dev Burn Cat', 'DBCAT', 'Dev-burn / buyback test coin (e2e)', devWallet.address,
+    'v'.repeat(88), devSol, devTok, 1, 'w'.repeat(88), null, now - 15000
+  );
+  insertCoin.run(
+    mintNoFees, 'No Fees Fox', 'NFFOX', 'No-fees test coin (e2e)', devWallet.address,
+    'y'.repeat(88), 55, 800000000, 1, 'z'.repeat(88), null, now - 10000
+  );
   const insertTrade = db.prepare(
     `INSERT INTO trades
        (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
@@ -502,6 +544,9 @@ async function main() {
   insertTrade.run(mint, WALLET_B, 'buy', 0.5, tok2, 0.5 / tok2, fee(0.5), 'b'.repeat(88), 'B'.repeat(88), now - 40000);
   insertTrade.run(mint, WALLET_A, 'sell', solOut, halfA, solOut / halfA, fee(solOut), 'c'.repeat(88), 'C'.repeat(88), now - 30000);
   insertTrade.run(mint, WALLET_B, 'buy', sol3, 1000000, sol3 / 1000000, fee(sol3), 'd'.repeat(88), 'D'.repeat(88), now - 10000);
+  // Coin E's single trade: a 2 SOL buy (0.02 SOL creator fees).
+  const devFee = fee(2);
+  insertTrade.run(mintDev, WALLET_B, 'buy', 2, tokDev, 2 / tokDev, devFee, 't'.repeat(88), 'T'.repeat(88), now - 5000);
   console.log('seeded test coins', mintUnfunded, mint);
 
   try {
@@ -1570,9 +1615,281 @@ async function main() {
       // already gone — fine
     }
 
+    // ---------- 17. Dev burn ----------
+    console.log('dev burn:');
+    // Preview math against hand-computed values.
+    const burnAmount = 1000000;
+    const bp = await get(`/api/coins/${mintDev}/burn-preview?amount=${burnAmount}`);
+    const priceNow = devSol / devTok;
+    const priceAfter = devSol / (devTok - burnAmount);
+    assert(approx(bp.current.price, priceNow), 'burn-preview current price = solReserve / tokenReserve');
+    assert(approx(bp.projected.price, priceAfter), 'burn-preview projected price = solReserve / (tokenReserve - amount)');
+    assert(bp.current.circulatingSupply === 1000000000, 'burn-preview current supply is 1B (nothing burned yet)');
+    assert(
+      bp.projected.circulatingSupply === 1000000000 - burnAmount,
+      'burn-preview projected supply drops by the burn'
+    );
+    assert(
+      approx(bp.current.marketCapSol, priceNow * 1000000000),
+      'burn-preview current market cap = price x supply'
+    );
+    assert(
+      approx(bp.projected.marketCapSol, priceAfter * (1000000000 - burnAmount)),
+      'burn-preview projected market cap = new price x new supply'
+    );
+    assert(
+      approx(bp.pctSupplyBurned, (burnAmount / 1000000000) * 100),
+      'burn-preview % of supply burned'
+    );
+    assert(
+      approx(bp.priceIncreasePct, ((priceAfter - priceNow) / priceNow) * 100),
+      'burn-preview price increase %'
+    );
+    assert(bp.maxBurn === devTok, 'burn-preview maxBurn is the curve reserve');
+    assert(bp.pairAsset.symbol === 'SOL', 'burn-preview pair asset is SOL');
+    // USD fields: the test server runs with SOL_USD_PRICE=100.
+    if (Number.isFinite(bp.assetUsd)) {
+      assert(approx(bp.current.priceUsd, priceNow * bp.assetUsd), 'burn-preview current priceUsd');
+      assert(
+        approx(bp.projected.marketCapUsd, priceAfter * (1000000000 - burnAmount) * bp.assetUsd),
+        'burn-preview projected marketCapUsd'
+      );
+    }
+    // Preview validation.
+    const bpZeroRes = await fetch(`${BASE}/api/coins/${mintDev}/burn-preview?amount=0`);
+    assert(bpZeroRes.status === 400, 'burn-preview amount 0 is 400');
+    const bpBigRes = await fetch(`${BASE}/api/coins/${mintDev}/burn-preview?amount=${devTok}`);
+    assert(bpBigRes.status === 400, 'burn-preview amount >= reserve is 400');
+    const bpUnknownRes = await fetch(
+      `${BASE}/api/coins/${Keypair.generate().publicKey.toBase58()}/burn-preview?amount=100`
+    );
+    assert(bpUnknownRes.status === 404, 'burn-preview on an unknown coin is 404');
+
+    // Creator-only: anyone else gets 403 (checked before the signature).
+    const dbForbidden = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      { wallet: WALLET_A, amount: 100, source: 'pool' },
+      403
+    );
+    assert(/Hanya kreator/.test(dbForbidden.error), `dev burn by a non-creator is 403: ${dbForbidden.error}`);
+    // Validation.
+    const dbBadSource = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      { wallet: devWallet.address, amount: 100, source: 'mystery' },
+      400
+    );
+    assert(/source/.test(dbBadSource.error), 'dev burn with a bad source is 400');
+    const dbZero = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      { wallet: devWallet.address, amount: 0, source: 'pool' },
+      400
+    );
+    assert(/lebih dari 0/.test(dbZero.error), 'dev burn of 0 is 400');
+    const dbTooBig = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      { wallet: devWallet.address, amount: devTok, source: 'holdings', txSignature: 'n'.repeat(88) },
+      400
+    );
+    assert(/melebihi/.test(dbTooBig.error), `dev burn >= reserve is 400: ${dbTooBig.error}`);
+    const dbUnknown = await post(
+      `/api/coins/${Keypair.generate().publicKey.toBase58()}/dev-burn`,
+      { wallet: devWallet.address, amount: 100, source: 'pool' },
+      404
+    );
+    assert(/tidak ditemukan/.test(dbUnknown.error), 'dev burn on an unknown coin is 404');
+
+    // Pool burns need the creator's signature over the canonical message.
+    const poolMsg = devBurnMessage({
+      wallet: devWallet.address,
+      mint: mintDev,
+      amount: '1000000',
+      source: 'pool',
+    });
+    const dbUnsigned = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      { wallet: devWallet.address, amount: 1000000, source: 'pool' },
+      401
+    );
+    assert(/tanda tangan|Pesan/.test(dbUnsigned.error), `unsigned pool burn is 401: ${dbUnsigned.error}`);
+    const wrongPoolMsg = devBurnMessage({
+      wallet: devWallet.address,
+      mint: mintDev,
+      amount: '2000000',
+      source: 'pool',
+    });
+    const dbWrongMsg = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      {
+        wallet: devWallet.address,
+        amount: 1000000,
+        source: 'pool',
+        message: wrongPoolMsg,
+        signature: devWallet.sign(wrongPoolMsg),
+      },
+      401
+    );
+    assert(/tidak sesuai/.test(dbWrongMsg.error), `pool burn signed for a different amount is 401: ${dbWrongMsg.error}`);
+    const dbWrongSigner = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      {
+        wallet: devWallet.address,
+        amount: 1000000,
+        source: 'pool',
+        message: poolMsg,
+        signature: otherWallet.sign(poolMsg),
+      },
+      401
+    );
+    assert(/tidak valid/.test(dbWrongSigner.error), `pool burn signed by another wallet is 401: ${dbWrongSigner.error}`);
+    // Valid signature, but the pool holds 0 of this mint on-chain.
+    const dbPoolShort = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      {
+        wallet: devWallet.address,
+        amount: 1000000,
+        source: 'pool',
+        message: poolMsg,
+        signature: devWallet.sign(poolMsg),
+      },
+      400
+    );
+    assert(/Pool hanya memegang/.test(dbPoolShort.error), `pool burn with an empty pool is 400: ${dbPoolShort.error}`);
+    // Holdings burn with a fake signature: rejected on-chain (~10s).
+    const dbFake = await post(
+      `/api/coins/${mintDev}/dev-burn`,
+      { wallet: devWallet.address, amount: 100, source: 'holdings', txSignature: 'p'.repeat(88) },
+      422
+    );
+    assert(/Verifikasi burn gagal/.test(dbFake.error), `fake holdings dev burn rejected: ${dbFake.error}`);
+
+    // Burn sources serialize in the history (seeded directly — the
+    // success paths need real on-chain burns).
+    const insertBurn = db.prepare(
+      `INSERT INTO burns (mint_address, wallet, amount, source, price_after, tx_signature, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    insertBurn.run(mintNoFees, WALLET_A, 1000, 'holder', 0.0000001, 'h'.repeat(88), now - 3000);
+    insertBurn.run(mintNoFees, devWallet.address, 2000, 'dev', 0.0000002, 'i'.repeat(88), now - 2000);
+    insertBurn.run(mintNoFees, pool.address, 3000, 'pool', 0.0000003, 'j'.repeat(88), now - 1000);
+    const nfBurns = await get(`/api/coins/${mintNoFees}/burns`);
+    assert(nfBurns.burns.length === 3, 'seeded burns appear in the history');
+    assert(
+      nfBurns.burns.map((b) => b.source).join(',') === 'pool,dev,holder',
+      'burn history carries the source (pool/dev/holder, newest first)'
+    );
+    assert(
+      nfBurns.totalBurned === 6000 && nfBurns.circulatingSupply === 1000000000 - 6000,
+      'burn totals sum all sources'
+    );
+
+    // ---------- 18. Buyback ----------
+    console.log('buyback:');
+    // Preview math against the bonding module.
+    const bbSpend = 0.01;
+    const bbp = await get(`/api/coins/${mintDev}/buyback-preview?amount=${bbSpend}`);
+    const bbTokens = bonding.quoteBuy({ sol_reserve: devSol, token_reserve: devTok }, bbSpend);
+    const bbNewPrice = (devSol + bbSpend) / (devTok - bbTokens);
+    assert(approx(bbp.tokenAmount, bbTokens), 'buyback-preview tokens out = curve quote');
+    assert(approx(bbp.newPrice, bbNewPrice), 'buyback-preview new price after the buyback');
+    assert(approx(bbp.unclaimedSol, devFee), 'buyback-preview unclaimed = seeded fees');
+    assert(bbp.minBuy === 0.001, 'buyback-preview minBuy is 0.001 SOL');
+    assert(bbp.pairAsset.symbol === 'SOL', 'buyback-preview pair asset is SOL');
+    // 'all' previews the full unclaimed balance.
+    const bbpAll = await get(`/api/coins/${mintDev}/buyback-preview?amount=all`);
+    assert(
+      bbpAll.isAll === true && approx(bbpAll.amount, devFee),
+      "buyback-preview 'all' spends the full unclaimed balance"
+    );
+    assert(
+      approx(bbpAll.tokenAmount, bonding.quoteBuy({ sol_reserve: devSol, token_reserve: devTok }, devFee)),
+      "buyback-preview 'all' quotes the full balance"
+    );
+    // Preview validation.
+    const bbpZeroRes = await fetch(`${BASE}/api/coins/${mintDev}/buyback-preview?amount=0`);
+    assert(bbpZeroRes.status === 400, 'buyback-preview amount 0 is 400');
+    const bbpBigRes = await fetch(`${BASE}/api/coins/${mintDev}/buyback-preview?amount=${devFee + 1}`);
+    assert(bbpBigRes.status === 400, 'buyback-preview above unclaimed is 400');
+    const bbpUnknownRes = await fetch(
+      `${BASE}/api/coins/${Keypair.generate().publicKey.toBase58()}/buyback-preview?amount=0.01`
+    );
+    assert(bbpUnknownRes.status === 404, 'buyback-preview on an unknown coin is 404');
+
+    // Creator-only.
+    const bbForbidden = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: WALLET_A, amount: 0.01 },
+      403
+    );
+    assert(/Hanya kreator/.test(bbForbidden.error), `buyback by a non-creator is 403: ${bbForbidden.error}`);
+    // Signature requirement.
+    const bbMsg = buybackMessage({ wallet: devWallet.address, mint: mintDev, amount: '0.01' });
+    const bbUnsigned = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: devWallet.address, amount: 0.01 },
+      401
+    );
+    assert(/tanda tangan|Pesan/.test(bbUnsigned.error), `unsigned buyback is 401: ${bbUnsigned.error}`);
+    const bbWrongMsg = buybackMessage({ wallet: devWallet.address, mint: mintDev, amount: '0.02' });
+    const bbWrongMsgRes = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: devWallet.address, amount: 0.01, message: bbWrongMsg, signature: devWallet.sign(bbWrongMsg) },
+      401
+    );
+    assert(/tidak sesuai/.test(bbWrongMsgRes.error), `buyback signed for a different amount is 401: ${bbWrongMsgRes.error}`);
+    const bbWrongSigner = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: devWallet.address, amount: 0.01, message: bbMsg, signature: otherWallet.sign(bbMsg) },
+      401
+    );
+    assert(/tidak valid/.test(bbWrongSigner.error), `buyback signed by another wallet is 401: ${bbWrongSigner.error}`);
+    // No fees at all (coin F).
+    const bbAllMsg = buybackMessage({ wallet: devWallet.address, mint: mintNoFees, amount: 'all' });
+    const bbNoFees = await post(
+      `/api/coins/${mintNoFees}/buyback`,
+      { wallet: devWallet.address, amount: 'all', message: bbAllMsg, signature: devWallet.sign(bbAllMsg) },
+      400
+    );
+    assert(/Tidak ada fee/.test(bbNoFees.error), `buyback with zero unclaimed fees is 400: ${bbNoFees.error}`);
+    // Below the minimum buy.
+    const bbMinMsg = buybackMessage({ wallet: devWallet.address, mint: mintDev, amount: '0.0005' });
+    const bbBelowMin = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: devWallet.address, amount: 0.0005, message: bbMinMsg, signature: devWallet.sign(bbMinMsg) },
+      400
+    );
+    assert(/minimal/.test(bbBelowMin.error), `buyback below the minimum is 400: ${bbBelowMin.error}`);
+    // Above the unclaimed balance.
+    const bbBigMsg = buybackMessage({ wallet: devWallet.address, mint: mintDev, amount: '0.05' });
+    const bbTooBig = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: devWallet.address, amount: 0.05, message: bbBigMsg, signature: devWallet.sign(bbBigMsg) },
+      400
+    );
+    assert(/melebihi/.test(bbTooBig.error), `buyback above unclaimed is 400: ${bbTooBig.error}`);
+    // Valid buyback, but the pool holds 0 of this mint on-chain.
+    const bbPoolShort = await post(
+      `/api/coins/${mintDev}/buyback`,
+      { wallet: devWallet.address, amount: 0.01, message: bbMsg, signature: devWallet.sign(bbMsg) },
+      400
+    );
+    assert(/kehabisan token/.test(bbPoolShort.error), `buyback with an empty pool is 400: ${bbPoolShort.error}`);
+    // The fee-claim kind serializes on the detail endpoint (seeded
+    // directly — the success path needs a funded pool).
+    db.prepare(
+      `INSERT INTO fee_claims (mint_address, creator_wallet, amount_sol, asset_symbol, kind, tx_signature, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(mintDev, devWallet.address, 0.005, 'SOL', 'buyback', 'o'.repeat(88), now - 1000);
+    const devDetail = await get(`/api/coins/${mintDev}`);
+    const seededClaim = devDetail.feeClaims.find((c) => c.txSignature === 'o'.repeat(88));
+    assert(seededClaim && seededClaim.kind === 'buyback', 'detail feeClaims carry the buyback kind');
+    assert(
+      approx(devDetail.creatorFees.unclaimedSol, devFee - 0.005),
+      'a buyback claim reduces the unclaimed balance'
+    );
+
     console.log('\nALL E2E CHECKS PASSED');
   } finally {
-    const allMints = [mint, mintUnfunded, mintPair, mintOrphan];
+    const allMints = [mint, mintUnfunded, mintPair, mintOrphan, mintDev, mintNoFees];
     const placeholders = allMints.map(() => '?').join(', ');
     db.prepare(`DELETE FROM trades WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare(`DELETE FROM fee_claims WHERE mint_address IN (${placeholders})`).run(...allMints);
