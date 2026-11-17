@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>solpump — Buat Coin di Solana Devnet</title>
+  <meta name="description" content="Buat coin kripto ala pump.fun di Solana devnet. Minting SPL asli lewat Phantom, trading simulasi bonding-curve dengan pelacakan untung-rugi.">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">sol<span>pump</span></a>
+    <nav class="nav">
+      <a href="#/" data-nav="feed">Beranda</a>
+      <a href="#/create" data-nav="create">Buat Coin</a>
+      <a href="#/portfolio" data-nav="portfolio">Portofolio Saya</a>
+    </nav>
+    <div class="wallet-box" id="walletBox">
+      <button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>
+    </div>
+  </header>
+
+  <main class="container" id="view">
+    <p class="muted">Memuat…</p>
+  </main>
+
+  <footer class="footer">
+    <p><strong>solpump</strong> berjalan di <a href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Solana Devnet</a> — token yang di-mint adalah token SPL asli di devnet (tanpa nilai uang sungguhan). Panel Beli/Jual adalah <strong>simulasi</strong>: tidak ada transaksi on-chain.</p>
+    <p class="muted">Butuh SOL devnet? Ambil gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</p>
+  </footer>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <!-- Solana libraries: one bundle built by build.js (see README). -->
+  <script src="/vendor-solana.js"></script>
+  <script src="/solana.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

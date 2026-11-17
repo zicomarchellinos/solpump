@@ -1,0 +1,17 @@
+# Render blueprint: one free web service (API + static frontend + SQLite).
+# Deploy: push this repo to GitHub, then in Render choose
+# "New +" -> "Web Service" -> "Build and deploy from a GitHub repo",
+# or "New +" -> "Blueprint" and point it at this file.
+services:
+  - type: web
+    name: solpump
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      # Pin Node 22: better-sqlite3 ships a prebuilt binary for it, so the
+      # deploy skips native compilation entirely. (No prebuild exists for
+      # Node 24, and a source build is slower and more fragile.)
+      - key: NODE_VERSION
+        value: "22"
