@@ -1,19 +1,50 @@
-/* solpump — pump.fun-inspired look: near-black surfaces, pump green accent,
-   dense coin cards, chunky buy/sell buttons. Brand and copy stay solpump's own. */
+/* solpump — tampilan ala pump.fun (berdasarkan pengamatan langsung ke
+   pump.fun, snapshot 2026-11-10): tema gelap, sidebar kiri, aksen hijau
+   muda, font Geist. Nama, brand mark, dan copy tetap milik solpump. */
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/Geist-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/Geist-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/Geist-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
-  --bg: #0a0a0a;
-  --card: #111111;
-  --card2: #1a1a1a;
-  --border: #262626;
-  --text: #ffffff;
-  --muted: #9ca3af;
-  --green: #00e87b;
-  --green-dim: #052e1b;
-  --red: #ff4d4d;
-  --red-dim: #3b0a0a;
+  /* Token warna pump.fun (dari CSS resminya). */
+  --bg: #111113;        /* bg-primary */
+  --card: #18191b;      /* bg-secondary */
+  --card2: #212225;     /* bg-tertiary */
+  --card3: #272a2d;     /* bg-muted-secondary */
+  --border: #212225;    /* border-secondary */
+  --border2: #272a2d;   /* border-tertiary */
+  --text: #fafafa;      /* text-primary */
+  --text2: #e4e4e7;     /* text-secondary */
+  --muted: #a1a1aa;     /* text-tertiary */
+  --green: #86efac;     /* accent / bg-interactive */
+  --green-on: #052e16;  /* text-on-accent */
+  --green-dim: #0e2e12; /* sprout-950 */
+  --gain: #5ddf6c;      /* text-success */
+  --loss: #f87171;      /* text-error */
+  --red: #ef4444;
+  --red-dim: #450a0a;
   --gold: #facc15;
-  --blue: #38bdf8;
+  --blue: #60a5fa;
   --radius: 8px;
+  --radius-sm: 6px;
 }
 
 * { box-sizing: border-box; }
@@ -22,11 +53,15 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 15px;
   line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
 }
 
 h1, h2, h3 { letter-spacing: -0.02em; }
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.05rem; }
 a { color: var(--green); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
@@ -34,52 +69,97 @@ a:hover { text-decoration: underline; }
 .small { font-size: 0.85rem; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; word-break: break-all; }
 
-/* ---- Top bar ---- */
-.topbar {
+/* ---- App shell: sidebar + kolom utama (ala pump.fun) ---- */
+.app-shell { display: flex; min-height: 100vh; width: 100%; }
+.sidebar {
+  width: 13rem; /* --sidebar-width pump.fun */
+  flex-shrink: 0;
   display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 10px 20px;
-  border-bottom: 1px solid var(--border);
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  padding: 0 12px 8px;
   position: sticky;
   top: 0;
-  background: rgba(10, 10, 10, 0.95);
-  z-index: 10;
-  flex-wrap: wrap;
+  height: 100vh;
 }
-.brand { font-size: 1.4rem; font-weight: 800; color: var(--text); letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }
+.sidebar .brand { height: 48px; display: flex; align-items: center; padding: 0 7px; flex-shrink: 0; }
+.sidebar-foot { margin-top: auto; border-top: 1px solid var(--border); padding-top: 8px; }
+.sidebar-foot p { margin: 6px 0; }
+.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.brand { font-size: 1.3rem; font-weight: 700; color: var(--text); letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }
 .brand span { color: var(--green); }
 .brand:hover { text-decoration: none; }
 .brand-mark {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px; border-radius: 8px;
-  background: var(--green); color: #0a0a0a !important;
-  font-size: 1rem; font-weight: 900;
+  width: 24px; height: 24px; border-radius: var(--radius-sm);
+  background: var(--green); color: var(--green-on) !important;
+  font-size: 0.9rem; font-weight: 700;
 }
 .net-pill {
   background: var(--green-dim); color: var(--green);
-  border: 1px solid #0d5c34; border-radius: 999px;
-  padding: 2px 10px; font-size: 0.7rem; font-weight: 800; letter-spacing: 0.08em;
+  border: 1px solid #1a5821; border-radius: 999px;
+  padding: 2px 10px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em;
+  white-space: nowrap;
 }
-.nav { display: flex; gap: 16px; flex: 1; }
-.nav a { color: var(--muted); font-weight: 600; }
-.nav a.active, .nav a:hover { color: var(--text); text-decoration: none; }
+
+/* Nav sidebar: baris 32px ala pump.fun (h-8, rounded-md, ikon 18px). */
+.nav { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.nav a {
+  display: flex; align-items: center; gap: 10px;
+  height: 32px; padding: 0 10px; border-radius: var(--radius-sm);
+  color: var(--text2); font-weight: 500; font-size: 0.9rem;
+}
+.nav a:hover { background: var(--card2); text-decoration: none; }
+.nav a.active { background: var(--card2); color: var(--text); }
+.nav-ic {
+  width: 18px; height: 18px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 0.95rem; color: var(--muted);
+}
+.nav a.active .nav-ic { color: var(--green); }
+
+/* ---- Header atas + infobar ---- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: rgba(17, 17, 19, 0.95);
+  z-index: 10;
+}
+.topbar-spacer { flex: 1; }
+.infobar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  white-space: nowrap;
+}
 .wallet-box { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .wallet-chip {
-  background: var(--card2);
-  border: 1px solid var(--border);
+  background: var(--card);
+  border: 1px solid var(--border2);
   border-radius: 999px;
-  padding: 6px 12px;
+  padding: 5px 12px;
   font-size: 0.85rem;
   display: flex;
   gap: 8px;
   align-items: center;
+  height: 32px;
 }
 .wallet-chip .bal { color: var(--gold); font-weight: 700; }
 /* The chip is a link to the wallet's own profile — keep it reading as a
    chip, not a green anchor. */
 a.wallet-chip { color: var(--text); }
-a.wallet-chip:hover { border-color: var(--green); }
+a.wallet-chip:hover { border-color: var(--green); text-decoration: none; }
 
 /* Address links to creator profiles. */
 .addr-link { color: var(--green); }
@@ -100,21 +180,41 @@ a.wallet-chip:hover { border-color: var(--green); }
 /* Generic flex row (claim rows on the profile page). */
 .row { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
 
-/* Callouts (social trade calls). */
+/* Callouts (social trade calls) — format post ala pump.fun: avatar,
+   username, waktu, teks, lalu kartu coin mini + meta posisi. */
 .callout {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--card2);
+  background: var(--card);
   padding: 12px 14px;
   margin-bottom: 10px;
 }
 .callout:last-child { margin-bottom: 0; }
 .callout-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.callout-avatar {
+  width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 0.7rem; color: var(--green-on); background: var(--green);
+}
 .callout-text { margin: 10px 0; white-space: pre-wrap; word-break: break-word; }
+.callout-coin {
+  display: flex; gap: 10px; align-items: center;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin: 0 0 10px;
+}
+.callout-coin:hover { text-decoration: none; border-color: var(--border2); }
+.callout-coin .coin-mini {
+  width: 36px; height: 36px; border-radius: var(--radius-sm); flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 0.7rem; color: var(--green-on); background: var(--green);
+}
 .callout-meta { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); }
 
 /* ---- Layout ---- */
-.container { max-width: 1200px; margin: 0 auto; padding: 16px 20px; }
+.container { width: 100%; max-width: 1200px; margin: 0 auto; padding: 12px 24px 24px; }
 .card {
   background: var(--card);
   border: 1px solid var(--border);
@@ -132,133 +232,178 @@ a.wallet-chip:hover { border-color: var(--green); }
   .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
 }
 
-/* ---- Hero ---- */
-.hero { padding: 12px 4px 4px; }
-.hero h1 { font-size: 1.6rem; margin: 0 0 6px; }
-.hero p { color: var(--muted); margin: 0 0 14px; max-width: 640px; }
-.hero .badge-live {
-  display: inline-block;
-  background: var(--green-dim);
-  color: var(--green);
-  border: 1px solid #0d5c34;
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 0.75rem;
-  font-weight: 800;
-  letter-spacing: 0.05em;
-  margin-bottom: 10px;
-}
-.hero .badge-sim {
-  display: inline-block;
-  background: var(--red-dim);
-  color: #fca5a5;
-  border: 1px solid #7f1d1d;
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 0.75rem;
-  font-weight: 800;
-  margin-bottom: 10px;
-}
-
 /* ---- Buttons & forms ---- */
 .btn {
-  border: none;
-  border-radius: 8px;
-  padding: 10px 18px;
-  font-size: 0.95rem;
-  font-weight: 700;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  font-size: 0.9rem;
+  font-weight: 600;
   cursor: pointer;
   background: var(--card2);
   color: var(--text);
-  border: 1px solid var(--border);
+  font-family: inherit;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
-.btn:hover:not(:disabled) { filter: brightness(1.25); }
+.btn:hover:not(:disabled) { filter: brightness(1.2); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-primary { background: var(--green); color: #0a0a0a; border-color: var(--green); }
-.btn-buy { background: var(--green); color: #0a0a0a; width: 100%; }
-.btn-sell { background: var(--red); color: #fff; width: 100%; }
+.btn-primary { background: var(--green); color: var(--green-on); border-color: var(--green); }
+.btn-buy { background: var(--green); color: var(--green-on); border-color: var(--green); width: 100%; height: 44px; font-size: 1rem; }
+.btn-sell { background: var(--red); color: #fff; border-color: var(--red); width: 100%; height: 44px; font-size: 1rem; }
 .btn-ghost { background: transparent; }
-.btn-sm { padding: 6px 12px; font-size: 0.85rem; }
+.btn-sm { padding: 4px 12px; font-size: 0.85rem; height: 32px; }
 
 input, textarea, select {
   width: 100%;
-  background: var(--card2);
-  border: 1px solid var(--border);
+  background: var(--card);
+  border: 1px solid var(--border2);
   color: var(--text);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 0.95rem;
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 0.9rem;
   font-family: inherit;
+  height: 40px;
 }
+textarea { height: auto; }
 input:focus, textarea:focus, select:focus { outline: 2px solid var(--green); border-color: var(--green); }
 label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 0.9rem; }
 .field { margin-bottom: 14px; }
 .field .hint { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
 
-/* ---- Feed ---- */
-.toolbar { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
-.toolbar input { flex: 1; min-width: 200px; }
-.toolbar select { width: auto; }
-.coin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+/* ---- Feed: strip trending + filter + grid ---- */
+/* Strip trending ala pump.fun: deretan chip coin yang bisa di-scroll
+   horizontal — logo, nama + HOT, harga, market cap. */
+.trend-strip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 4px 2px 12px;
+  margin-bottom: 4px;
+  scrollbar-width: thin;
+}
+.trend-chip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px 8px 8px;
+  cursor: pointer;
+  min-width: 180px;
+}
+.trend-chip:hover { border-color: var(--green); }
+.trend-chip img, .trend-chip .coin-avatar { width: 40px; height: 40px; border-radius: var(--radius-sm); font-size: 0.75rem; }
+.trend-chip .tc-name { font-weight: 700; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+.trend-chip .tc-price { font-size: 0.85rem; color: var(--text2); }
+.trend-chip .tc-mc { font-size: 0.8rem; color: var(--muted); }
+.trend-chip .hot {
+  background: var(--red-dim); color: var(--loss);
+  border-radius: 4px; padding: 1px 5px; font-size: 0.65rem; font-weight: 700;
+  margin-left: 4px; vertical-align: middle;
+}
+.trend-title { font-size: 0.8rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 4px 0 8px; }
+
+.toolbar { display: flex; gap: 10px; margin: 12px 0 16px; flex-wrap: wrap; align-items: center; }
+.toolbar input { flex: 1; min-width: 200px; max-width: 420px; height: 32px; }
+/* Filter pill ala pump.fun (Trending / New / …): satu set tombol kecil. */
+.sort-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.pill {
+  border: 1px solid var(--border2);
+  background: var(--card);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  height: 32px;
+}
+.pill:hover { color: var(--text); border-color: var(--green); }
+.pill.active { background: var(--green); color: var(--green-on); border-color: var(--green); }
+
+.coin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
 .coin-card { cursor: pointer; transition: border-color 0.15s; padding: 14px; }
 .coin-card:hover { border-color: var(--green); }
 .coin-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
 .coin-head .coin-id { flex: 1; min-width: 0; }
 .coin-logo {
-  width: 44px; height: 44px; border-radius: 50%; object-fit: cover;
+  width: 56px; height: 56px; border-radius: var(--radius-sm); object-fit: cover;
   background: var(--card2); flex-shrink: 0;
 }
 .coin-avatar {
-  width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
+  width: 56px; height: 56px; border-radius: var(--radius-sm); flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  font-weight: 800; font-size: 0.95rem; color: #0a0a0a; background: var(--green);
+  font-weight: 700; font-size: 0.95rem; color: var(--green-on); background: var(--green);
 }
 .coin-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .coin-ticker { color: var(--muted); font-size: 0.85rem; }
+.coin-pair { color: var(--muted); font-size: 0.8rem; }
+.coin-time { color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
 .coin-desc {
   color: var(--muted); font-size: 0.85rem; margin: 0 0 8px;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 .coin-price { font-size: 1.05rem; margin-bottom: 6px; }
+.coin-price-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
 .coin-stats { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--muted); }
 .coin-stats b { color: var(--text); }
+.coin-foot { font-size: 0.8rem; color: var(--muted); margin-top: 6px; }
 .progress { height: 6px; background: var(--card2); border-radius: 999px; overflow: hidden; margin-top: 10px; }
 .progress > div { height: 100%; background: var(--green); }
 .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
 .empty h2 { color: var(--text); }
 
-/* ---- Detail ---- */
+/* ---- Detail: dua kolom (grafik kiri, trading kanan) ---- */
+.detail-layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+.detail-main { min-width: 0; }
+.detail-side { position: sticky; top: 64px; min-width: 0; }
+@media (max-width: 960px) {
+  .detail-layout { grid-template-columns: 1fr; }
+  .detail-side { position: static; }
+}
+.detail-head-logo { width: 64px; height: 64px; border-radius: var(--radius); }
+.detail-head-logo.coin-avatar { font-size: 1.1rem; }
+
 .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-.stat { background: var(--card2); border-radius: 8px; padding: 10px 12px; }
+.stat { background: var(--card2); border-radius: var(--radius-sm); padding: 10px 12px; }
 .stat .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .stat .value { font-weight: 700; font-size: 1.05rem; }
 @media (max-width: 760px) { .stat-grid { grid-template-columns: 1fr 1fr; } }
 
-.profit { color: var(--green); }
-.loss { color: var(--red); }
+.profit { color: var(--gain); }
+.loss { color: var(--loss); }
 .badge {
   display: inline-block; border-radius: 999px; padding: 2px 10px;
   font-size: 0.8rem; font-weight: 700; white-space: nowrap;
 }
-.badge-buy { background: var(--green-dim); color: var(--green); }
-.badge-sell { background: var(--red-dim); color: #fca5a5; }
-.badge-sim { background: var(--red-dim); color: #fca5a5; }
-.badge-ok { background: var(--green-dim); color: var(--green); }
-.badge-live { background: var(--green-dim); color: var(--green); }
-.badge-warn { background: #3b2a00; color: var(--gold); }
+.badge-buy { background: var(--green-dim); color: var(--gain); }
+.badge-sell { background: var(--red-dim); color: var(--loss); }
+.badge-sim { background: var(--red-dim); color: var(--loss); }
+.badge-ok { background: var(--green-dim); color: var(--gain); }
+.badge-live { background: var(--green-dim); color: var(--gain); }
+.badge-warn { background: #422006; color: var(--gold); }
 
 .chart-wrap { position: relative; }
 .chart-wrap svg { width: 100%; height: 260px; display: block; }
 .chart-tip {
   position: absolute; pointer-events: none; display: none;
-  background: #000; border: 1px solid var(--border); border-radius: 8px;
+  background: #000; border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 6px 10px; font-size: 0.8rem; white-space: nowrap; z-index: 5;
 }
 .range-btns { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
-.range-btns .btn.active { background: var(--green); color: #0a0a0a; border-color: var(--green); }
+.range-btns .btn.active { background: var(--green); color: var(--green-on); border-color: var(--green); }
 
+/* Tab tersegmentasi ala pump.fun: satu kontrol, opsi aktif berwarna. */
 .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-.tabs .btn.active { background: var(--green); color: #0a0a0a; border-color: var(--green); }
+.tabs .btn.active { background: var(--green); color: var(--green-on); border-color: var(--green); }
+.tabs .btn[data-side="sell"].active { background: var(--red); color: #fff; border-color: var(--red); }
 
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
@@ -266,7 +411,7 @@ th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
 .table-wrap { overflow-x: auto; }
 
 .trade-box .quick { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
-.trade-box .quick .btn { padding: 5px 10px; font-size: 0.8rem; }
+.trade-box .quick .btn { padding: 5px 10px; font-size: 0.8rem; height: 30px; }
 .estimate { font-size: 0.85rem; color: var(--muted); margin: 8px 0; min-height: 1.2em; }
 
 .pnl-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -278,26 +423,54 @@ th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
 
 .steps { list-style: none; padding: 0; margin: 16px 0; }
 .steps li { padding: 8px 0; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: center; }
-.steps li.done { color: var(--green); }
+.steps li.done { color: var(--gain); }
 .steps li.active { color: var(--gold); }
 .steps li.pending { color: var(--muted); }
 
 .alert {
-  border-radius: 8px; padding: 12px 14px; margin: 12px 0;
+  border-radius: var(--radius-sm); padding: 12px 14px; margin: 12px 0;
   border: 1px solid var(--border); background: var(--card2);
 }
 .alert-error { border-color: #7f1d1d; background: #1c0a0a; }
-.alert-info { border-color: #0c4a6e; background: #08222f; }
-.alert-success { border-color: var(--green-dim); background: #0a1a10; }
+.alert-info { border-color: #1e3a8a; background: #172554; }
+.alert-success { border-color: var(--green-dim); background: #0e2e12; }
 
 .toast {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-  background: var(--green); color: #0a0a0a; font-weight: 700;
+  background: var(--green); color: var(--green-on); font-weight: 700;
   padding: 12px 20px; border-radius: 999px; z-index: 50;
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
 }
 
+/* ---- Create: form kiri + pratinjau kanan (ala pump.fun) ---- */
+.create-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+.create-preview-col { position: sticky; top: 64px; }
+@media (max-width: 900px) {
+  .create-layout { grid-template-columns: 1fr; }
+  .create-preview-col { position: static; }
+}
+.preview-note { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+
 .footer {
-  max-width: 1200px; margin: 0 auto; padding: 20px;
+  margin-top: auto; padding: 20px 24px;
   border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem;
+}
+.footer p { max-width: 1200px; margin: 0 auto 8px; }
+
+/* ---- Layar kecil: sidebar jadi baris atas, brand pindah ke header ---- */
+@media (max-width: 767px) {
+  .app-shell { flex-direction: column; }
+  .sidebar {
+    width: 100%; height: auto; position: static;
+    flex-direction: row; align-items: center;
+    border-right: none; border-bottom: 1px solid var(--border);
+    padding: 0 12px; gap: 8px;
+  }
+  .sidebar .brand { height: 48px; }
+  .sidebar .nav { flex-direction: row; margin-top: 0; flex: 1; }
+  .sidebar .nav a { padding: 0 8px; font-size: 0.85rem; }
+  .sidebar .nav-ic { display: none; }
+  .sidebar-foot { display: none; }
+  .topbar, .infobar, .container, .footer { padding-left: 16px; padding-right: 16px; }
+  .infobar { overflow-x: auto; }
 }

@@ -38,6 +38,10 @@ Harga token dan market cap ditampilkan dalam USD, ala pump.fun — pasangannya t
 Single-service Node + Express + SQLite (better-sqlite3), frontend vanilla JS.
 Library Solana (`@solana/web3.js` + `@solana/spl-token`) dibundel ke satu file browser (`public/vendor-solana.js`) dengan esbuild — tidak ada dependensi CDN saat runtime.
 
+## Tampilan
+
+UI-nya mengikuti tampilan pump.fun yang sebenarnya (dipelajari dari situs live + arsipnya, 2026-11-10): tema gelap (`#111113` latar, `#18191b` kartu), sidebar kiri 13rem, aksen hijau muda `#86efac` (tombol utama, teks gelap `#052e16`), hijau untung `#5ddf6c` / merah rugi `#f87171`, font **Geist** (Regular/Medium/Bold, di-vendor di `public/fonts/` — lisensi SIL OFL). Nama "solpump" dan brand mark-nya sendiri; tidak ada logo/aset brand pump.fun yang dipakai. Tata letaknya: strip trending di atas feed, kartu coin bergaya board (logo, nama + ticker, pair TICKER/SOL, waktu pembuatan, market cap, progres kurva bonding), halaman detail dua kolom (grafik + riwayat kiri, panel trading + PnL + fee kanan), dan halaman buat coin dua kolom dengan panel pratinjau live.
+
 ## Menjalankan lokal
 
 ```bash

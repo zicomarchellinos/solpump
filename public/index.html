@@ -5,31 +5,50 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>solpump — Buat Coin di Solana Devnet</title>
   <meta name="description" content="Buat coin kripto ala pump.fun di Solana devnet. Minting SPL asli lewat Phantom, trading devnet asli lewat dompet pool dengan pelacakan untung-rugi.">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2300e87b'/%3E%3Ctext x='16' y='22' font-family='Arial' font-size='18' font-weight='bold' text-anchor='middle' fill='%230a0a0a'%3ES%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2386efac'/%3E%3Ctext x='16' y='22' font-family='Arial' font-size='18' font-weight='bold' text-anchor='middle' fill='%23052e16'%3ES%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="#/"><span class="brand-mark">S</span>sol<span>pump</span></a>
-    <span class="net-pill">DEVNET</span>
-    <nav class="nav">
-      <a href="#/" data-nav="feed">Beranda</a>
-      <a href="#/create" data-nav="create">Buat Coin</a>
-      <a href="#/portfolio" data-nav="portfolio">Portofolio Saya</a>
-    </nav>
-    <div class="wallet-box" id="walletBox">
-      <button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>
+  <!-- App shell ala pump.fun: sidebar kiri (desktop) + kolom utama dengan
+       header atas. Di layar kecil, sidebar berubah jadi baris atas. -->
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/"><span class="brand-mark">S</span>sol<span>pump</span></a>
+      <nav class="nav">
+        <a href="#/" data-nav="feed"><span class="nav-ic">⌂</span>Beranda</a>
+        <a href="#/create" data-nav="create"><span class="nav-ic">+</span>Buat Coin</a>
+        <a href="#/portfolio" data-nav="portfolio"><span class="nav-ic">◈</span>Portofolio Saya</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="net-pill">DEVNET</span>
+        <p class="small muted">Solana Devnet — token testnet, tanpa nilai uang.</p>
+        <p class="small"><a href="https://faucet.solana.com" target="_blank" rel="noopener">Ambil SOL devnet gratis ↗</a></p>
+      </div>
+    </aside>
+
+    <div class="main-col">
+      <header class="topbar">
+        <div class="topbar-spacer"></div>
+        <div class="wallet-box" id="walletBox">
+          <button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>
+        </div>
+      </header>
+
+      <div class="infobar">
+        <span class="net-pill">DEVNET</span>
+        <span class="muted small">Trading asli di devnet — SOL dan token beneran berpindah on-chain.</span>
+      </div>
+
+      <main class="container" id="view">
+        <p class="muted">Memuat…</p>
+      </main>
+
+      <footer class="footer">
+        <p><strong>solpump</strong> berjalan di <a href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Solana Devnet</a> — token yang di-mint adalah token SPL asli di devnet (tanpa nilai uang sungguhan). Trading memakai SOL devnet asli yang berpindah on-chain lewat <strong>dompet pool kustodian</strong> di <span id="poolAddress">…</span> — server yang memegang kunci pool dan menyelesaikan sisi kedua setiap trade. Devnet hanya untuk percobaan; token di sini tidak punya nilai uang.</p>
+        <p class="muted">Butuh SOL devnet? Ambil gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</p>
+      </footer>
     </div>
-  </header>
-
-  <main class="container" id="view">
-    <p class="muted">Memuat…</p>
-  </main>
-
-  <footer class="footer">
-    <p><strong>solpump</strong> berjalan di <a href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Solana Devnet</a> — token yang di-mint adalah token SPL asli di devnet (tanpa nilai uang sungguhan). Trading memakai SOL devnet asli yang berpindah on-chain lewat <strong>dompet pool kustodian</strong> di <span id="poolAddress">…</span> — server yang memegang kunci pool dan menyelesaikan sisi kedua setiap trade. Devnet hanya untuk percobaan; token di sini tidak punya nilai uang.</p>
-    <p class="muted">Butuh SOL devnet? Ambil gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</p>
-  </footer>
+  </div>
 
   <div class="toast" id="toast" hidden></div>
 

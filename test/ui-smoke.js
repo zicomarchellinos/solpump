@@ -93,11 +93,32 @@ async function main() {
       throw new Error(`page error: ${e.message}`);
     });
 
+    // Pump.fun-style app shell: sidebar with brand + nav, top header.
+    assert(document.querySelector('.sidebar'), 'sidebar renders');
+    assert(document.querySelector('.sidebar .brand').textContent.includes('solpump'), 'sidebar shows the solpump brand');
+    assert(document.querySelectorAll('.nav a').length === 3, 'sidebar nav has Beranda / Buat Coin / Portofolio');
+    assert(document.querySelector('.topbar'), 'top header renders');
+    assert(document.body.textContent.includes('DEVNET'), 'DEVNET pill is visible');
+
     // Feed: coin card renders with the seeded coin.
     await waitFor(
       () => document.querySelector('.coin-card'),
       15000,
       'coin card in feed'
+    );
+    // Trending strip (pump.fun style): the seeded coin appears as a chip.
+    await waitFor(
+      () => document.querySelector('.trend-chip'),
+      15000,
+      'trending strip chip'
+    );
+    assert(
+      document.querySelector('.trend-strip').textContent.includes('SMOKE'),
+      'trending strip shows the seeded coin'
+    );
+    assert(
+      document.querySelector('.trend-chip .hot'),
+      'top trending chip carries a HOT badge'
     );
     // Expected USD strings for the smoke coin, from the live SOL/USD rate
     // (the test server is started with SOL_USD_PRICE=100; if a server ever
@@ -115,11 +136,15 @@ async function main() {
       'feed shows the seeded coin'
     );
     assert(document.querySelector('#searchInput'), 'feed search input renders');
-    assert(document.querySelector('#sortSelect'), 'feed sort select renders');
+    assert(document.querySelectorAll('[data-sort]').length === 5, 'feed sort pills render (Baru / Market Cap / Volume / Harga / Perubahan)');
+    assert(document.querySelector('[data-sort="newest"].active'), 'newest sort pill is active by default');
     assert(document.body.textContent.includes('Market cap'), 'coin card shows market cap');
     assert(document.querySelector('.coin-card .addr-link'), 'coin card links the creator profile');
+    assert(document.querySelector('.coin-card .progress'), 'coin card shows the bonding-curve progress bar');
+    assert(document.querySelector('.coin-card .coin-desc'), 'coin card shows the description');
     const cardText = document.querySelector('.coin-card').textContent;
     assert(cardText.includes('SMOKE/SOL'), 'coin card shows the TICKER/SOL pair label');
+    assert(cardText.includes('mnt lalu'), 'coin card shows the time since creation');
     if (expPrice) {
       assert(cardText.includes(expPrice), `coin card shows the USD price (${expPrice})`);
       assert(cardText.includes(expMc), `coin card shows the USD market cap (${expMc})`);
@@ -207,6 +232,17 @@ async function main() {
     }
     assert(document.body.textContent.includes('Terverifikasi on-chain'), 'detail shows verified badge');
     assert(document.body.textContent.includes('explorer.solana.com') || document.querySelector('a[href*="explorer.solana.com"]'), 'detail links to Solana Explorer');
+    // Two-column detail layout (pump.fun style): chart left, trade sidebar right.
+    assert(document.querySelector('.detail-layout'), 'detail uses the two-column layout');
+    assert(document.querySelector('.detail-side'), 'detail has a sticky trade sidebar');
+    assert(
+      document.querySelector('.detail-side .trade-box'),
+      'buy/sell panel lives in the detail sidebar'
+    );
+    assert(
+      document.querySelector('.detail-side #feeCard'),
+      'creator fee card lives in the detail sidebar'
+    );
     assert(document.querySelector('.trade-box'), 'buy/sell panel renders');
     assert(document.body.textContent.includes('DEVNET ASLI'), 'trade panel labeled DEVNET ASLI');
     assert(document.body.textContent.includes('dompet pool'), 'trade panel discloses the pool wallet');
@@ -236,6 +272,7 @@ async function main() {
     );
     // Callouts: the seeded callout renders with its verified-buyer marker.
     assert(document.querySelector('#calloutsCard'), 'callouts section renders');
+    assert(document.querySelector('.callout-avatar'), 'callout shows the trader avatar');
     assert(
       document.body.textContent.includes('Pembeli terverifikasi'),
       'callout shows the verified-buyer marker'
@@ -282,6 +319,15 @@ async function main() {
     await waitFor(() => document.querySelector('#coinName'), 15000, 'create form');
     assert(document.querySelector('#coinTicker'), 'create form has ticker input');
     assert(document.querySelector('#mintBtn'), 'create form has mint button');
+    assert(document.querySelector('#createPreview'), 'create page shows the live preview panel');
+    assert(
+      document.querySelector('#createPreview').textContent.includes('Pratinjau'),
+      'preview panel is labeled Pratinjau'
+    );
+    assert(
+      document.querySelector('#createPreview').textContent.includes('$5K'),
+      'preview shows the ~$5K starting market cap'
+    );
     assert(
       document.body.textContent.includes('Phantom tidak terdeteksi'),
       'create view shows Phantom guidance without the extension'

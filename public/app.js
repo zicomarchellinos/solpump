@@ -195,6 +195,20 @@ function fmtDate(ts) {
   });
 }
 
+// Relative time, pump.fun style ("5 mnt lalu", "2 jam lalu").
+function fmtAgo(ts) {
+  const diff = Date.now() - Number(ts);
+  if (!Number.isFinite(diff) || diff < 0) return 'baru saja';
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'baru saja';
+  if (min < 60) return `${min} mnt lalu`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} jam lalu`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day} hari lalu`;
+  return fmtDate(ts);
+}
+
 function toast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
@@ -227,7 +241,7 @@ function logoHtml(coin, cls = 'coin-logo') {
     return `<img class="${cls}" src="${esc(coin.logoUrl)}" alt="${esc(coin.ticker)}">`;
   }
   const initials = (coin.ticker || '?').slice(0, 2).toUpperCase();
-  return `<div class="coin-avatar">${esc(initials)}</div>`;
+  return `<div class="coin-avatar${cls === 'coin-logo' ? '' : ` ${cls}`}">${esc(initials)}</div>`;
 }
 
 function txLink(sig, label) {
@@ -258,15 +272,23 @@ function calloutHtml(c, { showCoin = false } = {}) {
   const pnlUsd = Number.isFinite(c.pnlUsd)
     ? `${fmtSignedUsd(c.pnlUsd)} <span class="muted">(${fmtSignedSol(c.pnlSol)})</span>`
     : fmtSignedSol(c.pnlSol);
+  const initials = (c.wallet || '?').slice(0, 2).toUpperCase();
   return `
     <div class="callout">
       <div class="callout-head">
+        <span class="callout-avatar">${esc(initials)}</span>
         ${creatorLink(c.wallet)}
         <span class="badge badge-ok">✓ Pembeli terverifikasi</span>
-        ${showCoin ? `<a href="#/coin/${esc(c.mintAddress)}"><b>$${esc(c.coinTicker)}</b></a>` : ''}
-        <span class="muted small" style="margin-left:auto">${fmtTime(c.createdAt)}</span>
+        <span class="muted small" style="margin-left:auto">${fmtAgo(c.createdAt)}</span>
       </div>
       <p class="callout-text">${esc(c.text)}</p>
+      ${showCoin
+        ? `<a class="callout-coin" href="#/coin/${esc(c.mintAddress)}">
+            <span class="coin-mini">${esc((c.coinTicker || '?').slice(0, 2).toUpperCase())}</span>
+            <span><b>${esc(c.coinName || c.coinTicker)}</b> <span class="muted">$${esc(c.coinTicker)}</span></span>
+            <span class="muted small" style="margin-left:auto">Lihat coin ↗</span>
+          </a>`
+        : ''}
       <div class="callout-meta small">
         <span>Entry <b>${fmtPriceBoth(c.entryPriceUsd, c.entryPrice)}</b></span>
         <span>Dipergang <b>${fmtTokens(c.holdingsAtPost)}</b></span>
@@ -460,31 +482,35 @@ let feedSort = 'newest';
 
 async function renderFeed() {
   const view = document.getElementById('view');
+  // Layout ala pump.fun: strip trending di atas, lalu filter pill + grid.
+  // (Tidak ada hero — pump.fun langsung ke konten.)
+  const sortPills = [
+    ['newest', 'Baru'],
+    ['marketcap', 'Market Cap'],
+    ['volume', 'Volume'],
+    ['price', 'Harga'],
+    ['change', 'Perubahan'],
+  ];
   view.innerHTML = `
-    <div class="hero">
-      <div class="badge-live">● TRADING ASLI DI DEVNET</div>
-      <h1>Buat coin-mu sendiri di Solana devnet</h1>
-      <p>Isi nama, ticker, dan logo — satu tanda tangan di Phantom me-mint token SPL beneran di devnet. Trading memakai SOL devnet asli lewat dompet pool.</p>
-      <a class="btn btn-primary" href="#/create">+ Buat Coin</a>
-    </div>
+    <div id="trendStrip"></div>
     <div class="toolbar">
       <input id="searchInput" type="search" placeholder="Cari coin atau ticker…" value="${esc(feedSearch)}">
-      <select id="sortSelect">
-        <option value="newest" ${feedSort === 'newest' ? 'selected' : ''}>Terbaru</option>
-        <option value="price" ${feedSort === 'price' ? 'selected' : ''}>Harga tertinggi</option>
-        <option value="marketcap" ${feedSort === 'marketcap' ? 'selected' : ''}>Market cap</option>
-        <option value="volume" ${feedSort === 'volume' ? 'selected' : ''}>Volume</option>
-        <option value="change" ${feedSort === 'change' ? 'selected' : ''}>Perubahan harga</option>
-      </select>
+      <div class="sort-pills" role="tablist" aria-label="Urutkan coin">
+        ${sortPills
+          .map(
+            ([v, label]) =>
+              `<button class="pill ${feedSort === v ? 'active' : ''}" data-sort="${v}" role="tab">${label}</button>`
+          )
+          .join('')}
+      </div>
       ${state.wallet && state.following.size > 0
-        ? `<button class="btn btn-sm ${state.feedFollowingOnly ? 'active' : ''}" id="followingToggle" title="Hanya coin dan callout dari kreator yang kamu ikuti">Mengikuti (${state.following.size})</button>`
+        ? `<button class="pill ${state.feedFollowingOnly ? 'active' : ''}" id="followingToggle" title="Hanya coin dan callout dari kreator yang kamu ikuti">Mengikuti (${state.following.size})</button>`
         : ''}
     </div>
     <div id="followingCallouts"></div>
     <div id="coinList"><p class="muted">Memuat coin…</p></div>`;
 
   const searchInput = document.getElementById('searchInput');
-  const sortSelect = document.getElementById('sortSelect');
   let debounce;
   searchInput.addEventListener('input', () => {
     clearTimeout(debounce);
@@ -493,9 +519,14 @@ async function renderFeed() {
       loadCoins();
     }, 300);
   });
-  sortSelect.addEventListener('change', () => {
-    feedSort = sortSelect.value;
-    loadCoins();
+  view.querySelectorAll('[data-sort]').forEach((b) => {
+    b.addEventListener('click', () => {
+      feedSort = b.dataset.sort;
+      view.querySelectorAll('[data-sort]').forEach((x) =>
+        x.classList.toggle('active', x.dataset.sort === feedSort)
+      );
+      loadCoins();
+    });
   });
   const followingToggle = document.getElementById('followingToggle');
   if (followingToggle) {
@@ -505,7 +536,46 @@ async function renderFeed() {
       loadCoins();
     });
   }
+  loadTrendStrip();
   loadCoins();
+
+  // Strip trending ala pump.fun: 10 coin teratas berdasarkan market cap,
+  // bisa di-scroll horizontal. Gagal memuat = strip kosong (tidak fatal).
+  async function loadTrendStrip() {
+    const strip = document.getElementById('trendStrip');
+    if (!strip) return;
+    try {
+      const data = await apiGet('/api/coins?sort=marketcap&limit=10');
+      if (!data.coins.length) {
+        strip.innerHTML = '';
+        return;
+      }
+      strip.innerHTML = `
+        <div class="trend-title">Sedang trending</div>
+        <div class="trend-strip">
+          ${data.coins
+            .map(
+              (c, i) => `
+            <div class="trend-chip" data-mint="${esc(c.mintAddress)}" title="${esc(c.name)} ($${esc(c.ticker)})">
+              ${logoHtml(c)}
+              <div style="min-width:0">
+                <div class="tc-name">${esc(c.ticker)}${i < 3 ? '<span class="hot">HOT</span>' : ''}</div>
+                <div class="tc-price">${fmtPriceBoth(c.priceUsd, c.price)}</div>
+                <div class="tc-mc">${fmtMarketCap(c)}</div>
+              </div>
+            </div>`
+            )
+            .join('')}
+        </div>`;
+      strip.querySelectorAll('.trend-chip').forEach((chip) => {
+        chip.addEventListener('click', () => {
+          location.hash = `#/coin/${chip.dataset.mint}`;
+        });
+      });
+    } catch {
+      strip.innerHTML = '';
+    }
+  }
 
   async function loadCoins() {
     const list = document.getElementById('coinList');
@@ -572,22 +642,24 @@ function coinCard(c) {
       <div class="coin-head">
         ${logoHtml(c)}
         <div class="coin-id">
-          <div class="coin-name">${esc(c.name)}</div>
-          <div class="coin-ticker">$${esc(c.ticker)}</div>
-          <div class="small muted">${esc(c.ticker)}/SOL</div>
+          <div class="coin-name">${esc(c.name)} <span class="coin-ticker">$${esc(c.ticker)}</span></div>
+          <div class="coin-pair">${esc(c.ticker)}/SOL • ${fmtAgo(c.createdAt)}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div class="small muted">Market cap</div>
+          <div><b>${fmtMarketCap(c)}</b></div>
         </div>
         ${c.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
       </div>
       ${c.description ? `<p class="coin-desc">${esc(c.description)}</p>` : ''}
-      <div class="coin-price"><b>${fmtPriceBoth(c.priceUsd, c.price)}</b> <span class="${chg}">${fmtPct(c.changePct)}</span></div>
-      <div class="coin-stats">
-        <span>Market cap <b>${fmtMarketCap(c)}</b></span>
-        <span>Vol <b>${fmtSol(c.volumeSol)}</b></span>
+      <div class="coin-price-row">
+        <span class="coin-price"><b>${fmtPriceBoth(c.priceUsd, c.price)}</b> <span class="${chg}">${fmtPct(c.changePct)}</span></span>
+        <span class="small muted">Vol <b style="color:var(--text)">${fmtSol(c.volumeSol)} SOL</b></span>
       </div>
       <div class="progress" title="Progres kurva bonding: ${c.progressPct.toFixed(1)}%">
         <div style="width:${c.progressPct.toFixed(1)}%"></div>
       </div>
-      <div class="small muted" style="margin-top:4px">Kurva bonding ${c.progressPct.toFixed(1)}% • ${c.txCount} tx • oleh ${creatorLink(c.creatorWallet)}</div>
+      <div class="coin-foot">Kurva bonding ${c.progressPct.toFixed(1)}% • ${c.txCount} tx • oleh ${creatorLink(c.creatorWallet)}</div>
     </div>`;
 }
 
@@ -598,6 +670,7 @@ async function renderCreate() {
     <h1>Buat Coin</h1>
     <p class="muted">Minting asli di Solana devnet: suplai 1.000.000.000 token, 6 desimal, otoritas mint langsung dicabut. Nama, ticker, dan logo tersimpan di registry situs ini. Setelah mint, kamu akan diminta satu tanda tangan lagi untuk memindahkan 800.000.000 token ke dompet pool agar coin bisa diperdagangkan (200.000.000 token tetap di dompetmu).</p>
     <div id="pendingMintBox"></div>
+    <div class="create-layout">
     <div class="card">
       <div class="field">
         <label for="coinName">Nama coin</label>
@@ -615,7 +688,6 @@ async function renderCreate() {
       <div class="field">
         <label for="coinLogo">Logo (opsional, maks ~675 KB)</label>
         <input id="coinLogo" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
-        <div id="logoPreview" style="margin-top:8px"></div>
       </div>
       <div id="walletStatus"></div>
       <div id="mintSteps"></div>
@@ -631,12 +703,60 @@ async function renderCreate() {
         <span>Saya sudah memastikan Phantom di jaringan <strong>Devnet</strong> dan akun aktifnya adalah akun yang punya SOL devnet.</span>
       </label>
       <button class="btn btn-primary" id="mintBtn" style="margin-top:8px">Buat Coin &amp; Mint di Devnet</button>
+    </div>
+    <div class="create-preview-col">
+      <div class="card" id="createPreview">
+        <h2 style="margin-top:0">Pratinjau</h2>
+        <p class="small muted">Beginilah coin-mu akan tampil di feed.</p>
+        <div class="card coin-card" style="margin-bottom:0;cursor:default">
+          <div class="coin-head">
+            <div id="logoPreview"><div class="coin-avatar">??</div></div>
+            <div class="coin-id">
+              <div class="coin-name"><span id="pvName">Nama coin</span> <span class="coin-ticker">$<span id="pvTicker">TICKER</span></span></div>
+              <div class="coin-pair"><span id="pvPair">TICKER</span>/SOL • baru saja</div>
+            </div>
+            <div style="text-align:right;flex-shrink:0">
+              <div class="small muted">Market cap</div>
+              <div><b>$5K</b></div>
+            </div>
+          </div>
+          <p class="coin-desc" id="pvDesc">Deskripsi coin-mu akan tampil di sini.</p>
+          <div class="coin-price-row">
+            <span class="coin-price"><b>~$0.000005</b></span>
+            <span class="small muted">Vol <b style="color:var(--text)">0 SOL</b></span>
+          </div>
+          <div class="progress"><div style="width:0%"></div></div>
+          <div class="coin-foot">Kurva bonding 0% • 0 tx</div>
+        </div>
+        <p class="preview-note">Harga awal (~$0.000005) dan market cap awal (~$5K) ditentukan kurva bonding saat coin dibuat.</p>
+      </div>
+    </div>
     </div>`;
 
   const tickerInput = document.getElementById('coinTicker');
   tickerInput.addEventListener('input', () => {
     tickerInput.value = tickerInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    renderPreview();
   });
+  document.getElementById('coinName').addEventListener('input', renderPreview);
+  document.getElementById('coinDesc').addEventListener('input', renderPreview);
+
+  // Live preview: mirror the form into the preview card (pump.fun's create
+  // page shows the same "how your coin will look" panel).
+  function renderPreview() {
+    const name = document.getElementById('coinName').value.trim() || 'Nama coin';
+    const ticker = document.getElementById('coinTicker').value.trim() || 'TICKER';
+    const desc = document.getElementById('coinDesc').value.trim() || 'Deskripsi coin-mu akan tampil di sini.';
+    document.getElementById('pvName').textContent = name;
+    document.getElementById('pvTicker').textContent = ticker;
+    document.getElementById('pvPair').textContent = ticker;
+    document.getElementById('pvDesc').textContent = desc;
+    // Without a logo, the preview avatar shows the ticker's initials.
+    if (!logoData) {
+      document.getElementById('logoPreview').innerHTML =
+        `<div class="coin-avatar">${esc(ticker.slice(0, 2).toUpperCase())}</div>`;
+    }
+  }
 
   let logoData = null;
   const logoInput = document.getElementById('coinLogo');
@@ -656,7 +776,7 @@ async function renderCreate() {
     reader.onload = () => {
       const [meta, base64] = String(reader.result).split(',');
       logoData = { dataBase64: base64, mimeType: file.type };
-      preview.innerHTML = `<img src="${esc(reader.result)}" alt="Pratinjau logo" style="width:64px;height:64px;border-radius:50%;object-fit:cover">`;
+      preview.innerHTML = `<img src="${esc(reader.result)}" alt="Pratinjau logo" class="coin-logo">`;
     };
     reader.readAsDataURL(file);
   });
@@ -997,10 +1117,10 @@ async function renderCoin(mintAddress) {
   view.innerHTML = `
     <div class="card">
       <div class="coin-head">
-        ${logoHtml(coin)}
+        ${logoHtml(coin, 'coin-logo detail-head-logo')}
         <div>
           <div class="coin-name" style="font-size:1.3rem">${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span></div>
-          <div class="small muted">${esc(coin.ticker)}/SOL • Dibuat ${fmtDate(coin.createdAt)} oleh ${creatorLink(coin.creatorWallet)}</div>
+          <div class="small muted">${esc(coin.ticker)}/SOL • Dibuat ${fmtAgo(coin.createdAt)} oleh ${creatorLink(coin.creatorWallet)}</div>
         </div>
         <span class="badge badge-ok" style="margin-left:auto">✓ Terverifikasi on-chain</span>
         ${coin.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
@@ -1027,22 +1147,8 @@ async function renderCoin(mintAddress) {
       </div>
     </div>
 
-    <div class="card" id="feeCard">
-      <h2 style="margin-top:0">Fee Kreator <span class="badge badge-ok">${creatorFeePct}% dari setiap trade</span></h2>
-      <div class="stat-grid">
-        <div class="stat"><div class="label">Total fee terkumpul</div><div class="value">${fmtSol(creatorFees.totalEarnedSol)} SOL</div></div>
-        <div class="stat"><div class="label">Sudah diklaim</div><div class="value">${fmtSol(creatorFees.totalClaimedSol)} SOL</div></div>
-        <div class="stat"><div class="label">Bisa diklaim</div><div class="value">${fmtSol(creatorFees.unclaimedSol)} SOL</div></div>
-      </div>
-      ${isCreator
-        ? `<div style="margin-top:12px">
-            <button class="btn btn-primary" id="claimFeesBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>Klaim ${fmtSol(creatorFees.unclaimedSol)} SOL</button>
-            <div id="claimResult" style="margin-top:8px"></div>
-            <p class="small muted">Fee dikirim dari dompet pool ke dompetmu sebagai transaksi devnet asli. Klaim tercatat di riwayat transaksi.</p>
-          </div>`
-        : `<p class="small muted" style="margin-top:12px">1% dari volume SOL setiap beli dan jual masuk ke kreator ${creatorLink(coin.creatorWallet)}.</p>`}
-    </div>
-
+    <div class="detail-layout">
+    <div class="detail-main">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
         <h2 style="margin:0">Grafik Harga</h2>
@@ -1081,21 +1187,6 @@ async function renderCoin(mintAddress) {
       </div>
     </div>
 
-    <div class="grid-2">
-      <div class="card trade-box">
-        <h2 style="margin-top:0">Beli / Jual <span class="badge badge-live">DEVNET ASLI</span></h2>
-        <p class="small muted">Trading asli di devnet: SOL dan token beneran berpindah on-chain lewat dompet pool kustodian (<span id="tradePoolAddr">…</span>). Devnet hanya untuk percobaan — SOL di sini token testnet gratis tanpa nilai uang.</p>
-        <p class="small"><b>${creatorFeePct}% creator fee</b> dari volume SOL setiap trade masuk ke kreator ${creatorLink(coin.creatorWallet)} — saat beli sudah termasuk dalam SOL yang kamu bayar, saat jual dipotong dari SOL yang kamu terima.</p>
-        <div class="tabs">
-          <button class="btn btn-sm ${state.tradeSide === 'buy' ? 'active' : ''}" data-side="buy">Beli</button>
-          <button class="btn btn-sm ${state.tradeSide === 'sell' ? 'active' : ''}" data-side="sell">Jual</button>
-        </div>
-        <div id="tradeForm"></div>
-        <div id="tradeResult"></div>
-      </div>
-      <div class="card" id="pnlCard"></div>
-    </div>
-
     <div class="card">
       <h2 style="margin-top:0">Riwayat Transaksi</h2>
       <div class="tabs">
@@ -1115,6 +1206,37 @@ async function renderCoin(mintAddress) {
           ? '<p class="muted">Belum ada callout untuk coin ini.</p>'
           : (callouts || []).map((c) => calloutHtml(c)).join('')}
       </div>
+    </div>
+    </div>
+    <aside class="detail-side">
+      <div class="card trade-box">
+        <h2 style="margin-top:0">Beli / Jual <span class="badge badge-live">DEVNET ASLI</span></h2>
+        <p class="small muted">Trading asli di devnet: SOL dan token beneran berpindah on-chain lewat dompet pool kustodian (<span id="tradePoolAddr">…</span>). Devnet hanya untuk percobaan — SOL di sini token testnet gratis tanpa nilai uang.</p>
+        <p class="small"><b>${creatorFeePct}% creator fee</b> dari volume SOL setiap trade masuk ke kreator ${creatorLink(coin.creatorWallet)} — saat beli sudah termasuk dalam SOL yang kamu bayar, saat jual dipotong dari SOL yang kamu terima.</p>
+        <div class="tabs">
+          <button class="btn btn-sm ${state.tradeSide === 'buy' ? 'active' : ''}" data-side="buy">Beli</button>
+          <button class="btn btn-sm ${state.tradeSide === 'sell' ? 'active' : ''}" data-side="sell">Jual</button>
+        </div>
+        <div id="tradeForm"></div>
+        <div id="tradeResult"></div>
+      </div>
+      <div class="card" id="pnlCard"></div>
+      <div class="card" id="feeCard">
+        <h2 style="margin-top:0">Fee Kreator <span class="badge badge-ok">${creatorFeePct}% dari setiap trade</span></h2>
+        <div class="stat-grid" style="grid-template-columns:1fr 1fr">
+          <div class="stat"><div class="label">Total fee terkumpul</div><div class="value">${fmtSol(creatorFees.totalEarnedSol)} SOL</div></div>
+          <div class="stat"><div class="label">Sudah diklaim</div><div class="value">${fmtSol(creatorFees.totalClaimedSol)} SOL</div></div>
+          <div class="stat"><div class="label">Bisa diklaim</div><div class="value">${fmtSol(creatorFees.unclaimedSol)} SOL</div></div>
+        </div>
+        ${isCreator
+          ? `<div style="margin-top:12px">
+              <button class="btn btn-primary" id="claimFeesBtn" ${creatorFees.unclaimedSol > 0 ? '' : 'disabled'}>Klaim ${fmtSol(creatorFees.unclaimedSol)} SOL</button>
+              <div id="claimResult" style="margin-top:8px"></div>
+              <p class="small muted">Fee dikirim dari dompet pool ke dompetmu sebagai transaksi devnet asli. Klaim tercatat di riwayat transaksi.</p>
+            </div>`
+          : `<p class="small muted" style="margin-top:12px">1% dari volume SOL setiap beli dan jual masuk ke kreator ${creatorLink(coin.creatorWallet)}.</p>`}
+      </div>
+    </aside>
     </div>`;
 
   // Copy buttons
@@ -1788,7 +1910,7 @@ function renderChartEl(wrap, points, range) {
   const area = `${line} L${x(t1).toFixed(1)},${H - PAD_B} L${x(t0).toFixed(1)},${H - PAD_B} Z`;
   const last = pts[pts.length - 1];
   const up = last.price >= pts[0].price;
-  const color = up ? '#22c55e' : '#ec4899';
+  const color = up ? '#5ddf6c' : '#f87171'; // pump.fun gain/loss
   const fmtAxisTime = (t) =>
     new Date(t).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 
@@ -1803,8 +1925,8 @@ function renderChartEl(wrap, points, range) {
       <path d="${area}" fill="url(#chartFill)"/>
       <path d="${line}" fill="none" stroke="${color}" stroke-width="2"/>
       <circle cx="${x(last.t)}" cy="${y(last.price)}" r="4" fill="${color}"/>
-      <text x="${PAD_L}" y="${H - 6}" fill="#93a79a" font-size="13">${esc(fmtAxisTime(t0))}</text>
-      <text x="${W - PAD_R}" y="${H - 6}" fill="#93a79a" font-size="13" text-anchor="end">${esc(fmtAxisTime(t1))}</text>
+      <text x="${PAD_L}" y="${H - 6}" fill="#a1a1aa" font-size="13">${esc(fmtAxisTime(t0))}</text>
+      <text x="${W - PAD_R}" y="${H - 6}" fill="#a1a1aa" font-size="13" text-anchor="end">${esc(fmtAxisTime(t1))}</text>
     </svg>
     <div class="chart-tip" id="chartTip"></div>`;
 
