@@ -59,6 +59,59 @@
 //      signature requirement (401), the no-fees / below-minimum /
 //      above-unclaimed / pool-short guards (400), and the fee-claim
 //      kind ('claim' vs 'buyback') on the detail endpoint
+//  19. re-register: verification guards (bad mint 400, unknown mint
+//      422, wrong mint profile 422 via the real devnet USDC mint
+//      (wrong supply) + Wrapped SOL mint (0 supply on devnet), pool-
+//      holds-0 422 via the real user coin against the local pool,
+//      already-registered 409, bad signature 401) and the pool-
+//      attribution / reconstruction math (module level, vs hand-
+//      computed values). The success path needs a real mint + pool
+//      funding and is untestable locally.
+//  20. callout rewards: tier eligibility math (module level), the
+//      reward status on the detail endpoint, funding guards (fake tx
+//      422, non-creator 403, bad amount 400), claim guards (non-author
+//      403, wrong signature 401, tier not reached 400, already claimed
+//      409, empty pool 400), and pool balance accounting over seeded
+//      funds/claims. Fund/claim success paths need real on-chain SOL
+//      transfers and are untestable locally.
+//  21. livestream: WebSocket signaling (broadcaster join with a valid
+//      creator signature, non-creator broadcaster rejected, the
+//      waiting-viewers list in the broadcaster's joined message,
+//      offer/answer/ICE relay, viewer count, chat flow with auth,
+//      stream-ended on broadcaster disconnect)
+//  22. categories: the ?category= feed filter, the category badge data
+//      in responses, and the invalid-category 400
+//  23. custom tax: per-coin fee math (module level + fee totals on the
+//      detail endpoint for a seeded high-tax coin) and the register
+//      validation for out-of-range fee_bps. Prepare success quotes are
+//      untestable (pool holds 0 of the fake mints), as in section 3.
+//  24. 18+: the is_adult flag in feed/detail responses
+//  25. receipts: the USD snapshot on a seeded transfer and
+//      GET /api/transfers/:id (200 + 404)
+//  26. contacts: CRUD + signature guards (wrong message/signature
+//      401), duplicate wallet 409, non-owner 403
+//  27. verified + community badges: the graduation rule, the $100K
+//      market-cap rule, and each badge rule (Creator, Early Bird, Top
+//      Trader, Callout Star, Whale) against seeded trades/claims
+//  28. routed SOL buys: the two-hop quote math (module level, vs
+//      hand-computed values), both legs recorded with the right
+//      amounts/fees/reserves (module level), atomicity (a failed
+//      second leg rolls back the first), the one-hop limit (prepare/
+//      buy with payWith=sol on a deep-chain coin -> 400), the fake-tx
+//      routed buy (422, zero state change), and solBuyAvailable on
+//      the detail endpoint. The success path needs a real on-chain SOL
+//      transfer and is untestable locally.
+//  29. admin badges: the status endpoint (including the user's admin
+//      wallet from ADMIN_WALLETS), non-admin 403 on grant/revoke/
+//      list, admin grant/revoke round-trip, granted badges on the
+//      profile, invalid wallet/badge 400, wrong signature/message 401,
+//      duplicate grant 409.
+// The admin tests need the test server started with ADMIN_WALLETS
+// including BOTH the user's admin wallet
+// (GCPah2G9b8tAMKqryzb3NSUDfqp8nUFcPWsFgujWZrJw — his Phantom @zicoms12,
+// also the HcnwCGar mint creator) AND the deterministic test admin
+// wallet below (seed 'solpump-test-admin-v1'), whose private key this
+// suite controls so it can sign admin requests.
 // The actual Phantom signature steps cannot be exercised here (no wallet
 // extension), so no real on-chain trade is executed by this test — and the
 // claim success path (a real pool payout) cannot be tested without
@@ -79,17 +132,33 @@ const { Keypair } = require('@solana/web3.js');
 const bonding = require('../src/bonding');
 const pairs = require('../src/pairs');
 const solprice = require('../src/solprice');
+const rewards = require('../src/rewards');
+const badges = require('../src/badges');
+const routes = require('../src/routes');
 const {
   profileMessage,
   devBurnMessage,
   buybackMessage,
+  reRegisterMessage,
+  rewardClaimMessage,
+  streamStartMessage,
+  streamJoinMessage,
+  contactAddMessage,
+  contactEditMessage,
+  contactDeleteMessage,
+  adminMessage,
   sha256Hex,
 } = require('../src/signverify');
 
-// A throwaway wallet that can sign follow messages: a real Solana keypair,
+// A throwaway wallet that can sign messages: a real Solana keypair,
 // signed with Node's built-in Ed25519 (same scheme Phantom uses).
-function makeTestWallet() {
-  const kp = Keypair.generate();
+// With a seed string the keypair is deterministic (used for the admin
+// tests: the test server must run with ADMIN_WALLETS including the
+// address this derives — see the header comment).
+function makeTestWallet(seedString) {
+  const kp = seedString
+    ? Keypair.fromSeed(crypto.createHash('sha256').update(seedString).digest())
+    : Keypair.generate();
   const seed = Buffer.from(kp.secretKey.slice(0, 32));
   const pub = Buffer.from(kp.secretKey.slice(32));
   const keyObject = crypto.createPrivateKey({
@@ -107,6 +176,12 @@ function makeTestWallet() {
       crypto.sign(null, Buffer.from(message, 'utf8'), keyObject).toString('base64'),
   };
 }
+
+// The user's admin wallet (his Phantom @zicoms12; also the HcnwCGar mint
+// creator — verified against the mint-history lookup). The test server
+// must run with ADMIN_WALLETS including this address.
+const USER_ADMIN_WALLET = 'GCPah2G9b8tAMKqryzb3NSUDfqp8nUFcPWsFgujWZrJw';
+const TEST_ADMIN_WALLET = makeTestWallet('solpump-test-admin-v1'); // Hnp1qA4W7sgNsBPuHQRyeG5Gff6CAAguH3rQXJRYJGU
 
 const BASE = process.argv[2] || process.env.BASE_URL || 'http://localhost:3100';
 const WALLET_A = 'HyevJPsT3Yf5MTWMph4LaArUqtKS27ScfHF5Cqim6eek';
@@ -137,6 +212,32 @@ async function post(p, body, expectStatus = 200) {
   const data = await res.json().catch(() => ({}));
   if (res.status !== expectStatus) {
     throw new Error(`POST ${p} -> HTTP ${res.status} (expected ${expectStatus}): ${data.error || ''}`);
+  }
+  return data;
+}
+
+async function put(p, body, expectStatus = 200) {
+  const res = await fetch(`${BASE}${p}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status !== expectStatus) {
+    throw new Error(`PUT ${p} -> HTTP ${res.status} (expected ${expectStatus}): ${data.error || ''}`);
+  }
+  return data;
+}
+
+async function del(p, body, expectStatus = 200) {
+  const res = await fetch(`${BASE}${p}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status !== expectStatus) {
+    throw new Error(`DELETE ${p} -> HTTP ${res.status} (expected ${expectStatus}): ${data.error || ''}`);
   }
   return data;
 }
@@ -469,6 +570,10 @@ async function main() {
 
   // ---------- 2. Server: seed four coins ----------
   const db = new Database(path.join(__dirname, '..', 'data', 'solpump.db'));
+  // Wallets created inside the try block that the finally cleanup needs
+  // (declared here so they are in scope there).
+  let adminGrantTarget = '';
+  let contactOwnerWallet = '';
   const mintUnfunded = Keypair.generate().publicKey.toBase58();
   const mint = Keypair.generate().publicKey.toBase58();
   const mintPair = Keypair.generate().publicKey.toBase58();
@@ -547,6 +652,84 @@ async function main() {
   // Coin E's single trade: a 2 SOL buy (0.02 SOL creator fees).
   const devFee = fee(2);
   insertTrade.run(mintDev, WALLET_B, 'buy', 2, tokDev, 2 / tokDev, devFee, 't'.repeat(88), 'T'.repeat(88), now - 5000);
+  // Coins for sections 19-29 (creators WALLET_B or throwaway wallets —
+  // WALLET_A must stay at exactly 2 coins for section 15).
+  // Coin G: paired with PDOG — a DEEP pair chain (PDOG is paired with
+  // TCAT), so SOL buys are unavailable (one-hop limit, section 28).
+  const mintDeep = Keypair.generate().publicKey.toBase58();
+  insertCoin.run(
+    mintDeep, 'Deep Chain Cat', 'DCCAT', 'Coin paired with PDOG (deep chain)', WALLET_B,
+    'g'.repeat(88), 55, 800000000, 1, 'h'.repeat(88), mintPair, now - 9000
+  );
+  // Coin H: 5% creator tax (fee_bps 500) with one seeded 2 SOL buy
+  // (0.1 SOL fees at 5%) for the per-coin tax math (section 23).
+  const mintTax = Keypair.generate().publicKey.toBase58();
+  const tokTax = (800000000 * 2) / (55 + 2);
+  insertCoin.run(
+    mintTax, 'Tax Fox', 'TFOX', '5% tax test coin (e2e)', WALLET_B,
+    'i'.repeat(88), 57, 800000000 - tokTax, 1, 'j'.repeat(88), null, now - 8000
+  );
+  db.prepare('UPDATE coins SET fee_bps = 500 WHERE mint_address = ?').run(mintTax);
+  const taxFee = bonding.creatorFeeSol(2, 500);
+  insertTrade.run(mintTax, WALLET_B, 'buy', 2, tokTax, 2 / tokTax, taxFee, 'k'.repeat(88), 'K'.repeat(88), now - 7000);
+  // Coin I: 18+ (section 24) and Coin J: category Meme (section 22).
+  const mintAdult = Keypair.generate().publicKey.toBase58();
+  insertCoin.run(
+    mintAdult, 'Adult Owl', 'AOWL', '18+ test coin (e2e)', WALLET_B,
+    'l'.repeat(88), 55, 800000000, 1, 'm'.repeat(88), null, now - 6000
+  );
+  db.prepare('UPDATE coins SET is_adult = 1 WHERE mint_address = ?').run(mintAdult);
+  const mintMeme = Keypair.generate().publicKey.toBase58();
+  insertCoin.run(
+    mintMeme, 'Meme Mouse', 'MMOUSE', 'Meme category test coin (e2e)', WALLET_B,
+    'n'.repeat(88), 55, 800000000, 1, 'o'.repeat(88), null, now - 5000
+  );
+  db.prepare("UPDATE coins SET category = 'Meme' WHERE mint_address = ?").run(mintMeme);
+  // Coin K: graduated (140 SOL raised = 55 + 85) — its creator is
+  // verified via the graduation rule (section 27).
+  const gradWallet = makeTestWallet();
+  const mintGrad = Keypair.generate().publicKey.toBase58();
+  insertCoin.run(
+    mintGrad, 'Graduated Goat', 'GGOAT', 'Graduated test coin (e2e)', gradWallet.address,
+    'p'.repeat(88), 140, (800000000 * 55) / 140, 1, 'q'.repeat(88), null, now - 4000
+  );
+  // Coin L: NOT graduated (60 SOL) but price 2e-6 SOL/token -> market
+  // cap 2000 SOL -> $200K at SOL_USD_PRICE=100, so its creator is
+  // verified via the $100K market-cap rule only (section 27).
+  const richWallet = makeTestWallet();
+  const mintRich = Keypair.generate().publicKey.toBase58();
+  insertCoin.run(
+    mintRich, 'Rich Rabbit', 'RRAB', '$100K market-cap test coin (e2e)', richWallet.address,
+    'r'.repeat(88), 60, 30000000, 1, 's'.repeat(88), null, now - 3000
+  );
+  // Coin M: badge test coin. Three buyers (1/2/3 SOL) — all three are
+  // first-10 buyers (Early Bird), top 3 by volume (Top Trader), and
+  // hold >= 1% of the 1B circulating supply (Whale); the creator earns
+  // Creator; buyer2's seeded reward claim earns Callout Star.
+  const badgeWallet = makeTestWallet();
+  const buyer1 = makeTestWallet();
+  const buyer2 = makeTestWallet();
+  const buyer3 = makeTestWallet();
+  const mintBadges = Keypair.generate().publicKey.toBase58();
+  let badgeSol = 55;
+  let badgeTok = 800000000;
+  const badgeBuys = [];
+  for (const [w, sol] of [[buyer1, 1], [buyer2, 2], [buyer3, 3]]) {
+    const out = bonding.quoteBuy({ sol_reserve: badgeSol, token_reserve: badgeTok }, sol);
+    badgeBuys.push({ wallet: w, sol, out });
+    badgeSol += sol;
+    badgeTok -= out;
+  }
+  insertCoin.run(
+    mintBadges, 'Badge Bear', 'BBEAR', 'Badge test coin (e2e)', badgeWallet.address,
+    't'.repeat(88), badgeSol, badgeTok, 1, 'u'.repeat(88), null, now - 2000
+  );
+  for (const [i, b] of badgeBuys.entries()) {
+    insertTrade.run(
+      mintBadges, b.wallet.address, 'buy', b.sol, b.out, b.sol / b.out, fee(b.sol),
+      String(i + 1).repeat(88), String.fromCharCode(65 + i).repeat(88), now - 1500 + i * 100
+    );
+  }
   console.log('seeded test coins', mintUnfunded, mint);
 
   try {
@@ -1887,16 +2070,857 @@ async function main() {
       'a buyback claim reduces the unclaimed balance'
     );
 
+    // ---------- 19. Re-register ----------
+    console.log('re-register:');
+    // Module level: pool attribution math vs hand-computed values.
+    // attribution = (reserve - virtual) + unclaimedFees - buyFees.
+    assert(
+      approx(bonding.poolAttribution({ solReserve: 60, unclaimedFees: 0.02, buyFees: 0.01 }), 5.01),
+      'poolAttribution = (reserve - virtual) + unclaimed - buyFees (5.01 SOL)'
+    );
+    assert(
+      approx(bonding.poolAttribution({ solReserve: 55, unclaimedFees: 0, buyFees: 0 }), 0),
+      'a fresh coin attributes 0 of the pool balance'
+    );
+    assert(
+      approx(bonding.poolAttribution({ solReserve: 56.3726, unclaimedFees: 0, buyFees: 0 }), 1.3726),
+      'the user coin reconstruction: 56.3726 reserve -> 1.3726 SOL of pool SOL'
+    );
+    const reregWallet = makeTestWallet();
+    const reregBody = (mintAddress, wallet) => {
+      const message = reRegisterMessage({ wallet: wallet.address, mint: mintAddress });
+      return {
+        mintAddress,
+        name: 'Re Cat',
+        ticker: 'RCAT',
+        description: 'Re-register test',
+        creatorWallet: wallet.address,
+        message,
+        signature: wallet.sign(message),
+      };
+    };
+    // Bad mint (not base58) -> 400.
+    await post('/api/coins/re-register', reregBody('not-a-mint', reregWallet), 400);
+    console.log('  ok - bad mint address is 400');
+    // Unknown mint (valid base58, no on-chain account) -> 422.
+    const unknownMint = Keypair.generate().publicKey.toBase58();
+    const unknownRes = await post('/api/coins/re-register', reregBody(unknownMint, reregWallet), 422);
+    assert(/Verifikasi daftar ulang gagal/.test(unknownRes.error), `unknown mint is 422: ${unknownRes.error}`);
+    // Wrong supply: real devnet USDC mint (6 decimals but a huge
+    // supply, not 1B) -> 422.
+    const usdcRes = await post(
+      '/api/coins/re-register',
+      reregBody('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', reregWallet),
+      422
+    );
+    assert(/supply|1.000.000.000|1 miliar/i.test(usdcRes.error), `USDC mint rejected for supply: ${usdcRes.error}`);
+    // Wrong profile: Wrapped SOL (9 decimals, 0 supply on devnet) -> 422.
+    // Note: readMintProfile checks supply before decimals, and the devnet
+    // wSOL mint currently has 0 supply, so it fails the supply check
+    // first — either reason proves a non-solpump-profile mint is rejected.
+    const wsolRes = await post(
+      '/api/coins/re-register',
+      reregBody('So11111111111111111111111111111111111111112', reregWallet),
+      422
+    );
+    assert(
+      /Suplai|Desimal/i.test(wsolRes.error),
+      `Wrapped SOL rejected for its mint profile: ${wsolRes.error}`
+    );
+    // Already registered (TCAT) -> 409, before any signature check
+    // (no message/signature in the body at all).
+    const { message: _m, signature: _s, ...noSigBody } = reregBody(mint, reregWallet);
+    await post('/api/coins/re-register', noSigBody, 409);
+    console.log('  ok - already-registered coin is 409 (before the signature check)');
+    // Bad signature: message for another mint -> 401; signature from
+    // the wrong wallet -> 401.
+    const wrongMsgBody = reregBody(mintGone, reregWallet);
+    wrongMsgBody.message = reRegisterMessage({ wallet: reregWallet.address, mint: unknownMint });
+    await post('/api/coins/re-register', wrongMsgBody, 401);
+    const wrongSigBody = reregBody(mintGone, reregWallet);
+    wrongSigBody.signature = otherWallet.sign(wrongSigBody.message);
+    await post('/api/coins/re-register', wrongSigBody, 401);
+    console.log('  ok - wrong re-register message / signature is 401');
+    // Pool-holds-0: the real user coin against the LOCAL pool (which
+    // holds 0 of it). The mint profile is valid, so the pool check is
+    // what fails — before the creatorship check, so any valid
+    // signature reaches it.
+    const poolZeroRes = await post(
+      '/api/coins/re-register',
+      reregBody('HcnwCGarEEY7ew5sVTLkZjSyqhZjkNR7AVbzEb2Rk9mb', reregWallet),
+      422
+    );
+    assert(
+      /Pool tidak memegang/.test(poolZeroRes.error),
+      `real coin with a 0 local pool balance is 422: ${poolZeroRes.error}`
+    );
+    // (The success path needs a real mint + pool funding on-chain and
+    // cannot be exercised locally.)
+
+    // ---------- 20. Callout rewards ----------
+    console.log('callout rewards:');
+    // Module level: tier definitions + eligibility math.
+    assert(
+      JSON.stringify(rewards.REWARD_TIERS) ===
+        JSON.stringify([
+          { pct: 10, amountSol: 0.01 },
+          { pct: 25, amountSol: 0.025 },
+          { pct: 50, amountSol: 0.05 },
+        ]),
+      'reward tiers are +10%/+25%/+50% -> 0.01/0.025/0.05 SOL'
+    );
+    const status50 = rewards.rewardStatusForCallout(50);
+    assert(status50.every((t) => t.eligible && !t.claimed), 'at +50% PnL all three tiers are eligible');
+    // Floating-point edge: exactly +50% can compute as 49.99999999999999 —
+    // the tier comparison carries a 1e-9 epsilon so the top tier still opens.
+    const statusEdge = rewards.rewardStatusForCallout(49.99999999999999);
+    assert(statusEdge.every((t) => t.eligible), 'at 49.99999999999999% PnL all three tiers are still eligible (epsilon)');
+    const status12 = rewards.rewardStatusForCallout(12);
+    assert(
+      status12[0].eligible && !status12[1].eligible && !status12[2].eligible,
+      'at +12% PnL only the +10% tier is eligible'
+    );
+    const statusClaimed = rewards.rewardStatusForCallout(50, new Set([10]));
+    assert(statusClaimed[0].claimed && statusClaimed[1].eligible, 'a claimed tier reports claimed, others stay eligible');
+    // Seed two callouts on TCAT: one at +50% live PnL, one at +5%.
+    const calloutAuthor = makeTestWallet();
+    const tcatPrice = finalSol / finalTok;
+    const insertCallout = db.prepare(
+      `INSERT INTO callouts (mint_address, wallet, text, entry_price, holdings_at_post, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    const callout50Id = insertCallout.run(
+      mint, calloutAuthor.address, 'TCAT to the moon', tcatPrice / 1.5, 1000000, now - 2000
+    ).lastInsertRowid;
+    const callout5Id = insertCallout.run(
+      mint, calloutAuthor.address, 'TCAT slow grind', tcatPrice / 1.05, 1000000, now - 1000
+    ).lastInsertRowid;
+    // Reward status on the detail endpoint.
+    const tcatDetail = await get(`/api/coins/${mint}`);
+    const c50 = tcatDetail.callouts.find((c) => c.id === callout50Id);
+    const c5 = tcatDetail.callouts.find((c) => c.id === callout5Id);
+    assert(c50 && c50.rewards.every((t) => t.eligible), 'detail: +50% callout has all tiers eligible');
+    assert(c5 && c5.rewards.every((t) => !t.eligible), 'detail: +5% callout has no tier eligible');
+    assert(
+      tcatDetail.rewardPool && tcatDetail.rewardPool.balanceSol === 0,
+      'detail: reward pool starts at 0 SOL'
+    );
+    // Funding guards on mintDev (creator devWallet).
+    const fundBody = (wallet, amountSol, txSignature) => ({
+      wallet: wallet.address,
+      amountSol,
+      txSignature,
+    });
+    // Fake funding tx -> 422 (on-chain verification).
+    await post(`/api/coins/${mintDev}/reward-fund`, fundBody(devWallet, 0.5, 'x'.repeat(88)), 422);
+    console.log('  ok - fake reward funding tx is 422');
+    // Non-creator -> 403 (before the on-chain check).
+    await post(`/api/coins/${mintDev}/reward-fund`, fundBody(otherWallet, 0.5, 'y'.repeat(88)), 403);
+    console.log('  ok - non-creator reward funding is 403');
+    // Bad amounts -> 400.
+    await post(`/api/coins/${mintDev}/reward-fund`, fundBody(devWallet, 0, 'z'.repeat(88)), 400);
+    await post(`/api/coins/${mintDev}/reward-fund`, fundBody(devWallet, 1001, 'z'.repeat(88)), 400);
+    console.log('  ok - out-of-range reward funding amounts are 400');
+    // Claim guards. Body builder for a claim by `wallet` on callout
+    // `calloutId` at tier `tier`.
+    const claimBody = (wallet, calloutId, tier) => {
+      const message = rewardClaimMessage({
+        wallet: wallet.address,
+        mint,
+        calloutId: String(calloutId),
+        tier,
+      });
+      return { wallet: wallet.address, tier, message, signature: wallet.sign(message) };
+    };
+    // Non-author -> 403.
+    await post(`/api/coins/${mint}/callouts/${callout50Id}/claim-reward`, claimBody(otherWallet, callout50Id, 10), 403);
+    console.log('  ok - non-author reward claim is 403');
+    // Wrong signature -> 401.
+    const badClaim = claimBody(calloutAuthor, callout50Id, 10);
+    badClaim.signature = otherWallet.sign(badClaim.message);
+    await post(`/api/coins/${mint}/callouts/${callout50Id}/claim-reward`, badClaim, 401);
+    console.log('  ok - wrong reward-claim signature is 401');
+    // Tier not reached (+5% callout, tier 10) -> 400.
+    await post(`/api/coins/${mint}/callouts/${callout5Id}/claim-reward`, claimBody(calloutAuthor, callout5Id, 10), 400);
+    console.log('  ok - claiming an unreached tier is 400');
+    // Already claimed: seed a tier-10 claim, then claim it again -> 409.
+    db.prepare(
+      `INSERT INTO reward_claims (mint_address, callout_id, wallet, tier, amount_sol, tx_signature, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(mint, callout50Id, calloutAuthor.address, 10, 0.01, 'z'.repeat(88), now);
+    await post(`/api/coins/${mint}/callouts/${callout50Id}/claim-reward`, claimBody(calloutAuthor, callout50Id, 10), 409);
+    console.log('  ok - claiming an already-claimed tier is 409');
+    // Empty pool: tier 25 is reached but no funds were deposited -> 400.
+    const emptyPoolRes = await post(
+      `/api/coins/${mint}/callouts/${callout50Id}/claim-reward`,
+      claimBody(calloutAuthor, callout50Id, 25),
+      400
+    );
+    assert(/Pool reward/.test(emptyPoolRes.error), `empty reward pool is 400: ${emptyPoolRes.error}`);
+    // Pool accounting: seed a 0.5 SOL fund; balance = 0.5 - 0.01 claimed.
+    db.prepare(
+      `INSERT INTO reward_funds (mint_address, funder_wallet, amount_sol, tx_signature, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(mint, WALLET_A, 0.5, 'f'.repeat(88), now);
+    const tcatDetail2 = await get(`/api/coins/${mint}`);
+    assert(
+      approx(tcatDetail2.rewardPool.balanceSol, 0.49) &&
+        approx(tcatDetail2.rewardPool.totalFundedSol, 0.5) &&
+        approx(tcatDetail2.rewardPool.totalClaimedSol, 0.01),
+      `reward pool accounting: funded 0.5, claimed 0.01, balance 0.49 (got ${JSON.stringify(tcatDetail2.rewardPool)})`
+    );
+    const c50b = tcatDetail2.callouts.find((c) => c.id === callout50Id);
+    assert(
+      c50b.rewards.find((t) => t.pct === 10).claimed && c50b.rewards.find((t) => t.pct === 25).eligible,
+      'detail: the seeded claim shows as claimed, tier 25 stays eligible'
+    );
+    // (Fund/claim success paths need real on-chain SOL transfers and
+    // cannot be exercised locally.)
+
+    // ---------- 21. Livestream ----------
+    console.log('livestream:');
+    const wsBase = BASE.replace(/^http/, 'ws');
+    // Small WS helper: collect messages, wait for one matching `pred`.
+    function wsConnect(url) {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(url);
+        const messages = [];
+        const waiters = [];
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          messages.push(msg);
+          for (let i = waiters.length - 1; i >= 0; i--) {
+            if (waiters[i].pred(msg)) {
+              waiters[i].resolve(msg);
+              waiters.splice(i, 1);
+            }
+          }
+        };
+        ws.onerror = (e) => reject(new Error(`WS error: ${e.message || 'unknown'}`));
+        ws.onopen = () =>
+          resolve({
+            ws,
+            send: (obj) => ws.send(JSON.stringify(obj)),
+            waitFor: (pred, label, timeoutMs = 5000) =>
+              new Promise((res2, rej2) => {
+                const found = messages.find(pred);
+                if (found) return res2(found);
+                const timer = setTimeout(
+                  () => rej2(new Error(`timeout waiting for WS message: ${label}`)),
+                  timeoutMs
+                );
+                waiters.push({
+                  pred,
+                  resolve: (m) => {
+                    clearTimeout(timer);
+                    res2(m);
+                  },
+                });
+              }),
+          });
+      });
+    }
+    // Viewer 1 joins BEFORE the stream starts (waiting state).
+    const viewer1 = await wsConnect(`${wsBase}/ws/stream?mint=${mintDev}`);
+    viewer1.send({ type: 'join', role: 'viewer' });
+    const v1Joined = await viewer1.waitFor((m) => m.type === 'joined', 'viewer joined');
+    assert(v1Joined.live === false && v1Joined.viewerCount === 1, 'viewer joins a not-live room (count 1)');
+    // Non-creator broadcaster (valid signature, wrong wallet) -> error.
+    const badBcast = await wsConnect(`${wsBase}/ws/stream?mint=${mintDev}`);
+    const badStartMsg = streamStartMessage({ wallet: otherWallet.address, mint: mintDev });
+    badBcast.send({
+      type: 'join',
+      role: 'broadcaster',
+      wallet: otherWallet.address,
+      message: badStartMsg,
+      signature: otherWallet.sign(badStartMsg),
+    });
+    const badBcastErr = await badBcast.waitFor((m) => m.type === 'error', 'non-creator broadcaster error');
+    assert(/Hanya kreator/.test(badBcastErr.error), `non-creator broadcaster rejected: ${badBcastErr.error}`);
+    badBcast.ws.close();
+    // The real creator goes live.
+    const bcast = await wsConnect(`${wsBase}/ws/stream?mint=${mintDev}`);
+    const startMsg = streamStartMessage({ wallet: devWallet.address, mint: mintDev });
+    bcast.send({
+      type: 'join',
+      role: 'broadcaster',
+      wallet: devWallet.address,
+      message: startMsg,
+      signature: devWallet.sign(startMsg),
+    });
+    const bcastJoined = await bcast.waitFor((m) => m.type === 'joined', 'broadcaster joined');
+    assert(bcastJoined.live === true && bcastJoined.viewerCount === 1, 'creator goes live (count 1)');
+    assert(
+      Array.isArray(bcastJoined.viewers) && bcastJoined.viewers.includes(v1Joined.viewerId),
+      'broadcaster joined message lists the waiting viewer (for the offer)'
+    );
+    const started = await viewer1.waitFor((m) => m.type === 'stream-started', 'stream-started');
+    assert(started.broadcaster === devWallet.address, 'waiting viewer gets stream-started');
+    // Viewer 2 joins mid-stream; the broadcaster gets viewer-joined.
+    const viewer2 = await wsConnect(`${wsBase}/ws/stream?mint=${mintDev}`);
+    viewer2.send({ type: 'join', role: 'viewer' });
+    const v2Joined = await viewer2.waitFor((m) => m.type === 'joined', 'viewer 2 joined');
+    assert(v2Joined.live === true && v2Joined.viewerCount === 2, 'second viewer joins live (count 2)');
+    const vJoined = await bcast.waitFor(
+      (m) => m.type === 'viewer-joined' && m.viewerId === v2Joined.viewerId,
+      'viewer-joined to broadcaster'
+    );
+    assert(vJoined.viewerCount === 2, 'broadcaster gets viewer-joined with count 2');
+    // Offer/answer/ICE relay (fake SDP objects — real SDP from
+    // RTCPeerConnection is an object { type, sdp }, and the server
+    // requires an object; the signaling path, not WebRTC itself).
+    bcast.send({ type: 'offer', to: v1Joined.viewerId, sdp: { type: 'offer', sdp: 'fake-offer-sdp' } });
+    const offer = await viewer1.waitFor((m) => m.type === 'offer', 'offer relayed to viewer');
+    assert(offer.from === 'broadcaster' && offer.sdp.sdp === 'fake-offer-sdp', 'offer relays broadcaster -> viewer');
+    viewer1.send({ type: 'answer', sdp: { type: 'answer', sdp: 'fake-answer-sdp' } });
+    const answer = await bcast.waitFor((m) => m.type === 'answer', 'answer relayed to broadcaster');
+    assert(answer.from === v1Joined.viewerId && answer.sdp.sdp === 'fake-answer-sdp', 'answer relays viewer -> broadcaster');
+    viewer1.send({ type: 'ice', to: 'broadcaster', candidate: 'fake-candidate' });
+    const ice = await bcast.waitFor((m) => m.type === 'ice', 'ICE relayed to broadcaster');
+    assert(ice.from === v1Joined.viewerId && ice.candidate === 'fake-candidate', 'ICE relays viewer -> broadcaster');
+    // Chat: unauthed chat is rejected; authed chat broadcasts.
+    viewer1.send({ type: 'chat', text: 'hello before auth' });
+    const chatErr = await viewer1.waitFor(
+      (m) => m.type === 'error' && /chat/i.test(m.error),
+      'unauthed chat error'
+    );
+    assert(chatErr, 'unauthed chat is rejected');
+    const chatWallet = makeTestWallet();
+    const joinMsg = streamJoinMessage({ wallet: chatWallet.address, mint: mintDev });
+    viewer1.send({
+      type: 'auth',
+      wallet: chatWallet.address,
+      message: joinMsg,
+      signature: chatWallet.sign(joinMsg),
+    });
+    const authed = await viewer1.waitFor((m) => m.type === 'authed', 'viewer authed');
+    assert(authed.wallet === chatWallet.address, 'viewer auths for chat with a valid signature');
+    viewer1.send({ type: 'chat', text: 'hello stream' });
+    const chatMsg = await bcast.waitFor((m) => m.type === 'chat', 'chat broadcast to broadcaster');
+    assert(
+      chatMsg.wallet === chatWallet.address && chatMsg.text === 'hello stream',
+      'authed chat broadcasts with the wallet + text'
+    );
+    // The live stream shows on the streams endpoint + coin detail.
+    const streams = await get('/api/streams');
+    assert(
+      streams.streams.some((s) => s.mintAddress === mintDev && s.viewerCount === 2),
+      'GET /api/streams lists the live coin with 2 viewers'
+    );
+    const devDetailLive = await get(`/api/coins/${mintDev}`);
+    assert(
+      devDetailLive.coin.isLive === true && devDetailLive.coin.viewerCount === 2,
+      'coin detail reports isLive + viewerCount'
+    );
+    assert(
+      devDetailLive.stream && devDetailLive.stream.broadcaster === devWallet.address,
+      'coin detail carries the live stream object'
+    );
+    // Broadcaster disconnects -> viewers get stream-ended.
+    bcast.ws.close();
+    const ended = await viewer1.waitFor((m) => m.type === 'stream-ended', 'stream-ended on disconnect');
+    assert(ended, 'viewers see stream-ended when the creator disconnects');
+    viewer1.ws.close();
+    viewer2.ws.close();
+    const streamsAfter = await get('/api/streams');
+    assert(!streamsAfter.streams.some((s) => s.mintAddress === mintDev), 'the stream leaves /api/streams after ending');
+
+    // ---------- 22. Categories ----------
+    console.log('categories:');
+    const memeFeed = await get('/api/coins?category=Meme');
+    assert(
+      memeFeed.coins.length === 1 && memeFeed.coins[0].mintAddress === mintMeme,
+      'the ?category=Meme filter returns only the Meme coin'
+    );
+    const lainnyaFeed = await get('/api/coins?category=Lainnya');
+    assert(
+      lainnyaFeed.coins.some((c) => c.mintAddress === mint),
+      'the ?category=Lainnya filter includes the default-category coin'
+    );
+    assert(
+      !lainnyaFeed.coins.some((c) => c.mintAddress === mintMeme),
+      'the Meme coin is excluded from the Lainnya filter'
+    );
+    const memeDetail = await get(`/api/coins/${mintMeme}`);
+    assert(memeDetail.coin.category === 'Meme', 'the detail endpoint exposes the category');
+    const tcatCat = (await get(`/api/coins/${mint}`)).coin.category;
+    assert(tcatCat === 'Lainnya', 'coins without a category default to Lainnya');
+    const badCatRes = await fetch(`${BASE}/api/coins?category=Bogus`);
+    assert(badCatRes.status === 400, 'an unknown category is 400');
+
+    // ---------- 23. Custom tax ----------
+    console.log('custom tax:');
+    assert(bonding.creatorFeeSol(1, 500) === 0.05, 'creatorFeeSol(1 SOL, 500 bps) = 0.05 SOL');
+    assert(bonding.creatorFeeSol(1, 0) === 0, 'creatorFeeSol with 0 bps = 0');
+    assert(bonding.creatorFeeSol(1) === 0.01, 'creatorFeeSol defaults to 100 bps (1%)');
+    const taxDetail = await get(`/api/coins/${mintTax}`);
+    assert(taxDetail.coin.feeBps === 500 && taxDetail.coin.feePct === 5, 'the detail endpoint exposes the per-coin tax (5%)');
+    assert(
+      approx(taxDetail.stats.totalFeesSol, 0.1),
+      `the 5% coin's fee total is 0.1 SOL on a 2 SOL buy (got ${taxDetail.stats.totalFeesSol})`
+    );
+    assert(
+      approx(taxDetail.creatorFees.totalEarnedSol, 0.1),
+      'the creator-fees total uses the per-coin tax too'
+    );
+    const tcatFee = await get(`/api/coins/${mint}`);
+    assert(tcatFee.coin.feeBps === 100 && tcatFee.coin.feePct === 1, 'the default-tax coin reports 100 bps (1%)');
+    // Register validation: out-of-range feeBps is 400 before any
+    // on-chain verification (fake mint, no chain call needed).
+    const badTaxBody = {
+      mintAddress: mintGone,
+      name: 'Bad Tax',
+      ticker: 'BTAX',
+      description: 'x',
+      creatorWallet: WALLET_A,
+      txSignature: 'a'.repeat(88),
+      fundingTxSignature: 'b'.repeat(88),
+      feeBps: 1001,
+    };
+    await post('/api/coins/register', badTaxBody, 400);
+    await post('/api/coins/register', { ...badTaxBody, feeBps: -1 }, 400);
+    console.log('  ok - out-of-range feeBps at registration is 400');
+    // GIF logos: the upload validation table accepts image/gif.
+    assert(routes.IMAGE_MIME_EXT['image/gif'] === 'gif', 'the logo upload validation accepts image/gif');
+
+    // ---------- 24. 18+ ----------
+    console.log('18+:');
+    const adultFeed = await get('/api/coins');
+    const adultCoin = adultFeed.coins.find((c) => c.mintAddress === mintAdult);
+    assert(adultCoin && adultCoin.isAdult === true, 'the feed flags the 18+ coin (isAdult=true)');
+    const adultDetail = await get(`/api/coins/${mintAdult}`);
+    assert(adultDetail.coin.isAdult === true, 'the detail endpoint flags the 18+ coin');
+    const normalDetail = await get(`/api/coins/${mint}`);
+    assert(normalDetail.coin.isAdult === false, 'a normal coin reports isAdult=false');
+
+    // ---------- 25. Receipts ----------
+    console.log('receipts:');
+    const transferId = db
+      .prepare(
+        `INSERT INTO transfers (mint_address, from_wallet, to_wallet, amount, tx_signature, usd_value, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(mint, WALLET_A, WALLET_B, 1000000, '7'.repeat(88), 12.5, now - 1000).lastInsertRowid;
+    const receipt = await get(`/api/transfers/${transferId}`);
+    assert(receipt.transfer.id === transferId, 'GET /api/transfers/:id returns the transfer');
+    assert(receipt.transfer.usdValue === 12.5, 'the receipt carries the USD value snapshot (12.5)');
+    assert(
+      receipt.coin && receipt.coin.ticker === 'TCAT' && receipt.coin.name === 'Test Cat',
+      'the receipt carries the coin meta (name + ticker)'
+    );
+    const missingReceipt = await fetch(`${BASE}/api/transfers/999999999`);
+    assert(missingReceipt.status === 404, 'an unknown transfer id is 404');
+
+    // ---------- 26. Contacts ----------
+    console.log('contacts:');
+    const contactOwner = makeTestWallet();
+    contactOwnerWallet = contactOwner.address;
+    const contactTarget = makeTestWallet();
+    const addBody = (owner, name, wallet) => {
+      const message = contactAddMessage({ owner: owner.address, name, wallet: wallet.address });
+      return {
+        ownerWallet: owner.address,
+        name,
+        wallet: wallet.address,
+        message,
+        signature: owner.sign(message),
+      };
+    };
+    const added = await post('/api/contacts', addBody(contactOwner, 'Budi', contactTarget), 201);
+    assert(
+      added.contact && added.contact.name === 'Budi' && added.contact.wallet === contactTarget.address,
+      'a contact is added with a valid signature'
+    );
+    const contactId = added.contact.id;
+    // Duplicate wallet for the same owner -> 409.
+    await post('/api/contacts', addBody(contactOwner, 'Budi 2', contactTarget), 409);
+    console.log('  ok - duplicate contact wallet is 409');
+    // Wrong message / wrong signature -> 401.
+    const badMsgContact = addBody(contactOwner, 'Cici', makeTestWallet());
+    badMsgContact.message = contactAddMessage({
+      owner: contactOwner.address,
+      name: 'Other',
+      wallet: badMsgContact.wallet,
+    });
+    await post('/api/contacts', badMsgContact, 401);
+    const badSigContact = addBody(contactOwner, 'Dede', makeTestWallet());
+    badSigContact.signature = otherWallet.sign(badSigContact.message);
+    await post('/api/contacts', badSigContact, 401);
+    console.log('  ok - wrong contact message / signature is 401');
+    // Invalid wallet -> 400.
+    const badWalletContact = addBody(contactOwner, 'Eko', contactTarget);
+    badWalletContact.wallet = 'not-a-wallet';
+    await post('/api/contacts', badWalletContact, 400);
+    console.log('  ok - invalid contact wallet is 400');
+    // List.
+    const contactList = await get(`/api/contacts?owner=${contactOwner.address}`);
+    assert(
+      contactList.contacts.length === 1 && contactList.contacts[0].id === contactId,
+      'the address book lists the added contact'
+    );
+    // Edit (owner, valid signature) -> 200.
+    const editMsg = contactEditMessage({
+      owner: contactOwner.address,
+      contactId: String(contactId),
+      name: 'Budi Baru',
+      wallet: contactTarget.address,
+    });
+    const edited = await put(`/api/contacts/${contactId}`, {
+      ownerWallet: contactOwner.address,
+      name: 'Budi Baru',
+      wallet: contactTarget.address,
+      message: editMsg,
+      signature: contactOwner.sign(editMsg),
+    });
+    assert(edited.contact.name === 'Budi Baru', 'the contact is edited by its owner');
+    // Non-owner edit -> 403 (valid signature, wrong owner).
+    const nonOwnerEditMsg = contactEditMessage({
+      owner: otherWallet.address,
+      contactId: String(contactId),
+      name: 'Hacker',
+      wallet: contactTarget.address,
+    });
+    await put(
+      `/api/contacts/${contactId}`,
+      {
+        ownerWallet: otherWallet.address,
+        name: 'Hacker',
+        wallet: contactTarget.address,
+        message: nonOwnerEditMsg,
+        signature: otherWallet.sign(nonOwnerEditMsg),
+      },
+      403
+    );
+    console.log('  ok - non-owner contact edit is 403');
+    // Delete (owner, valid signature) -> 200; again -> 404.
+    const delMsg = contactDeleteMessage({ owner: contactOwner.address, contactId: String(contactId) });
+    await del(`/api/contacts/${contactId}`, {
+      ownerWallet: contactOwner.address,
+      message: delMsg,
+      signature: contactOwner.sign(delMsg),
+    });
+    await del(
+      `/api/contacts/${contactId}`,
+      {
+        ownerWallet: contactOwner.address,
+        message: delMsg,
+        signature: contactOwner.sign(delMsg),
+      },
+      404
+    );
+    const contactListAfter = await get(`/api/contacts?owner=${contactOwner.address}`);
+    assert(contactListAfter.contacts.length === 0, 'the deleted contact leaves the address book');
+
+    // ---------- 27. Verified + community badges ----------
+    console.log('verified + badges:');
+    // Module level: computeVerifiedSet with hand-built rows.
+    const vSet = badges.computeVerifiedSet({
+      coinMap: new Map([
+        ['GRAD', { mint_address: 'GRAD', creator_wallet: 'grad-creator', sol_reserve: 140, token_reserve: 300000000, pair_mint: null }],
+        ['RICH', { mint_address: 'RICH', creator_wallet: 'rich-creator', sol_reserve: 60, token_reserve: 30000000, pair_mint: null }],
+        ['FRESH', { mint_address: 'FRESH', creator_wallet: 'fresh-creator', sol_reserve: 55, token_reserve: 800000000, pair_mint: null }],
+      ]),
+      burnedMap: new Map(),
+      solUsd: 100,
+    });
+    assert(vSet.has('grad-creator'), 'a graduated coin verifies its creator (module level)');
+    assert(vSet.has('rich-creator'), 'a $200K market-cap coin verifies its creator (module level)');
+    assert(!vSet.has('fresh-creator'), 'a fresh coin does not verify its creator (module level)');
+    // API: the graduated + $100K creators are verified; TCAT's creator
+    // (fresh curve, ~$4K MC) is not.
+    const gradProfile = await get(`/api/creators/${gradWallet.address}`);
+    assert(gradProfile.verified === true, 'the graduated coin creator is verified');
+    const richProfile = await get(`/api/creators/${richWallet.address}`);
+    const richSolUsd = richProfile.solUsd;
+    if (Number.isFinite(richSolUsd)) {
+      // Market cap 2000 SOL x SOL/USD; verified iff >= $100K.
+      const shouldVerify = 2000 * richSolUsd >= 100000;
+      assert(
+        richProfile.verified === shouldVerify,
+        `the $100K market-cap creator is verified iff 2000 SOL x $${richSolUsd} >= $100K (verified=${richProfile.verified})`
+      );
+    } else {
+      assert(richProfile.verified === false, 'without a SOL price the market-cap rule cannot verify');
+    }
+    const tcatCreatorProfile = await get(`/api/creators/${WALLET_A}`);
+    assert(tcatCreatorProfile.verified === false, "TCAT's creator is not verified");
+    // Community badges on the badge-test coin. First seed buyer2's
+    // callout + reward claim (Callout Star).
+    const b2CalloutId = insertCallout.run(
+      mintBadges, buyer2.address, 'BBEAR call', 1e-7, 1000000, now - 500
+    ).lastInsertRowid;
+    db.prepare(
+      `INSERT INTO reward_claims (mint_address, callout_id, wallet, tier, amount_sol, tx_signature, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(mintBadges, b2CalloutId, buyer2.address, 10, 0.01, '8'.repeat(88), now);
+    const badgeKeys = (profile) => (profile.badges || []).map((b) => b.key);
+    const creatorBadges = badgeKeys(await get(`/api/creators/${badgeWallet.address}`));
+    assert(creatorBadges.includes('creator'), 'the coin creator earns the Creator badge');
+    const b1Badges = badgeKeys(await get(`/api/creators/${buyer1.address}`));
+    assert(b1Badges.includes('earlyBird'), 'buyer1 (first buyer) earns Early Bird');
+    assert(b1Badges.includes('topTrader'), 'buyer1 (top 3 by volume) earns Top Trader');
+    assert(b1Badges.includes('whale'), 'buyer1 (14.3M tokens = 1.43% of supply) earns Whale');
+    const b2Badges = badgeKeys(await get(`/api/creators/${buyer2.address}`));
+    assert(b2Badges.includes('calloutStar'), 'buyer2 (claimed a reward) earns Callout Star');
+    assert(b2Badges.includes('whale'), 'buyer2 (27M tokens) earns Whale');
+    const b3Badges = badgeKeys(await get(`/api/creators/${buyer3.address}`));
+    assert(
+      b3Badges.includes('earlyBird') && b3Badges.includes('topTrader') && b3Badges.includes('whale'),
+      'buyer3 earns Early Bird + Top Trader + Whale'
+    );
+
+    // ---------- 28. Routed SOL buys ----------
+    console.log('routed SOL buys:');
+    // Module level: two-hop quote vs hand-computed values (fresh curves).
+    const fresh = { sol_reserve: 55, token_reserve: 800000000 };
+    const routed1 = bonding.quoteRoutedBuy(fresh, fresh, 1);
+    const pairOutHand = (800000000 * 1) / (55 + 1);
+    const tokenOutHand = (800000000 * pairOutHand) / (55 + pairOutHand);
+    assert(
+      approx(routed1.pairOut, pairOutHand) && approx(routed1.tokenOut, tokenOutHand),
+      `quoteRoutedBuy(1 SOL on fresh curves) = ${pairOutHand.toFixed(2)} pair tokens -> ${tokenOutHand.toFixed(0)} target tokens`
+    );
+    // Module level: the one-hop limit (solBuyInfo).
+    const coinMap = new Map();
+    for (const row of db.prepare('SELECT * FROM coins').all()) coinMap.set(row.mint_address, row);
+    assert(pairs.solBuyInfo(coinMap.get(mintPair), coinMap).available === true, 'PDOG (SOL-paired pair) allows SOL buys');
+    assert(
+      pairs.solBuyInfo(coinMap.get(mintDeep), coinMap).reason === 'deep-chain',
+      'the deep-chain coin reports reason=deep-chain'
+    );
+    assert(
+      pairs.solBuyInfo(coinMap.get(mintOrphan), coinMap).reason === 'missing-pair',
+      'the missing-pair coin reports reason=missing-pair'
+    );
+    // Module level: both legs recorded with the right amounts/fees.
+    const poolAddr = (await get('/api/pool')).address;
+    const tcatRow = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mint);
+    const pdogRow = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mintPair);
+    const routeBuyer = makeTestWallet();
+    const routedQuote = bonding.quoteRoutedBuy(tcatRow, pdogRow, 0.5);
+    const feeLeg1 = bonding.creatorFeeSol(0.5, tcatRow.fee_bps ?? 100);
+    const feeLeg2 = bonding.creatorFeeSol(routedQuote.pairOut, pdogRow.fee_bps ?? 100);
+    const routed = routes.recordRoutedBuy({
+      pairRow: tcatRow,
+      targetRow: pdogRow,
+      buyerWallet: routeBuyer.address,
+      poolAddress: poolAddr,
+      solAmount: 0.5,
+      pairAmount: routedQuote.pairOut,
+      tokenAmount: routedQuote.tokenOut,
+      feePairSol: feeLeg1,
+      feeTargetSol: feeLeg2,
+      userTxSignature: 'u'.repeat(88),
+      poolTxSignature: 'U'.repeat(88),
+    });
+    const tcatAfter = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mint);
+    const pdogAfter = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mintPair);
+    assert(
+      approx(tcatAfter.sol_reserve, tcatRow.sol_reserve + 0.5) &&
+        approx(tcatAfter.token_reserve, tcatRow.token_reserve - routedQuote.pairOut),
+      'leg 1 moves the pair coin reserves (SOL in, pair tokens out)'
+    );
+    assert(
+      approx(pdogAfter.sol_reserve, pdogRow.sol_reserve + routedQuote.pairOut) &&
+        approx(pdogAfter.token_reserve, pdogRow.token_reserve - routedQuote.tokenOut),
+      'leg 2 moves the target coin reserves (pair tokens in, target tokens out)'
+    );
+    const leg1Trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(routed.pairTradeId);
+    const leg2Trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(routed.targetTradeId);
+    assert(
+      leg1Trade.mint_address === mint && leg1Trade.wallet === poolAddr &&
+        approx(leg1Trade.sol_amount, 0.5) && approx(leg1Trade.token_amount, routedQuote.pairOut) &&
+        approx(leg1Trade.fee_sol, feeLeg1) && leg1Trade.pool_tx_signature === null &&
+        leg1Trade.user_tx_signature === null,
+      'leg 1 is recorded as a pool-wallet buy on the pair coin (no on-chain tx of its own — both signatures NULL)'
+    );
+    assert(
+      leg2Trade.mint_address === mintPair && leg2Trade.wallet === routeBuyer.address &&
+        approx(leg2Trade.sol_amount, routedQuote.pairOut) && approx(leg2Trade.token_amount, routedQuote.tokenOut) &&
+        approx(leg2Trade.fee_sol, feeLeg2) && leg2Trade.pool_tx_signature === 'U'.repeat(88) &&
+        leg2Trade.user_tx_signature === 'u'.repeat(88),
+      'leg 2 is recorded as the buyer buy on the target coin (carrying the real user + pool signatures)'
+    );
+    // Restore the reserves + remove the recorded legs (the DB seeds
+    // must stay as the earlier sections expect them).
+    db.prepare('UPDATE coins SET sol_reserve = ?, token_reserve = ? WHERE mint_address = ?').run(
+      tcatRow.sol_reserve, tcatRow.token_reserve, mint
+    );
+    db.prepare('UPDATE coins SET sol_reserve = ?, token_reserve = ? WHERE mint_address = ?').run(
+      pdogRow.sol_reserve, pdogRow.token_reserve, mintPair
+    );
+    db.prepare('DELETE FROM trades WHERE id IN (?, ?)').run(routed.pairTradeId, routed.targetTradeId);
+    // Atomicity: a target row with a NULL mint_address makes the second
+    // INSERT throw NOT NULL — the whole transaction must roll back.
+    const tradesBefore = db.prepare('SELECT COUNT(*) AS n FROM trades').get().n;
+    let atomicThrew = false;
+    try {
+      routes.recordRoutedBuy({
+        pairRow: tcatRow,
+        targetRow: { ...pdogRow, mint_address: null },
+        buyerWallet: routeBuyer.address,
+        poolAddress: poolAddr,
+        solAmount: 0.5,
+        pairAmount: routedQuote.pairOut,
+        tokenAmount: routedQuote.tokenOut,
+        feePairSol: feeLeg1,
+        feeTargetSol: feeLeg2,
+        userTxSignature: 'v'.repeat(88),
+        poolTxSignature: 'V'.repeat(88),
+      });
+    } catch (err) {
+      atomicThrew = /NOT NULL/i.test(err.message);
+    }
+    assert(atomicThrew, 'recordRoutedBuy with a NULL target mint throws NOT NULL');
+    const tcatAtomic = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mint);
+    const tradesAfter = db.prepare('SELECT COUNT(*) AS n FROM trades').get().n;
+    assert(
+      approx(tcatAtomic.sol_reserve, tcatRow.sol_reserve) &&
+        approx(tcatAtomic.token_reserve, tcatRow.token_reserve) &&
+        tradesAfter === tradesBefore,
+      'the failed second leg rolls back the first (pair reserves + trade count unchanged)'
+    );
+    // API: prepare/buy with payWith=sol on the deep-chain coin -> 400.
+    const deepPrepare = await post(
+      '/api/trades/prepare',
+      { mintAddress: mintDeep, side: 'buy', amount: 0.5, payWith: 'sol', wallet: routeBuyer.address },
+      400
+    );
+    assert(
+      /Beli dengan SOL tidak tersedia/.test(deepPrepare.error) && /lebih dari satu hop/.test(deepPrepare.error),
+      `deep-chain SOL prepare is 400 with the clear message: ${deepPrepare.error}`
+    );
+    // API: fake-tx routed buy on PDOG -> 422, zero state change.
+    const pdogBefore = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mintPair);
+    await post(
+      '/api/trades/buy',
+      {
+        mintAddress: mintPair,
+        wallet: routeBuyer.address,
+        solAmount: 0.5,
+        payWith: 'sol',
+        userTxSignature: 'w'.repeat(88),
+      },
+      422
+    );
+    const pdogAfterFake = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mintPair);
+    assert(
+      approx(pdogAfterFake.sol_reserve, pdogBefore.sol_reserve) &&
+        approx(pdogAfterFake.token_reserve, pdogBefore.token_reserve),
+      'a fake-tx routed buy leaves the reserves untouched'
+    );
+    // Detail endpoint: solBuyAvailable flags.
+    const pdogDetail = await get(`/api/coins/${mintPair}`);
+    assert(
+      pdogDetail.solBuyAvailable === true && pdogDetail.pairCoin && pdogDetail.pairCoin.ticker === 'TCAT',
+      'the PDOG detail exposes solBuyAvailable=true + the pair coin'
+    );
+    const deepDetail = await get(`/api/coins/${mintDeep}`);
+    assert(
+      deepDetail.solBuyAvailable === false && deepDetail.solBuyUnavailableReason === 'deep-chain',
+      'the deep-chain detail exposes solBuyAvailable=false + reason=deep-chain'
+    );
+    // (The routed-buy success path needs a real on-chain SOL transfer
+    // and cannot be exercised locally.)
+
+    // ---------- 29. Admin badges ----------
+    console.log('admin badges:');
+    // Status: the user's admin wallet + the deterministic test admin
+    // are admins; an ordinary wallet is not.
+    const userAdminStatus = await get(`/api/admin/status?wallet=${USER_ADMIN_WALLET}`);
+    assert(userAdminStatus.isAdmin === true, "the user's admin wallet is an admin");
+    const testAdminStatus = await get(`/api/admin/status?wallet=${TEST_ADMIN_WALLET.address}`);
+    assert(testAdminStatus.isAdmin === true, 'the deterministic test admin wallet is an admin');
+    const plainStatus = await get(`/api/admin/status?wallet=${WALLET_A}`);
+    assert(plainStatus.isAdmin === false, 'an ordinary wallet is not an admin');
+    // Grant as non-admin (valid signature, wrong wallet) -> 403.
+    const grantTarget = makeTestWallet();
+    adminGrantTarget = grantTarget.address;
+    const adminBody = (admin, action, wallet, badge) => {
+      const message = adminMessage({ admin: admin.address, action, wallet, badge });
+      return {
+        adminWallet: admin.address,
+        ...(wallet ? { wallet } : {}),
+        ...(badge ? { badge } : {}),
+        message,
+        signature: admin.sign(message),
+      };
+    };
+    await post(
+      '/api/admin/badges/grant',
+      adminBody(otherWallet, 'grant', grantTarget.address, 'whale'),
+      403
+    );
+    console.log('  ok - non-admin grant is 403');
+    // Grant with a wrong signature -> 401; with a message for another
+    // action (revoke) -> 401.
+    const badSigGrant = adminBody(TEST_ADMIN_WALLET, 'grant', grantTarget.address, 'whale');
+    badSigGrant.signature = otherWallet.sign(badSigGrant.message);
+    await post('/api/admin/badges/grant', badSigGrant, 401);
+    const wrongActionGrant = adminBody(TEST_ADMIN_WALLET, 'revoke', grantTarget.address, 'whale');
+    await post('/api/admin/badges/grant', wrongActionGrant, 401);
+    console.log('  ok - wrong admin signature / message is 401');
+    // Invalid wallet / badge -> 400.
+    await post('/api/admin/badges/grant', adminBody(TEST_ADMIN_WALLET, 'grant', 'not-a-wallet', 'whale'), 400);
+    await post('/api/admin/badges/grant', adminBody(TEST_ADMIN_WALLET, 'grant', grantTarget.address, 'superstar'), 400);
+    console.log('  ok - invalid grant wallet / badge is 400');
+    // Grant round-trip.
+    const granted = await post(
+      '/api/admin/badges/grant',
+      adminBody(TEST_ADMIN_WALLET, 'grant', grantTarget.address, 'whale'),
+      201
+    );
+    assert(
+      granted.grant && granted.grant.wallet === grantTarget.address && granted.grant.badge === 'whale',
+      'an admin grants a badge (201)'
+    );
+    // Duplicate grant -> 409.
+    await post('/api/admin/badges/grant', adminBody(TEST_ADMIN_WALLET, 'grant', grantTarget.address, 'whale'), 409);
+    console.log('  ok - duplicate grant is 409');
+    // The granted badge appears on the profile exactly like an earned one.
+    const targetProfile = await get(`/api/creators/${grantTarget.address}`);
+    assert(
+      (targetProfile.badges || []).some((b) => b.key === 'whale'),
+      'the granted badge appears on the profile'
+    );
+    // List: non-admin 403, admin sees the grant.
+    await post('/api/admin/badges/list', adminBody(otherWallet, 'list'), 403);
+    const grantList = await post('/api/admin/badges/list', adminBody(TEST_ADMIN_WALLET, 'list'));
+    assert(
+      grantList.grants.some((g) => g.wallet === grantTarget.address && g.badge === 'whale'),
+      'the admin list shows the grant'
+    );
+    // Revoke: non-admin 403, admin 200, then the badge is gone.
+    await post('/api/admin/badges/revoke', adminBody(otherWallet, 'revoke', grantTarget.address, 'whale'), 403);
+    await post('/api/admin/badges/revoke', adminBody(TEST_ADMIN_WALLET, 'revoke', grantTarget.address, 'whale'));
+    const targetAfter = await get(`/api/creators/${grantTarget.address}`);
+    assert(
+      !(targetAfter.badges || []).some((b) => b.key === 'whale'),
+      'the revoked badge leaves the profile'
+    );
+    // Revoking again -> 404.
+    await post('/api/admin/badges/revoke', adminBody(TEST_ADMIN_WALLET, 'revoke', grantTarget.address, 'whale'), 404);
+    console.log('  ok - revoking a missing grant is 404');
+
     console.log('\nALL E2E CHECKS PASSED');
   } finally {
-    const allMints = [mint, mintUnfunded, mintPair, mintOrphan, mintDev, mintNoFees];
+    const allMints = [mint, mintUnfunded, mintPair, mintOrphan, mintDev, mintNoFees, mintDeep, mintTax, mintAdult, mintMeme, mintGrad, mintRich, mintBadges];
     const placeholders = allMints.map(() => '?').join(', ');
+    // FK-safe order: reward_claims references callouts, so claims go
+    // before callouts; everything else references coins and goes before
+    // the coins themselves.
     db.prepare(`DELETE FROM trades WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare(`DELETE FROM fee_claims WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM reward_claims WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare(`DELETE FROM callouts WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare(`DELETE FROM burns WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare(`DELETE FROM transfers WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM reward_funds WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare(`DELETE FROM coins WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare('DELETE FROM badge_grants WHERE wallet = ? OR granted_by = ?').run(
+      adminGrantTarget, TEST_ADMIN_WALLET.address
+    );
+    db.prepare('DELETE FROM contacts WHERE owner_wallet = ?').run(contactOwnerWallet);
     db.prepare('DELETE FROM follows WHERE follower_wallet = ? OR following_wallet = ?').run(
       WALLET_A, WALLET_A
     );

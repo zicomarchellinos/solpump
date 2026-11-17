@@ -25,15 +25,19 @@ const MINT_SUPPLY_RAW = 1_000_000_000_000_000n; // 1B tokens * 10^6
 const FUNDING_TOKENS = 800_000_000; // tokens the creator moves to the pool
 const FUNDING_TOKENS_RAW = 800_000_000_000_000n; // 800M tokens * 10^6
 
-// Creator fee: 1% of every trade's SOL volume accrues to the coin's
-// creator, claimable later from the pool wallet. Single constant so the
-// rate can be changed in one place. On a buy the buyer pays the full SOL
-// amount (the fee is part of what they pay); on a sell the fee is deducted
-// from what the seller receives (seller gets solAmount - fee).
+// Creator fee: a per-coin tax on every trade's pair-asset volume,
+// set by the creator at creation (0–10%, default 1% = 100 bps) and
+// never changeable afterwards (changing tax after launch would rug
+// traders). The fee accrues to the coin's creator, claimable later from
+// the pool wallet. On a buy the buyer pays the full SOL amount (the fee
+// is part of what they pay); on a sell the fee is deducted from what the
+// seller receives (seller gets solAmount - fee). CREATOR_FEE_BPS is the
+// DEFAULT rate for coins created before per-coin tax existed.
 const CREATOR_FEE_BPS = 100; // basis points: 100 = 1%
+const MAX_FEE_BPS = 1000; // 10% — the maximum tax a creator may set
 
-function creatorFeeSol(solAmount) {
-  return (solAmount * CREATOR_FEE_BPS) / 10000;
+function creatorFeeSol(solAmount, feeBps = CREATOR_FEE_BPS) {
+  return (solAmount * feeBps) / 10000;
 }
 
 const INITIAL_PRICE = VIRTUAL_SOL / VIRTUAL_TOKENS; // SOL per token
@@ -144,6 +148,19 @@ function quoteBuy(coin, solIn) {
   return (coin.token_reserve * solIn) / (coin.sol_reserve + solIn);
 }
 
+// Two-hop routed buy quote (SOL -> pair coin -> target coin). The buyer
+// pays SOL; the pool routes it through the pair coin's curve (leg 1) and
+// the resulting pair tokens through the target coin's curve (leg 2).
+// Returns the pair tokens produced by leg 1 and the target tokens
+// produced by leg 2. Fees do NOT reduce the routed amounts — exactly as
+// on a direct buy, the buyer pays the full amount (fee included) and each
+// leg's creator fee accrues from its leg volume. Pure math, no DB.
+function quoteRoutedBuy(pairRow, targetRow, solIn) {
+  const pairOut = quoteBuy(pairRow, solIn);
+  const tokenOut = quoteBuy(targetRow, pairOut);
+  return { pairOut, tokenOut };
+}
+
 function quoteSell(coin, tokenIn) {
   return (coin.sol_reserve * tokenIn) / (coin.token_reserve + tokenIn);
 }
@@ -158,6 +175,20 @@ function quoteBuySolForTokens(coin, tokenOut) {
 function quoteSellTokensForSol(coin, solOut) {
   if (solOut >= coin.sol_reserve) return Infinity;
   return (coin.token_reserve * solOut) / (coin.sol_reserve - solOut);
+}
+
+// The pool's actual pair-asset holdings attributable to one registered
+// coin. Derivation: the pool receives the full buy amount (the 1% creator
+// fee is part of what the buyer pays) and pays out sells net of fee, so
+//   poolAsset = (sol_reserve - VIRTUAL_SOL) + unclaimedFees - buyFees
+// Buy fees sit inside BOTH the reserve and the unclaimed balance —
+// subtracting them once removes the double count; sell fees only sit in
+// the unclaimed balance. Claims, buybacks, burns and funding all keep
+// this relation exact. Used by re-register curve reconstruction
+// (src/routes.js) to attribute the pool's shared asset balance across
+// coins after a database wipe.
+function poolAttribution({ solReserve, unclaimedFees, buyFees }) {
+  return (solReserve - VIRTUAL_SOL) + (unclaimedFees || 0) - (buyFees || 0);
 }
 
 // Market stats derived from the trade history. `trades` must be in
@@ -309,7 +340,9 @@ module.exports = {
   FUNDING_TOKENS,
   FUNDING_TOKENS_RAW,
   CREATOR_FEE_BPS,
+  MAX_FEE_BPS,
   creatorFeeSol,
+  poolAttribution,
   INITIAL_PRICE,
   currentPrice,
   circulatingSupply,
@@ -321,6 +354,7 @@ module.exports = {
   buildCandles,
   curveProgressPct,
   quoteBuy,
+  quoteRoutedBuy,
   quoteSell,
   quoteBuySolForTokens,
   quoteSellTokensForSol,

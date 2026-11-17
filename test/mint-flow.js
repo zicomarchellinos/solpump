@@ -14,6 +14,8 @@
 //      recipient ATA (created when missing), and pair-asset TransferChecked
 //      from the buyer's pair ATA to the pool's pair ATA
 //   7. friendlyError message mapping
+//   8. buildSolTransferTransaction (reward funding): a single
+//      SystemProgram.transfer with the exact lamports, payer, recipient
 // Nothing here signs or sends a real transaction. The Phantom signature
 // step itself cannot be exercised here (no wallet extension).
 // Run with:
@@ -118,6 +120,7 @@ async function main() {
     buildBurnTransaction,
     buildTransferTransaction,
     buildPairBuyTransaction,
+    buildSolTransferTransaction,
     simulateTransaction,
     friendlyError,
   } = client;
@@ -327,6 +330,33 @@ async function main() {
     /Devnet/.test(friendlyError(new Error('Blockhash not found'))),
     'blockhash failure also hints at the Devnet network check'
   );
+
+  // ---------- 8. SOL transfer construction (reward funding) ----------
+  console.log('SOL transfer construction:');
+  const solFundPayer = Keypair.generate().publicKey;
+  const solFundRecipient = Keypair.generate().publicKey;
+  const { transaction: solFundTx } = await buildSolTransferTransaction(
+    solFundPayer,
+    solFundRecipient.toBase58(),
+    0.5
+  );
+  assert(solFundTx.instructions.length === 1, 'reward funding tx has exactly one instruction');
+  const solFundIx = solFundTx.instructions[0];
+  assert(
+    solFundIx.programId.equals(solanaWeb3.SystemProgram.programId),
+    'reward funding tx is a SystemProgram transfer'
+  );
+  assert(
+    solFundIx.keys[0].pubkey.equals(solFundPayer) && solFundIx.keys[1].pubkey.equals(solFundRecipient),
+    'reward funding transfer goes from the payer to the recipient'
+  );
+  // SystemProgram.transfer data: u32 instruction index (2) + u64 lamports.
+  const solFundLamports = solFundIx.data.readBigUInt64LE(4);
+  assert(
+    solFundLamports === BigInt(0.5 * LAMPORTS_PER_SOL),
+    `reward funding transfer moves exactly 0.5 SOL (${solFundLamports} lamports)`
+  );
+  assert(solFundTx.feePayer.equals(solFundPayer), 'the funder pays the fee');
 
   console.log('\nALL MINT-FLOW CHECKS PASSED');
 }

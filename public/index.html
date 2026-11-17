@@ -10,10 +10,11 @@
 </head>
 <body>
   <!-- App shell ala pump.fun: sidebar kiri (desktop) + kolom utama dengan
-       header atas. Di layar kecil, sidebar berubah jadi baris atas. -->
-  <div class="app-shell">
-    <aside class="sidebar">
-      <a class="brand" href="#/"><span class="brand-mark">S</span>sol<span>pump</span></a>
+       header atas. Di layar kecil, sidebar jadi drawer overlay yang dibuka
+       dengan tombol di header. -->
+  <div class="app-shell" id="appShell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#/"><span class="brand-mark">S</span><span class="brand-text">sol<span>pump</span></span></a>
       <nav class="nav">
         <a href="#/" data-nav="feed"><span class="nav-ic">⌂</span><span class="nav-label" data-i18n="navHome">Beranda</span></a>
         <a href="#/create" data-nav="create"><span class="nav-ic">+</span><span class="nav-label" data-i18n="navCreate">Buat Coin</span></a>
@@ -25,9 +26,12 @@
         <p class="small"><a href="https://faucet.solana.com" target="_blank" rel="noopener" data-i18n="sidebarFaucet">Ambil SOL devnet gratis ↗</a></p>
       </div>
     </aside>
+    <div class="sidebar-scrim" id="sidebarScrim" hidden></div>
 
     <div class="main-col">
       <header class="topbar">
+        <button class="btn btn-sm sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">«</button>
+        <a class="brand topbar-brand" href="#/"><span class="brand-mark">S</span><span class="brand-text">sol<span>pump</span></span></a>
         <div class="topbar-spacer"></div>
         <div class="lang-switcher" id="langBox" role="group" aria-label="Language"></div>
         <div class="wallet-box" id="walletBox">

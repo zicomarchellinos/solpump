@@ -3,7 +3,8 @@
     "@solana/spl-token": "^0.4.13",
     "@solana/web3.js": "^1.98.0",
     "better-sqlite3": "^11.10.0",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "ws": "^7.5.14"
   },
   "description": "solpump — pembuat coin ala pump.fun di Solana devnet: minting SPL asli lewat Phantom, trading devnet asli lewat dompet pool dengan pelacakan PnL. Single-service Node + Express + SQLite app.",
   "engines": {

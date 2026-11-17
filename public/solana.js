@@ -407,6 +407,26 @@ async function buildBuyTransaction(payerPubkey, mintAddress, poolAddress, solAmo
   return { transaction: tx };
 }
 
+// Plain SOL transfer (payer -> recipient). Used for creator reward-pool
+// deposits to the pool wallet; the server verifies the exact lamports
+// on-chain before recording the deposit.
+async function buildSolTransferTransaction(payerPubkey, recipientAddress, solAmount) {
+  const payer = new solanaWeb3.PublicKey(payerPubkey);
+  const recipient = new solanaWeb3.PublicKey(recipientAddress);
+
+  const tx = new solanaWeb3.Transaction();
+  tx.add(
+    solanaWeb3.SystemProgram.transfer({
+      fromPubkey: payer,
+      toPubkey: recipient,
+      lamports: Math.round(solAmount * solanaWeb3.LAMPORTS_PER_SOL),
+    })
+  );
+  tx.feePayer = payer;
+  tx.recentBlockhash = (await getConnection().getLatestBlockhash()).blockhash;
+  return { transaction: tx };
+}
+
 // Sell: transfer tokens (user ATA -> pool ATA).
 async function buildSellTransaction(payerPubkey, mintAddress, poolAddress, tokenAmount) {
   const connection = getConnection();

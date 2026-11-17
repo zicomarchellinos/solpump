@@ -1,13 +1,17 @@
 'use strict';
-// solpump — single-service app: Express API + static frontend + SQLite.
+// solpump — single-service app: Express API + static frontend + SQLite +
+// WebSocket livestream signaling (src/stream.js).
 // Listens on PORT (Render sets it) or 3000 locally.
 
 const path = require('path');
+const http = require('http');
 const express = require('express');
+const WebSocket = require('ws');
 
 // Initialize the database (creates data/solpump.db + schema on startup).
 require('./src/db');
 const api = require('./src/routes');
+const { attachStreamServer } = require('./src/stream');
 
 const app = express();
 // Behind Render's proxy; lets req.ip be the real client IP.
@@ -49,6 +53,30 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: err.message || 'Terjadi kesalahan.' });
 });
 
-app.listen(PORT, () => {
+const server = http.createServer(app);
+
+// Livestream signaling (WebRTC mesh): only /ws/stream upgrades to a
+// WebSocket; anything else is rejected. maxPayload caps signaling
+// messages (SDP blobs are a few KB; chat is tiny) so a client cannot
+// flood the server with huge frames.
+const wss = new WebSocket.Server({ noServer: true, maxPayload: 256 * 1024 });
+attachStreamServer(wss);
+server.on('upgrade', (req, socket, head) => {
+  let pathname = null;
+  try {
+    pathname = new URL(req.url, 'http://localhost').pathname;
+  } catch {
+    pathname = null;
+  }
+  if (pathname !== '/ws/stream') {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+server.listen(PORT, () => {
   console.log(`solpump listening on port ${PORT}`);
 });

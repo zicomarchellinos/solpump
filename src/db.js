@@ -170,6 +170,79 @@ db.exec(`
     cover_url TEXT,
     updated_at INTEGER NOT NULL
   );
+
+  -- Callout rewards: the creator funds a per-coin SOL reward pool with
+  -- real devnet SOL sent to the pool wallet (verified on-chain before
+  -- recording). tx_signature is unique: one funding transaction can only
+  -- be recorded once. The pool balance for a coin is SUM(funds) -
+  -- SUM(claims); it is a separate per-coin SOL ledger, independent of the
+  -- coin's pair (SOL-paired and coin-paired coins both pay rewards in
+  -- SOL). The SOL itself sits in the pool wallet alongside trading SOL —
+  -- the ledgers are DB-side, so re-register reconstruction subtracts
+  -- other coins' reward pools from the pool's SOL balance (see
+  -- src/routes.js reconstructAssetReserve).
+  CREATE TABLE IF NOT EXISTS reward_funds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+    funder_wallet TEXT NOT NULL,
+    amount_sol REAL NOT NULL,
+    tx_signature TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_reward_funds_mint ON reward_funds (mint_address, created_at);
+
+  -- Reward claims: a callout author claims a tier (+10% / +25% / +50%
+  -- live PnL -> 0.01 / 0.025 / 0.05 SOL) once per callout per tier.
+  -- UNIQUE(callout_id, tier) enforces the once-per-tier rule; the payout
+  -- is a real SOL transfer from the pool wallet (tx_signature is the
+  -- pool's payout transaction).
+  CREATE TABLE IF NOT EXISTS reward_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    callout_id INTEGER NOT NULL REFERENCES callouts(id),
+    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+    wallet TEXT NOT NULL,
+    tier INTEGER NOT NULL,
+    amount_sol REAL NOT NULL,
+    tx_signature TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (callout_id, tier)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_reward_claims_mint ON reward_claims (mint_address, created_at);
+  CREATE INDEX IF NOT EXISTS idx_reward_claims_callout ON reward_claims (callout_id);
+
+  -- Contacts: a per-wallet address book for transfers. One row per
+  -- (owner, contact wallet) pair — an owner cannot save the same wallet
+  -- twice. Writes are signature-proven (see src/signverify.js); reads
+  -- are public (a wallet's contacts are its own address book, and the
+  -- owner address is public on-chain anyway).
+  CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_wallet TEXT NOT NULL,
+    name TEXT NOT NULL,
+    contact_wallet TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (owner_wallet, contact_wallet)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts (owner_wallet, name);
+
+  -- Manual community-badge grants by admins (see ADMIN_WALLETS):
+  -- one row per (wallet, badge). Grants display on profiles exactly like
+  -- earned badges (badges.js merges them, de-duplicated); revoking
+  -- deletes the row, which un-grants the badge unless it was also earned.
+  CREATE TABLE IF NOT EXISTS badge_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT NOT NULL,
+    badge TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (wallet, badge)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_badge_grants_wallet ON badge_grants (wallet);
 `);
 
 // Lightweight migrations for databases created before these columns existed.
@@ -216,6 +289,27 @@ if (!hasColumn('burns', 'source')) {
 // unclaimed balance; the kind only distinguishes them in history.
 if (!hasColumn('fee_claims', 'kind')) {
   db.exec("ALTER TABLE fee_claims ADD COLUMN kind TEXT NOT NULL DEFAULT 'claim'");
+}
+// Coin categories (fixed list, see src/routes.js COIN_CATEGORIES):
+// pre-existing coins become 'Lainnya'.
+if (!hasColumn('coins', 'category')) {
+  db.exec("ALTER TABLE coins ADD COLUMN category TEXT NOT NULL DEFAULT 'Lainnya'");
+}
+// Per-coin creator tax in basis points (0–1000, default 100 = 1%):
+// set at creation, never changeable afterwards.
+if (!hasColumn('coins', 'fee_bps')) {
+  db.exec('ALTER TABLE coins ADD COLUMN fee_bps INTEGER NOT NULL DEFAULT 100');
+}
+// 18+ flag: the creator marks adult-content coins at creation; the UI
+// blurs their cards and gates their detail page behind an age check.
+if (!hasColumn('coins', 'is_adult')) {
+  db.exec('ALTER TABLE coins ADD COLUMN is_adult INTEGER NOT NULL DEFAULT 0');
+}
+// Transfer receipt: the USD value of the transferred tokens, snapshotted
+// at transfer time (NULL when no USD price was available then — the
+// receipt then shows the token amount only).
+if (!hasColumn('transfers', 'usd_value')) {
+  db.exec('ALTER TABLE transfers ADD COLUMN usd_value REAL');
 }
 // Replay protection: one user transaction can only settle one trade.
 db.exec(

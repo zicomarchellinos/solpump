@@ -2,11 +2,15 @@
 // UI smoke test: loads the real frontend in jsdom against a running server,
 // walks the feed -> coin detail -> creator profile -> portfolio -> create
 // views and asserts the key elements render. Requires the server running
-// (default http://localhost:3100). Seeds one test coin + trades + a callout
-// directly in the local DB, then removes all test data. Also unit-checks
-// the price formatters: plain decimals everywhere, never scientific
-// notation — SOL prices, USD prices ($0.000005), USD money ($12.35) and
-// the $K/$M/$B market-cap suffixes. Run with:
+// (default http://localhost:3100) with SOL_USD_PRICE=100 and ADMIN_WALLETS
+// including the deterministic test admin (see test/e2e.js header). Seeds
+// one test coin + trades + a callout directly in the local DB, plus a
+// graduated coin (verified creator), an 18+ Meme coin, a coin paired with
+// the smoke coin, a deep-chain coin, a reward fund, a transfer (receipt),
+// and a contact — then removes all test data. Also unit-checks the price
+// formatters: plain decimals everywhere, never scientific notation — SOL
+// prices, USD prices ($0.000005), USD money ($12.35) and the $K/$M/$B
+// market-cap suffixes. Run with:
 //   node test/ui-smoke.js [baseUrl]
 
 const path = require('path');
@@ -18,6 +22,10 @@ const { profileMessage: serverProfileMessage, sha256Hex: serverSha256Hex } = req
 
 const BASE = process.argv[2] || process.env.BASE_URL || 'http://localhost:3100';
 const WALLET_A = 'HyevJPsT3Yf5MTWMph4LaArUqtKS27ScfHF5Cqim6eek';
+// Deterministic test admin wallet (seed 'solpump-test-admin-v1' — the
+// same keypair test/e2e.js signs admin requests with). The test server
+// must run with ADMIN_WALLETS including this address.
+const TEST_ADMIN_ADDRESS = 'Hnp1qA4W7sgNsBPuHQRyeG5Gff6CAAguH3rQXJRYJGU';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAILED: ${msg}`);
@@ -73,10 +81,70 @@ async function main() {
     `INSERT INTO profiles (wallet, username, avatar_url, border, cover_url, updated_at)
      VALUES (?, 'smokecat', '/uploads/smoke-avatar.png', 'gold', '/uploads/smoke-cover.png', ?)`
   ).run(WALLET_A, now);
+  // Extra coins for the 14-job push, all created BEFORE the smoke coin
+  // (now - 120000) so SMOKE stays the newest card in the feed and keeps
+  // its place in the trending strip. All by WALLET_A (the creator
+  // profile assertions are contains-checks, not counts).
+  const mintAdult = Keypair.generate().publicKey.toBase58();
+  const mintPair = Keypair.generate().publicKey.toBase58();
+  const mintDeep = Keypair.generate().publicKey.toBase58();
+  const mintGrad = Keypair.generate().publicKey.toBase58();
+  const insertExtraCoin = db.prepare(
+    `INSERT INTO coins
+       (mint_address, name, ticker, description, logo_url, creator_wallet, tx_signature,
+        sol_reserve, token_reserve, trading_enabled, funding_tx_signature, pair_mint, category, is_adult, created_at)
+     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`
+  );
+  // 18+ Meme coin, fresh curve (market cap below SMOKE's).
+  insertExtraCoin.run(
+    mintAdult, 'Adult Owl', 'AOWL', '18+ Meme test coin', WALLET_A,
+    'g'.repeat(88), 55, 800000000, 'h'.repeat(88), null, 'Meme', 1, now - 120000
+  );
+  // Coin paired with SMOKE (routed SOL buys) + a deep-chain coin paired
+  // with it (SOL option disabled).
+  insertExtraCoin.run(
+    mintPair, 'Pair Dog', 'PDOG', 'Coin paired with SMOKE', WALLET_A,
+    'i'.repeat(88), 55, 800000000, 'j'.repeat(88), mint, 'Lainnya', 0, now - 120000
+  );
+  insertExtraCoin.run(
+    mintDeep, 'Deep Chain Cat', 'DCCAT', 'Coin paired with PDOG', WALLET_A,
+    'k'.repeat(88), 55, 800000000, 'l'.repeat(88), mintPair, 'Lainnya', 0, now - 120000
+  );
+  // Graduated coin (140 SOL raised) — makes WALLET_A a verified creator.
+  insertExtraCoin.run(
+    mintGrad, 'Graduated Goat', 'GGOAT', 'Graduated test coin', WALLET_A,
+    'm'.repeat(88), 140, (800000000 * 55) / 140, 'n'.repeat(88), null, 'Lainnya', 0, now - 120000
+  );
+  // A second callout on SMOKE at +50% live PnL (entry = current price
+  // / 1.5) so all three reward tiers are eligible.
+  db.prepare(
+    `INSERT INTO callouts (mint_address, wallet, text, entry_price, holdings_at_post, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(mint, WALLET_A, 'SMOKE sudah naik 50%, klaim reward!', smokePrice / 1.5, tok1 + tok2, now - 4000);
+  // A reward fund on SMOKE (0.5 SOL) for the reward card.
+  db.prepare(
+    `INSERT INTO reward_funds (mint_address, funder_wallet, amount_sol, tx_signature, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(mint, WALLET_A, 0.5, 'p'.repeat(88), now - 3000);
+  // A transfer on SMOKE (1M tokens, $12.50 snapshot) for the receipt page
+  // + the portfolio receipt link.
+  const transferId = db
+    .prepare(
+      `INSERT INTO transfers (mint_address, from_wallet, to_wallet, amount, tx_signature, usd_value, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(mint, WALLET_A, 'J6uK6XxHL2T2bg8CefLKYTSCwpMeBmTG7Pa9K8NYWSvb', 1000000, 's'.repeat(88), 12.5, now - 2000)
+    .lastInsertRowid;
+  // A contact for the transfer-form picker + portfolio contacts section.
+  db.prepare(
+    `INSERT INTO contacts (owner_wallet, name, contact_wallet, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(WALLET_A, 'Budi', 'J6uK6XxHL2T2bg8CefLKYTSCwpMeBmTG7Pa9K8NYWSvb', now - 1000, now - 1000);
   console.log('seeded smoke coin', mint);
 
   let dom;
   let dom2;
+  let dom3;
   try {
     dom = await JSDOM.fromURL(`${BASE}/`, {
       resources: 'usable',
@@ -307,6 +375,132 @@ async function main() {
       'language choice persists in localStorage (id)'
     );
 
+    // Categories: filter pills (Semua + 9) + the category badge on cards.
+    assert(
+      document.querySelectorAll('[data-category]').length === 10,
+      'category filter has Semua + 9 category pills'
+    );
+    assert(
+      document.querySelector('[data-category="Meme"]'),
+      'Meme category pill renders'
+    );
+    assert(
+      document.querySelector('.coin-card .badge-category'),
+      'coin card shows the category badge'
+    );
+    assert(
+      document.querySelector('.coin-card .badge-category').textContent.includes('Lainnya'),
+      'the SMOKE card shows the Lainnya category badge'
+    );
+    // The Meme filter shows only the Meme coin; Semua restores the feed.
+    document.querySelector('[data-category="Meme"]').click();
+    await waitFor(
+      () =>
+        document.querySelectorAll('.coin-card').length === 1 &&
+        document.querySelector('.coin-card').textContent.includes('AOWL'),
+      15000,
+      'Meme filter shows only the Meme coin'
+    );
+    assert(true, 'category filter narrows the feed to the Meme coin');
+    document.querySelector('[data-category=""]').click();
+    await waitFor(
+      () => document.querySelectorAll('.coin-card').length === 5,
+      15000,
+      'Semua restores all 5 coins'
+    );
+    assert(true, 'Semua filter restores the full feed');
+
+    // 18+: the adult coin's card is blurred with a veil button; the age
+    // confirmation modal unblurs it (one-time, persisted).
+    const adultCard = [...document.querySelectorAll('.coin-card')].find((c) =>
+      c.textContent.includes('AOWL')
+    );
+    assert(adultCard, 'the 18+ coin card renders in the feed');
+    assert(
+      adultCard.classList.contains('adult-blurred'),
+      'the 18+ coin card is blurred before confirmation'
+    );
+    assert(
+      adultCard.querySelector('.badge-adult'),
+      'the 18+ coin card shows the 18+ badge'
+    );
+    assert(adultCard.querySelector('.adult-veil'), 'the 18+ card has a click-to-reveal veil');
+    adultCard.querySelector('.adult-veil button, .adult-veil').click();
+    await waitFor(() => document.querySelector('.modal-overlay'), 15000, 'age confirmation modal');
+    assert(
+      document.querySelector('.modal-overlay').textContent.includes('18+'),
+      'age confirmation modal asks about 18+ content'
+    );
+    const confirmBtn = [...document.querySelectorAll('.modal-overlay button')].find((b) =>
+      b.textContent.includes('Saya 18+')
+    );
+    assert(confirmBtn, 'age confirmation modal has a confirm button');
+    confirmBtn.click();
+    await waitFor(
+      () => !document.querySelector('.coin-card.adult-blurred'),
+      15000,
+      'the 18+ card unblurs after confirmation'
+    );
+    assert(
+      window.localStorage.getItem('solpump-age-confirmed') === 'yes',
+      'age confirmation persists in localStorage'
+    );
+    // The 18+ toggle hides adult coins; clicking again shows them.
+    document.querySelector('#adultToggle').click();
+    await waitFor(
+      () => ![...document.querySelectorAll('.coin-card')].some((c) => c.textContent.includes('AOWL')),
+      15000,
+      'the 18+ toggle hides the adult coin'
+    );
+    assert(true, 'the 18+ toggle hides adult coins');
+    document.querySelector('#adultToggle').click();
+    await waitFor(
+      () => [...document.querySelectorAll('.coin-card')].some((c) => c.textContent.includes('AOWL')),
+      15000,
+      'the 18+ toggle shows the adult coin again'
+    );
+    assert(true, 'the 18+ toggle shows adult coins again');
+
+    // Verified creator (WALLET_A graduated a coin): the checkmark shows
+    // on the SMOKE card next to the creator name, with community badges.
+    assert(
+      document.querySelector('.coin-card .verified-badge'),
+      'the coin card shows the verified checkmark for the creator'
+    );
+    assert(
+      document.querySelector('.coin-card .badges'),
+      'the coin card shows community badges next to the creator'
+    );
+    // No admin link without a wallet (and no admin wallet connected).
+    assert(
+      !document.querySelector('[data-nav="admin"]'),
+      'no Admin nav link without a connected wallet'
+    );
+
+    // Collapsible sidebar: the toggle renders, collapses to the rail,
+    // re-expands, and persists the state in localStorage.
+    const appShell = document.getElementById('appShell');
+    assert(document.querySelector('#sidebarToggle'), 'sidebar toggle button renders');
+    assert(!appShell.classList.contains('sidebar-collapsed'), 'sidebar starts expanded');
+    document.querySelector('#sidebarToggle').click();
+    assert(
+      appShell.classList.contains('sidebar-collapsed'),
+      'clicking the toggle collapses the sidebar'
+    );
+    assert(
+      window.localStorage.getItem('solpump-sidebar-collapsed') === '1',
+      'collapsed state persists in localStorage'
+    );
+    document.querySelector('#sidebarToggle').click();
+    assert(
+      !appShell.classList.contains('sidebar-collapsed'),
+      'clicking the toggle again re-expands the sidebar'
+    );
+    assert(
+      window.localStorage.getItem('solpump-sidebar-collapsed') === '0',
+      'expanded state persists in localStorage'
+    );
+
     // Coin detail: chart, stats, trade panel, PnL prompt, trades table.
     window.location.hash = `#/coin/${mint}`;
     window.dispatchEvent(new window.HashChangeEvent('hashchange'));
@@ -496,6 +690,56 @@ async function main() {
       calloutAvatar && calloutAvatar.classList.contains('avatar-ring-gold'),
       'callout avatar carries the gold border ring'
     );
+    // Livestream panel: not-live state + the mesh-limit note.
+    assert(document.querySelector('#streamCard'), 'livestream panel renders on the coin detail');
+    assert(
+      document.querySelector('#streamCard').textContent.includes('Livestream'),
+      'stream panel carries its title'
+    );
+    assert(
+      document.querySelector('#streamCard').textContent.includes('tidak live'),
+      'stream panel shows the not-live state'
+    );
+    assert(
+      document.querySelector('#streamCard').textContent.includes('WebRTC'),
+      'stream panel states the WebRTC mesh limit'
+    );
+    // Callout rewards: the pool card (0.5 SOL funded) + tier chips on
+    // the +50% callout (all three tiers eligible).
+    assert(document.querySelector('#rewardCard'), 'reward card renders on the coin detail');
+    assert(
+      document.querySelector('#rewardCard').textContent.includes('Reward Callout'),
+      'reward card carries its title'
+    );
+    assert(
+      document.querySelector('#rewardCard').textContent.includes('0,5'),
+      'reward card shows the 0.5 SOL pool balance'
+    );
+    assert(
+      document.querySelectorAll('#calloutsCard .reward-chip').length >= 3,
+      'the callouts show reward tier chips'
+    );
+    assert(
+      document.querySelectorAll('#calloutsCard .reward-chip.eligible').length >= 3,
+      'the +50% callout has all three tiers eligible'
+    );
+    // Tax + category badges and the verified creator checkmark on detail.
+    assert(
+      document.querySelector('.badge-tax'),
+      'detail shows the creator tax badge'
+    );
+    assert(
+      document.querySelector('.badge-tax').textContent.includes('1%'),
+      'the tax badge shows the default 1%'
+    );
+    assert(
+      document.querySelector('.badge-category'),
+      'detail shows the category badge'
+    );
+    assert(
+      document.querySelector('.verified-badge'),
+      'detail shows the verified checkmark next to the creator'
+    );
 
     // Portfolio (no wallet connected): connect prompt renders.
     window.location.hash = '#/portfolio';
@@ -523,6 +767,24 @@ async function main() {
       document.body.textContent.includes('SMOKE masih awal, gas!'),
       'creator profile lists their callout'
     );
+    // Verified checkmark + badge shelf (Creator at minimum — WALLET_A
+    // created coins; the verified rule is shown in the UI).
+    assert(
+      document.querySelector('.verified-badge'),
+      'creator profile shows the verified checkmark'
+    );
+    assert(
+      document.querySelector('.badge-shelf'),
+      'creator profile shows the badge shelf'
+    );
+    assert(
+      document.querySelector('.badge-shelf').textContent.includes('Kreator'),
+      'badge shelf includes the Creator badge'
+    );
+    assert(
+      document.body.textContent.includes('market cap $100K'),
+      'creator profile shows the verified rule'
+    );
 
     // Create view: form renders with Phantom guidance (no extension here).
     window.location.hash = '#/create';
@@ -547,6 +809,31 @@ async function main() {
     assert(
       document.body.textContent.includes('Phantom harus di jaringan Devnet'),
       'create form reminds that Phantom must be on Devnet'
+    );
+    // Category + tax + 18+ pickers on the create form; GIF logos accepted.
+    assert(document.querySelector('#coinCategory'), 'create form has a category select');
+    assert(
+      document.querySelectorAll('#coinCategory option').length === 9,
+      'category select offers all 9 categories'
+    );
+    assert(document.querySelector('#coinTax'), 'create form has a creator tax select');
+    assert(
+      document.querySelector('#coinTax').value === '100',
+      'creator tax defaults to 1% (100 bps)'
+    );
+    assert(document.querySelector('#coinAdult'), 'create form has the 18+ checkbox');
+    assert(
+      document.querySelector('#coinLogo').getAttribute('accept').includes('image/gif'),
+      'logo upload accepts GIF (including animated)'
+    );
+    assert(
+      document.querySelector('#createPreview').textContent.includes('Pajak kreator'),
+      'preview shows the creator tax note'
+    );
+    // Re-register link on the create page.
+    assert(
+      document.querySelector('a[href="#/re-register"]'),
+      'create page links to the re-register form'
     );
     // Pair picker: SOL (default) + a searchable list of listed site coins.
     assert(document.querySelector('#pairPicker'), 'pair picker renders on the create form');
@@ -582,6 +869,43 @@ async function main() {
       'pair search finds the coin again'
     );
     assert(true, 'pair search finds the coin by ticker');
+
+    // Re-register view (no wallet): connect-first prompt.
+    window.location.hash = '#/re-register';
+    window.dispatchEvent(new window.HashChangeEvent('hashchange'));
+    await waitFor(
+      () => document.body.textContent.includes('Daftar Ulang Coin'),
+      15000,
+      're-register view'
+    );
+    assert(
+      document.body.textContent.includes('Hubungkan dompet'),
+      're-register asks to connect the creator wallet first'
+    );
+
+    // Receipt page: the seeded transfer renders as a receipt.
+    window.location.hash = `#/receipt/${transferId}`;
+    window.dispatchEvent(new window.HashChangeEvent('hashchange'));
+    await waitFor(() => document.querySelector('.receipt'), 15000, 'receipt page');
+    assert(
+      document.body.textContent.includes('Struk Transfer'),
+      'receipt page carries its title'
+    );
+    assert(
+      document.querySelector('.receipt').textContent.includes('1.000.000'),
+      'receipt shows the token amount'
+    );
+    assert(
+      document.querySelector('.receipt').textContent.includes('$12.50'),
+      'receipt shows the USD value snapshot'
+    );
+    assert(
+      document.querySelector('.receipt a[href*="explorer.solana.com/tx/"]'),
+      'receipt links the tx signature to Explorer'
+    );
+    assert(document.querySelector('#receiptCopyBtn'), 'receipt has a copy button');
+    assert(document.querySelector('#receiptShareBtn'), 'receipt has a share button');
+    assert(document.querySelector('#receiptPrintBtn'), 'receipt has a print button');
 
     // Creator profile (no wallet connected): username, photo avatar with
     // ring, cover banner — and NO edit form for a non-owner.
@@ -667,9 +991,26 @@ async function main() {
     );
     assert(doc2.querySelector('#transferHistory'), 'portfolio shows the transfer history card');
     assert(
-      doc2.querySelector('#transferHistory').textContent.includes('Belum ada transfer'),
-      'transfer history shows the empty state'
+      doc2.querySelector('#transferHistory').textContent.includes('1.000.000'),
+      'transfer history shows the seeded transfer'
     );
+    assert(
+      doc2.querySelector(`#transferHistory a[href="#/receipt/${transferId}"]`),
+      'transfer history links each row to its receipt'
+    );
+    // Contacts section: the seeded contact + the add form.
+    assert(doc2.querySelector('#contactsList'), 'portfolio shows the contacts section');
+    await waitFor(
+      () => doc2.querySelector('#contactsList').textContent.includes('Budi'),
+      15000,
+      'contacts list loads the seeded contact'
+    );
+    assert(
+      doc2.querySelector('#contactsList').textContent.includes('Budi'),
+      'contacts list shows the seeded contact'
+    );
+    assert(doc2.querySelector('#newContactName'), 'contacts section has a name input');
+    assert(doc2.querySelector('#addContactBtn'), 'contacts section has an add button');
     // Clicking Kirim opens the transfer card for that coin.
     doc2.querySelector('[data-transfer="' + mint + '"]').click();
     await waitFor(
@@ -680,6 +1021,44 @@ async function main() {
     assert(
       doc2.querySelector('#pfTransferTo') && doc2.querySelector('#pfTransferAmount'),
       'portfolio transfer card has recipient + amount inputs'
+    );
+    // Contact picker: the seeded contact is offered; picking it fills
+    // the recipient input.
+    await waitFor(
+      () =>
+        !doc2.querySelector('#pfTransferContact').hidden &&
+        [...doc2.querySelector('#pfTransferContact').options].some((o) => o.textContent.includes('Budi')),
+      15000,
+      'contact picker loads the seeded contact'
+    );
+    assert(true, 'transfer form offers the contact picker');
+    const picker = doc2.querySelector('#pfTransferContact');
+    picker.value = 'J6uK6XxHL2T2bg8CefLKYTSCwpMeBmTG7Pa9K8NYWSvb';
+    picker.dispatchEvent(new win2.Event('change', { bubbles: true }));
+    assert(
+      doc2.querySelector('#pfTransferTo').value === 'J6uK6XxHL2T2bg8CefLKYTSCwpMeBmTG7Pa9K8NYWSvb',
+      'picking a contact fills the recipient address'
+    );
+    // No Admin link for a non-admin wallet.
+    assert(
+      !doc2.querySelector('[data-nav="admin"]'),
+      'no Admin nav link for a non-admin wallet'
+    );
+
+    // Re-register view (connected): the full form renders.
+    win2.location.hash = '#/re-register';
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(() => doc2.querySelector('#rrMint'), 15000, 're-register form');
+    assert(doc2.querySelector('#rrName'), 're-register form has a name input');
+    assert(doc2.querySelector('#rrTicker'), 're-register form has a ticker input');
+    assert(doc2.querySelector('#rrPair'), 're-register form has a pair select');
+    assert(doc2.querySelector('#rrCategory'), 're-register form has a category select');
+    assert(doc2.querySelector('#rrTax'), 're-register form has a tax select');
+    assert(doc2.querySelector('#rrAdult'), 're-register form has the 18+ checkbox');
+    assert(doc2.querySelector('#rrSubmitBtn'), 're-register form has a submit button');
+    assert(
+      doc2.body.textContent.includes('mulai dari nol'),
+      're-register states the fresh-history caveat'
     );
 
     // Own profile (owner wallet): edit button + edit form prefilled with
@@ -776,15 +1155,132 @@ async function main() {
       doc2.querySelector('#devBurnCalc').textContent.includes('Kenaikan Harga'),
       'dev burn calculation shows the price gain row'
     );
+    // Creator-only reward funding + the author's claim buttons on the
+    // +50% callout (WALLET_A is both creator and callout author).
+    assert(
+      doc2.querySelector('#rewardFundAmount'),
+      'reward fund form renders for the coin creator'
+    );
+    assert(
+      doc2.querySelectorAll('#calloutsCard [data-claim-reward]').length >= 3,
+      'the callout author sees claim buttons for the three eligible tiers'
+    );
+    // Livestream: the creator sees the Go Live button.
+    assert(
+      doc2.querySelector('#streamStartBtn'),
+      'the coin creator sees the Go Live button'
+    );
+    assert(
+      doc2.querySelector('#streamCard').textContent.includes('WebRTC'),
+      'the stream panel states the mesh limit for the creator too'
+    );
+
+    // Routed SOL buys: on the pair coin, the buy form offers SOL
+    // (default) or the pair asset; on the deep-chain coin the SOL
+    // option is disabled with the reason.
+    win2.location.hash = `#/coin/${mintPair}`;
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(
+      () =>
+        doc2.querySelector('.coin-head')?.textContent.includes('PDOG') &&
+        doc2.querySelector('.pay-choice'),
+      15000,
+      'pay-choice radios on the pair coin'
+    );
+    assert(
+      doc2.querySelectorAll('.pay-choice input[type="radio"]').length === 2,
+      'the pair coin buy form offers two payment options (SOL + pair asset)'
+    );
+    assert(
+      doc2.querySelector('.pay-choice input[value="sol"]').checked,
+      'SOL is the default payment option'
+    );
+    assert(
+      doc2.querySelector('.pay-choice').textContent.includes('SMOKE'),
+      'the pair-asset option names the pair coin'
+    );
+    win2.location.hash = `#/coin/${mintDeep}`;
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(
+      () =>
+        doc2.querySelector('.coin-head')?.textContent.includes('DCCAT') &&
+        doc2.querySelector('.pay-choice'),
+      15000,
+      'pay-choice radios on the deep-chain coin'
+    );
+    assert(
+      doc2.querySelector('.pay-choice input[value="sol"]').disabled,
+      'the SOL option is disabled for the deep-chain coin'
+    );
+    assert(
+      doc2.querySelector('.trade-box').textContent.includes('lebih dari satu hop'),
+      'the deep-chain coin explains why SOL is unavailable'
+    );
+
+    // ---- Admin wallet (third page, test admin pre-seeded in
+    // localStorage + collapsed sidebar): the Admin nav link appears and
+    // the #/admin panel renders the grant form. No signing happens in
+    // jsdom — the panel renders fully without it. ----
+    dom3 = await JSDOM.fromURL(`${BASE}/`, {
+      resources: 'usable',
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(window) {
+        const nodeFetch = fetch;
+        window.fetch = (input, init) => {
+          const url =
+            typeof input === 'string' && input.startsWith('/')
+              ? new URL(input, window.location.href).toString()
+              : input;
+          return nodeFetch(url, init);
+        };
+        Object.defineProperty(window, 'crypto', { value: webcrypto, configurable: true });
+        window.localStorage.setItem('solpump-wallet', TEST_ADMIN_ADDRESS);
+        window.localStorage.setItem('solpump-sidebar-collapsed', '1');
+      },
+    });
+    const win3 = dom3.window;
+    const doc3 = win3.document;
+    win3.addEventListener('error', (e) => {
+      throw new Error(`page 3 error: ${e.message}`);
+    });
+    await waitFor(() => doc3.querySelector('.coin-card'), 15000, 'feed in page 3');
+    // The collapsed sidebar persists across a reload (seeded '1').
+    assert(
+      doc3.getElementById('appShell').classList.contains('sidebar-collapsed'),
+      'the sidebar starts collapsed when localStorage says so'
+    );
+    // The Admin link appears once the server confirms the wallet.
+    await waitFor(() => doc3.querySelector('[data-nav="admin"]'), 15000, 'Admin nav link for the admin wallet');
+    assert(
+      doc3.querySelector('[data-nav="admin"]').textContent.includes('Admin'),
+      'the Admin nav link renders for the admin wallet'
+    );
+    win3.location.hash = '#/admin';
+    win3.dispatchEvent(new win3.HashChangeEvent('hashchange'));
+    await waitFor(() => doc3.querySelector('#adminGrantBtn'), 15000, 'admin grant form');
+    assert(doc3.querySelector('#adminWallet'), 'admin panel has a wallet input');
+    assert(doc3.querySelector('#adminBadge'), 'admin panel has a badge select');
+    assert(
+      doc3.querySelectorAll('#adminBadge option').length === 5,
+      'admin badge select offers all 5 community badges'
+    );
+    assert(doc3.querySelector('#adminLoadListBtn'), 'admin panel has a load-list button');
 
     console.log('\nALL UI SMOKE CHECKS PASSED');
   } finally {
     if (dom) dom.window.close();
     if (dom2) dom2.window.close();
-    db.prepare('DELETE FROM trades WHERE mint_address = ?').run(mint);
-    db.prepare('DELETE FROM callouts WHERE mint_address = ?').run(mint);
+    if (dom3) dom3.window.close();
+    const allMints = [mint, mintAdult, mintPair, mintDeep, mintGrad];
+    const placeholders = allMints.map(() => '?').join(', ');
+    db.prepare(`DELETE FROM trades WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM callouts WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM reward_funds WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM transfers WHERE mint_address IN (${placeholders})`).run(...allMints);
+    db.prepare(`DELETE FROM coins WHERE mint_address IN (${placeholders})`).run(...allMints);
     db.prepare('DELETE FROM profiles WHERE wallet = ?').run(WALLET_A);
-    db.prepare('DELETE FROM coins WHERE mint_address = ?').run(mint);
+    db.prepare('DELETE FROM contacts WHERE owner_wallet = ?').run(WALLET_A);
     const left = db.prepare('SELECT COUNT(*) AS n FROM coins').get().n;
     console.log(`test data cleaned; coins remaining in DB: ${left}`);
     db.close();

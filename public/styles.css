@@ -81,14 +81,52 @@ a:hover { text-decoration: underline; }
   position: sticky;
   top: 0;
   height: 100vh;
+  transition: width 0.2s ease;
 }
 .sidebar .brand { height: 48px; display: flex; align-items: center; padding: 0 7px; flex-shrink: 0; }
 .sidebar-foot { margin-top: auto; border-top: 1px solid var(--border); padding-top: 8px; }
 .sidebar-foot p { margin: 6px 0; }
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
+/* Sidebar toggle (header, left edge) + the mobile-only brand shown in the
+   topbar while the drawer is closed. */
+.sidebar-toggle {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+.topbar-brand { display: none; font-size: 1.1rem; }
+.topbar-brand .brand-mark { width: 22px; height: 22px; font-size: 0.85rem; }
+
+/* Desktop only: collapsed sidebar = a slim icon-only rail; the content
+   column expands automatically (flex). Scoped to min-width so the mobile
+   drawer (max-width rules below) is never narrowed by the persisted
+   collapsed state. */
+@media (min-width: 768px) {
+  .app-shell.sidebar-collapsed .sidebar { width: 3.5rem; padding: 0 6px 8px; }
+  .app-shell.sidebar-collapsed .sidebar .brand { justify-content: center; padding: 0; }
+  .app-shell.sidebar-collapsed .sidebar .brand-text,
+  .app-shell.sidebar-collapsed .sidebar .nav-label,
+  .app-shell.sidebar-collapsed .sidebar-foot { display: none; }
+  .app-shell.sidebar-collapsed .sidebar .nav a { justify-content: center; padding: 0; }
+}
+
+/* Mobile drawer scrim (tapping it closes the drawer). Hidden by default;
+   only used on small screens. */
+.sidebar-scrim { display: none; }
+
 .brand { font-size: 1.3rem; font-weight: 700; color: var(--text); letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }
 .brand span { color: var(--green); }
+/* The brand-text wrapper keeps "sol" in the default text color; only the
+   inner "pump" span is green (same rendering as before the wrap). */
+.brand .brand-text { color: var(--text); }
+.brand .brand-text span { color: var(--green); }
 .brand:hover { text-decoration: none; }
 .brand-mark {
   display: inline-flex; align-items: center; justify-content: center;
@@ -511,20 +549,159 @@ th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
 }
 .border-option input:checked + .border-swatch { border-color: var(--green); color: var(--text); }
 
-/* ---- Layar kecil: sidebar jadi baris atas, brand pindah ke header ---- */
+/* ---- Layar kecil: sidebar jadi drawer overlay, dibuka via tombol ---- */
 @media (max-width: 767px) {
   .app-shell { flex-direction: column; }
   .sidebar {
-    width: 100%; height: auto; position: static;
-    flex-direction: row; align-items: center;
-    border-right: none; border-bottom: 1px solid var(--border);
-    padding: 0 12px; gap: 8px;
+    position: fixed;
+    left: 0;
+    top: 0;
+    height: 100vh;
+    width: 13rem;
+    transform: translateX(-105%);
+    transition: transform 0.2s ease;
+    z-index: 40;
+    background: var(--bg);
+    flex-direction: column;
+    align-items: stretch;
+    border-right: 1px solid var(--border);
+    border-bottom: none;
+    padding: 0 12px 8px;
   }
+  .app-shell.sidebar-open .sidebar { transform: translateX(0); }
   .sidebar .brand { height: 48px; }
-  .sidebar .nav { flex-direction: row; margin-top: 0; flex: 1; }
-  .sidebar .nav a { padding: 0 8px; font-size: 0.85rem; }
-  .sidebar .nav-ic { display: none; }
-  .sidebar-foot { display: none; }
+  .sidebar .nav { flex-direction: column; margin-top: 8px; flex: none; }
+  .sidebar .nav a { padding: 0 10px; font-size: 0.9rem; }
+  .sidebar .nav-ic { display: inline-flex; }
+  .sidebar-foot { display: block; }
+  .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 30;
+  }
+  .sidebar-scrim[hidden] { display: none; }
+  .topbar-brand { display: flex; }
   .topbar, .infobar, .container, .footer { padding-left: 16px; padding-right: 16px; }
   .infobar { overflow-x: auto; }
+}
+
+/* ---- Re-register, rewards, livestream, categories, tax, 18+, receipt,
+   contacts, badges, routed buys, admin (14-job push) ---- */
+
+/* Modal overlay (receipt, age confirmation). */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px;
+}
+.modal {
+  background: var(--card); border: 1px solid var(--border2);
+  border-radius: var(--radius); max-width: 560px; width: 100%;
+  max-height: 90vh; overflow-y: auto; padding: 20px;
+  position: relative; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.modal-close {
+  position: absolute; top: 8px; right: 8px;
+  background: none; border: none; color: var(--muted);
+  font-size: 1.1rem; cursor: pointer; padding: 4px 8px;
+}
+.modal-close:hover { color: var(--text); }
+
+/* Livestream panel. */
+.stream-video-wrap {
+  background: #000; border-radius: var(--radius-sm);
+  overflow: hidden; aspect-ratio: 16 / 9;
+  display: flex; align-items: center; justify-content: center;
+  margin: 8px 0;
+}
+.stream-video-wrap video { width: 100%; height: 100%; object-fit: cover; }
+.stream-placeholder { color: var(--muted); font-size: 0.9rem; text-align: center; padding: 16px; }
+.stream-status { margin: 6px 0; }
+.stream-chat-log {
+  max-height: 220px; overflow-y: auto;
+  border: 1px solid var(--border2); border-radius: var(--radius-sm);
+  padding: 8px; margin: 8px 0; display: flex; flex-direction: column; gap: 6px;
+  background: var(--card2);
+}
+.stream-chat-msg { font-size: 0.9rem; line-height: 1.4; word-break: break-word; }
+.stream-chat-input-row { display: flex; gap: 8px; }
+.stream-chat-input-row input { flex: 1; }
+
+/* LIVE badge (red, distinct from the green .badge-live "online" badge). */
+.badge-live-stream { background: var(--red); color: #fff; }
+.badge-category { background: var(--card3); color: var(--text2); }
+.badge-tax { background: var(--card3); color: var(--gold); }
+.badge-adult { background: var(--red-dim); color: var(--loss); }
+
+/* Callout reward tiers. */
+.reward-tiers { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.reward-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border2); border-radius: 999px;
+  padding: 4px 10px; font-size: 0.8rem; color: var(--muted);
+}
+.reward-chip.eligible { border-color: var(--gain); color: var(--gain); }
+.reward-chip.claimed { border-color: var(--green-dim); color: var(--gain); background: var(--green-dim); }
+.reward-chip.locked { opacity: 0.6; }
+.reward-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+
+/* 18+ blur: the card content blurs until the viewer confirms age or
+   reveals it; the veil button sits on top. */
+.coin-card.adult-blurred { position: relative; }
+.coin-card.adult-blurred > *:not(.adult-veil) { filter: blur(8px); pointer-events: none; }
+.adult-veil {
+  position: absolute; inset: 0; z-index: 2;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; background: rgba(17, 17, 19, 0.55); border-radius: var(--radius);
+}
+
+/* Transfer receipt. */
+.receipt-coin { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+.receipt-coin .coin-logo, .receipt-coin .coin-avatar { width: 40px; height: 40px; }
+.receipt-rows { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.receipt-row { display: flex; justify-content: space-between; gap: 12px; font-size: 0.92rem; }
+.receipt-row > span:last-child { text-align: right; word-break: break-all; }
+
+/* Pay-choice radios (SOL vs pair asset on routed buys). */
+.pay-choice { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.pay-option {
+  display: flex; align-items: center; gap: 8px;
+  border: 1px solid var(--border2); border-radius: var(--radius-sm);
+  padding: 8px 10px; cursor: pointer; font-size: 0.92rem;
+}
+.pay-option input { accent-color: var(--green); }
+.pay-option.disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* Verified checkmark + community badges. */
+.verified-badge { color: var(--blue); font-size: 0.9em; margin-left: 4px; }
+.badges { display: inline-flex; gap: 2px; margin-left: 4px; }
+.badge-icon { cursor: default; font-size: 0.95em; }
+.badge-shelf { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.badge-shelf-item {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border2); border-radius: 999px;
+  padding: 4px 10px; font-size: 0.85rem; background: var(--card2);
+}
+
+/* Contacts list. */
+.contact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.contact-list li {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  border: 1px solid var(--border2); border-radius: var(--radius-sm);
+  padding: 8px 10px; flex-wrap: wrap;
+}
+.contact-edit { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 220px; }
+
+/* Print: only the receipt prints — the app chrome and the action
+   buttons are hidden. */
+@media print {
+  .sidebar, .topbar, .infobar, .footer, .toast, .modal-overlay { display: none !important; }
+  .app-shell { display: block; }
+  .container { padding: 0; }
+  .receipt-actions { display: none !important; }
+  body { background: #fff; color: #000; }
+  .card { background: #fff; border: 1px solid #ccc; color: #000; }
 }

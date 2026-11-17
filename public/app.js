@@ -17,6 +17,13 @@
 const EXPLORER = 'https://explorer.solana.com';
 
 // ---------- State ----------
+// Coin-detail render sequence: renderCoin is async, and a second render
+// (fast navigation, a double hashchange) can start while the first is
+// still awaiting. Each render captures its sequence number and bails
+// after every await when a newer render has begun — otherwise the stale
+// render writes into DOM the newer one already replaced (or wiped with
+// the loading state), crashing on missing elements.
+let coinRenderSeq = 0;
 const state = {
   wallet: localStorage.getItem('solpump-wallet') || null,
   balanceSol: null,
@@ -30,6 +37,8 @@ const state = {
   tradeSide: 'buy',
   following: new Set(), // wallets the connected wallet follows
   feedFollowingOnly: false, // feed filter: only coins by followed creators
+  isAdmin: false, // is the connected wallet in ADMIN_WALLETS? (server check)
+  adminCheckedWallet: null, // wallet the cached isAdmin applies to
 };
 
 // A mint that succeeded on-chain but whose registration failed: kept so the
@@ -248,6 +257,28 @@ async function apiPost(url, body) {
   return data;
 }
 
+async function apiPut(url, body) {
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(translateError(data.error || `HTTP ${res.status}`));
+  return data;
+}
+
+async function apiDelete(url, body) {
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(translateError(data.error || `HTTP ${res.status}`));
+  return data;
+}
+
 function logoHtml(coin, cls = 'coin-logo') {
   if (coin.logoUrl) {
     return `<img class="${cls}" src="${esc(coin.logoUrl)}" alt="${esc(coin.ticker)}">`;
@@ -266,6 +297,192 @@ function txLink(sig, label) {
 function creatorLink(addr, label) {
   if (!addr) return '';
   return `<a class="addr-link mono" href="#/creator/${esc(addr)}" title="${esc(addr)}">${esc(label || shortAddr(addr))}</a>`;
+}
+
+// Verified checkmark (✓) next to a name, when the profile carries
+// verified: true (earned automatically: one of their coins graduated or
+// reached $100K market cap). `profile` may be null.
+function verifiedBadgeHtml(profile) {
+  if (!profile || !profile.verified) return '';
+  return `<span class="verified-badge" title="${translate('verifiedRuleShort')}">✓</span>`;
+}
+
+// Community badge icons next to a username (Creator, Early Bird, Top
+// Trader, Callout Star, Whale). Each badge carries its i18n name/desc
+// keys; the icon is an emoji from the server. Empty string when none.
+function badgesHtml(badges) {
+  if (!badges || !badges.length) return '';
+  return `<span class="badges">${badges
+    .map(
+      (b) =>
+        `<span class="badge-icon" title="${esc(translate(b.nameKey))} — ${esc(translate(b.descKey))}">${esc(b.icon)}</span>`
+    )
+    .join('')}</span>`;
+}
+
+// Category badge for coin cards and the detail page (translated label).
+function categoryBadgeHtml(category) {
+  if (!category) return '';
+  return `<span class="badge badge-category">${esc(categoryLabel(category))}</span>`;
+}
+
+// ---------- Generic modal ----------
+// A single reusable modal overlay, created lazily on first use. Content
+// is HTML; the caller wires any buttons inside after showing it.
+function ensureModal() {
+  let overlay = document.getElementById('modalOverlay');
+  if (overlay) return overlay;
+  overlay = document.createElement('div');
+  overlay.id = 'modalOverlay';
+  overlay.className = 'modal-overlay';
+  overlay.hidden = true;
+  overlay.innerHTML = `<div class="modal" role="dialog" aria-modal="true">
+    <button class="btn btn-sm modal-close" id="modalCloseBtn" aria-label="${translate('closeBtn')}">✕</button>
+    <div id="modalBody"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) hideModal();
+  });
+  document.getElementById('modalCloseBtn').addEventListener('click', hideModal);
+  return overlay;
+}
+
+function showModal(html) {
+  const overlay = ensureModal();
+  document.getElementById('modalBody').innerHTML = html;
+  overlay.hidden = false;
+}
+
+function hideModal() {
+  const overlay = document.getElementById('modalOverlay');
+  if (overlay) overlay.hidden = true;
+}
+
+// ---------- 18+ age confirmation ----------
+// One-time, client-side only: the API just exposes is_adult. Stored in
+// localStorage so the viewer is asked once per browser.
+const AGE_CONFIRM_KEY = 'solpump-age-confirmed';
+
+function isAgeConfirmed() {
+  try {
+    return localStorage.getItem(AGE_CONFIRM_KEY) === 'yes';
+  } catch {
+    return false;
+  }
+}
+
+// Shows the age-confirm modal; `onConfirm` runs after the viewer confirms
+// (and is persisted). The "leave" button just closes the modal.
+function showAgeConfirmModal(onConfirm) {
+  showModal(`
+    <h2 style="margin-top:0">${translate('adultConfirmTitle')}</h2>
+    <p>${translate('adultConfirmBody')}</p>
+    <div class="row" style="justify-content:flex-start">
+      <button class="btn btn-primary" id="ageConfirmYes">${translate('adultConfirmYes')}</button>
+      <button class="btn" id="ageConfirmNo">${translate('adultConfirmNo')}</button>
+    </div>`);
+  document.getElementById('ageConfirmYes').addEventListener('click', () => {
+    try {
+      localStorage.setItem(AGE_CONFIRM_KEY, 'yes');
+    } catch {
+      /* storage unavailable — confirmation lasts for this session only */
+    }
+    hideModal();
+    if (onConfirm) onConfirm();
+  });
+  document.getElementById('ageConfirmNo').addEventListener('click', hideModal);
+}
+
+// ---------- Collapsible sidebar ----------
+// Desktop: the header toggle collapses the sidebar to a slim icon-only
+// rail (class `sidebar-collapsed` on .app-shell); the content column
+// expands to fill the freed space (flex). The state persists in
+// localStorage across reloads. Mobile (<=767px): the sidebar is an
+// overlay drawer and the same toggle opens/closes it (class
+// `sidebar-open`, transient — the drawer always starts closed); tapping
+// the scrim or a nav link closes it.
+const SIDEBAR_COLLAPSED_KEY = 'solpump-sidebar-collapsed';
+const MOBILE_SIDEBAR_QUERY = '(max-width: 767px)';
+
+function isMobileSidebar() {
+  return (
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia(MOBILE_SIDEBAR_QUERY).matches
+  );
+}
+
+function isSidebarCollapsed() {
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function applySidebarState() {
+  const shell = document.getElementById('appShell');
+  const toggle = document.getElementById('sidebarToggle');
+  const scrim = document.getElementById('sidebarScrim');
+  if (!shell || !toggle) return;
+  const mobile = isMobileSidebar();
+  const drawerOpen = shell.classList.contains('sidebar-open');
+  shell.classList.toggle('sidebar-collapsed', !mobile && isSidebarCollapsed());
+  if (scrim) scrim.hidden = !mobile || !drawerOpen;
+  // Icon + tooltip follow the mode: chevrons collapse/expand on desktop,
+  // hamburger/X open/close the drawer on mobile.
+  let icon;
+  let labelKey;
+  if (mobile) {
+    icon = drawerOpen ? '✕' : '☰';
+    labelKey = drawerOpen ? 'sidebarCloseMenu' : 'sidebarOpenMenu';
+  } else if (isSidebarCollapsed()) {
+    icon = '»';
+    labelKey = 'sidebarExpand';
+  } else {
+    icon = '«';
+    labelKey = 'sidebarCollapse';
+  }
+  toggle.textContent = icon;
+  toggle.title = translate(labelKey);
+  toggle.setAttribute('aria-label', translate(labelKey));
+}
+
+function toggleSidebar() {
+  const shell = document.getElementById('appShell');
+  if (!shell) return;
+  if (isMobileSidebar()) {
+    shell.classList.toggle('sidebar-open');
+  } else {
+    const collapsed = !isSidebarCollapsed();
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch {
+      /* storage unavailable — the collapse lasts for this session only */
+    }
+  }
+  applySidebarState();
+}
+
+function closeSidebarDrawer() {
+  const shell = document.getElementById('appShell');
+  if (!shell || !shell.classList.contains('sidebar-open')) return;
+  shell.classList.remove('sidebar-open');
+  applySidebarState();
+}
+
+function wireSidebar() {
+  const toggle = document.getElementById('sidebarToggle');
+  if (toggle) toggle.addEventListener('click', toggleSidebar);
+  const scrim = document.getElementById('sidebarScrim');
+  if (scrim) scrim.addEventListener('click', closeSidebarDrawer);
+  // Tapping a nav link closes the mobile drawer (harmless on desktop).
+  document.querySelectorAll('.sidebar .nav a').forEach((a) => {
+    a.addEventListener('click', closeSidebarDrawer);
+  });
+  // Keep the toggle icon in sync when the viewport crosses the breakpoint.
+  window.addEventListener('resize', applySidebarState);
+  applySidebarState();
 }
 
 // Canonical follow message — must match src/signverify.js on the server.
@@ -319,6 +536,64 @@ function buybackMessage({ wallet, mint, amount }) {
   return [`solpump:buyback:${wallet}`, `mint:${mint}`, `amount:${amount}`].join('\n');
 }
 
+// Canonical re-register message — must match src/signverify.js exactly.
+function reRegisterMessage({ wallet, mint }) {
+  return [`solpump:re-register:${wallet}`, `mint:${mint}`].join('\n');
+}
+
+// Canonical reward-claim message — `calloutId` is the callout's numeric id
+// (as a string), `tier` is the claimed tier percent (10, 25, or 50).
+// Must match src/signverify.js exactly.
+function rewardClaimMessage({ wallet, mint, calloutId, tier }) {
+  return [
+    `solpump:reward-claim:${wallet}`,
+    `mint:${mint}`,
+    `callout:${calloutId}`,
+    `tier:${tier}`,
+  ].join('\n');
+}
+
+// Canonical livestream messages — must match src/signverify.js exactly.
+// stream-start: the creator proves they may go live for the coin.
+// stream-join: a viewer signs once per session to chat as their wallet.
+function streamStartMessage({ wallet, mint }) {
+  return [`solpump:stream-start:${wallet}`, `mint:${mint}`].join('\n');
+}
+
+function streamJoinMessage({ wallet, mint }) {
+  return [`solpump:stream-join:${wallet}`, `mint:${mint}`].join('\n');
+}
+
+// Canonical contact-book messages — must match src/signverify.js exactly.
+function contactAddMessage({ owner, name, wallet }) {
+  return [`solpump:contact-add:${owner}`, `name:${name}`, `wallet:${wallet}`].join('\n');
+}
+
+function contactEditMessage({ owner, contactId, name, wallet }) {
+  return [
+    `solpump:contact-edit:${owner}`,
+    `contact:${contactId}`,
+    `name:${name}`,
+    `wallet:${wallet}`,
+  ].join('\n');
+}
+
+function contactDeleteMessage({ owner, contactId }) {
+  return [`solpump:contact-delete:${owner}`, `contact:${contactId}`].join('\n');
+}
+
+// Canonical admin message — ONE format for all admin actions (grant,
+// revoke, list). Must match src/signverify.js exactly.
+function adminMessage({ admin, action, wallet, badge }) {
+  const lines = [`solpump:admin:${admin}`, `action:${action}`];
+  if (wallet) lines.push(`wallet:${wallet}`);
+  if (badge) lines.push(`badge:${badge}`);
+  return lines.join('\n');
+}
+
+// Fixed coin categories — must match COIN_CATEGORIES in src/routes.js.
+const COIN_CATEGORIES = ['Meme', 'AI', 'Gaming', 'DeFi', 'Animals', 'Art', 'Sports', 'Music', 'Lainnya'];
+
 async function sha256Hex(text) {
   // WebCrypto only recognizes the hyphenated name 'SHA-256' — the bare
   // 'sha256' throws "Unrecognized name" in browsers (and Node's WebCrypto).
@@ -351,17 +626,46 @@ function avatarHtml(profile, wallet, size = 56, round = false) {
 // price. Prices are USD (plain decimals, never scientific notation), PnL is
 // USD primary with the SOL figure in parentheses; PnL uses the same
 // green=profit / pink=loss styling as the PnL card.
-function calloutHtml(c, { showCoin = false } = {}) {
+// `showClaim`: on the coin detail page, the callout's author sees a claim
+// button for each eligible, unclaimed reward tier.
+function calloutHtml(c, { showCoin = false, showClaim = false } = {}) {
   const cls = c.pnlSol >= 0 ? 'profit' : 'loss';
   const asset = c.assetSymbol || 'SOL';
   const pnlUsd = Number.isFinite(c.pnlUsd)
     ? `${fmtSignedUsd(c.pnlUsd)} <span class="muted">(${fmtSignedSol(c.pnlSol, asset)})</span>`
     : fmtSignedSol(c.pnlSol, asset);
+  const rewards = c.rewards || [];
+  const isAuthor = state.wallet && state.wallet === c.wallet;
+  const rewardChips = rewards.length
+    ? `<div class="reward-chips">
+        ${rewards
+          .map((r) => {
+            const stateClass = r.claimed ? 'claimed' : r.eligible ? 'eligible' : 'locked';
+            const stateLabel = r.claimed
+              ? translate('rewardTierClaimed')
+              : r.eligible
+                ? translate('rewardTierEligible')
+                : translate('rewardTierLocked');
+            return `<span class="reward-chip ${stateClass}" title="${translate('rewardTierTitle', { pct: r.pct, amount: fmtSol(r.amountSol) })}">+${r.pct}% · ${fmtSol(r.amountSol)} SOL · ${stateLabel}</span>`;
+          })
+          .join('')}
+      </div>`
+    : '';
+  const claimButtons =
+    showClaim && isAuthor
+      ? rewards
+          .filter((r) => r.eligible && !r.claimed)
+          .map(
+            (r) =>
+              `<button class="btn btn-sm btn-primary" data-claim-reward="${c.id}" data-tier="${r.pct}">${translate('rewardClaimBtn', { pct: r.pct, amount: fmtSol(r.amountSol) })}</button>`
+          )
+          .join(' ')
+      : '';
   return `
     <div class="callout">
       <div class="callout-head">
         ${avatarHtml(c.authorProfile, c.wallet, 28, true)}
-        ${creatorLink(c.wallet, displayName(c.authorProfile, c.wallet))}
+        ${creatorLink(c.wallet, displayName(c.authorProfile, c.wallet))}${verifiedBadgeHtml(c.authorProfile)}${badgesHtml(c.authorProfile && c.authorProfile.badges)}
         <span class="badge badge-ok">${translate('calloutVerified')}</span>
         <span class="muted small" style="margin-left:auto">${fmtAgo(c.createdAt)}</span>
       </div>
@@ -379,7 +683,49 @@ function calloutHtml(c, { showCoin = false } = {}) {
         <span>${translate('calloutCurrentPrice')} <b>${fmtPriceBoth(c.currentPriceUsd, c.currentPrice)}</b></span>
         <span>${translate('calloutPnl')} <b class="${cls}">${pnlUsd} (${fmtPct(c.pnlPct)})</b></span>
       </div>
+      ${rewardChips}
+      ${claimButtons ? `<div class="row" style="justify-content:flex-start;margin-top:8px">${claimButtons}</div>` : ''}
     </div>`;
+}
+
+// Claim one callout reward tier (author only, signature-proven). The
+// server re-verifies the live PnL threshold and pays real SOL from the
+// pool wallet. Called from the coin detail page's claim buttons.
+async function claimCalloutReward(mintAddress, calloutId, tier, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const phantom = (await waitForPhantom(3000)) || getPhantom();
+    if (!phantom) throw new Error(translate('errPhantomShort'));
+    if (typeof phantom.signMessage !== 'function') {
+      throw new Error(translate('errNoSignMessage'));
+    }
+    const message = rewardClaimMessage({
+      wallet: state.wallet,
+      mint: mintAddress,
+      calloutId: String(calloutId),
+      tier: String(tier),
+    });
+    toast(translate('toastSignRewardClaim'));
+    const signature = await signWalletMessage(phantom, message);
+    const res = await apiPost(`/api/coins/${mintAddress}/callouts/${calloutId}/claim-reward`, {
+      wallet: state.wallet,
+      tier,
+      message,
+      signature,
+    });
+    toast(
+      translate('rewardClaimSuccess', {
+        amount: fmtSol(res.claim.amountSol),
+        tx: res.claim.txSignature ? shortAddr(res.claim.txSignature) : '',
+      })
+    );
+    await refreshBalance();
+    renderHeader();
+    route();
+  } catch (err) {
+    toast(translate('rewardClaimFailed', { msg: friendlyError(err) }));
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function loadPoolAddress() {
@@ -553,6 +899,49 @@ function renderHeader() {
       href === hash || (href === '#/' && (hash === '' || hash === '#/'))
     );
   });
+  // Admin nav link (cached state renders immediately; the server check
+  // refreshes it once per connected wallet).
+  renderAdminNavLink();
+  refreshAdminStatus();
+}
+
+// Admin status: the server decides (ADMIN_WALLETS); the client only
+// shows/hides the sidebar link. Cached per wallet — one check per
+// connect, re-checked when the wallet changes.
+async function refreshAdminStatus() {
+  if (!state.wallet) {
+    state.isAdmin = false;
+    state.adminCheckedWallet = null;
+    renderAdminNavLink();
+    return;
+  }
+  if (state.adminCheckedWallet === state.wallet) return;
+  try {
+    const data = await apiGet(`/api/admin/status?wallet=${encodeURIComponent(state.wallet)}`);
+    state.isAdmin = !!data.isAdmin;
+  } catch {
+    state.isAdmin = false;
+  }
+  state.adminCheckedWallet = state.wallet;
+  renderAdminNavLink();
+}
+
+// The Admin sidebar link exists only for admin wallets (added/removed
+// dynamically — the static shell has no admin link).
+function renderAdminNavLink() {
+  const nav = document.querySelector('.sidebar .nav');
+  if (!nav) return;
+  const existing = nav.querySelector('[data-nav="admin"]');
+  if (existing) existing.remove();
+  if (!state.isAdmin) return;
+  const a = document.createElement('a');
+  a.href = '#/admin';
+  a.dataset.nav = 'admin';
+  a.innerHTML = `<span class="nav-ic">⚙</span><span class="nav-label">${translate('navAdmin')}</span>`;
+  a.addEventListener('click', closeSidebarDrawer);
+  const hash = location.hash || '#/';
+  if (hash === '#/admin') a.classList.add('active');
+  nav.appendChild(a);
 }
 
 // Language switcher in the topbar (ID / EN / 中文), persisted in
@@ -589,14 +978,21 @@ function renderLangSwitcher() {
 // ---------- Router ----------
 function route() {
   const hash = location.hash || '#/';
+  // Leaving a coin page ends any livestream the viewer is watching (or
+  // broadcasting) — the stream panel unmounts with the view.
+  stopStream();
   renderHeader();
   if (hash === '#/' || hash === '') return renderFeed();
   if (hash === '#/create') return renderCreate();
+  if (hash === '#/re-register') return renderReRegister();
   if (hash === '#/portfolio') return renderPortfolio();
+  if (hash === '#/admin') return renderAdmin();
   const m = hash.match(/^#\/coin\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (m) return renderCoin(m[1]);
   const c = hash.match(/^#\/creator\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (c) return renderCreator(c[1]);
+  const r = hash.match(/^#\/receipt\/(\d+)$/);
+  if (r) return renderReceipt(Number(r[1]));
   document.getElementById('view').innerHTML =
     `<div class="card"><p>${translate('notFoundTitle')}</p><a href="#/">${translate('backHome')}</a></div>`;
 }
@@ -606,6 +1002,17 @@ window.addEventListener('hashchange', route);
 // ---------- Feed ----------
 let feedSearch = '';
 let feedSort = 'newest';
+let feedCategory = null; // null = all categories
+let feedHideAdult = false; // default: show 18+ coins, blurred + badged
+
+// Translated category label ('Lainnya' -> 'Other' / '其他'); unknown
+// values fall back to the raw stored string.
+function categoryLabel(cat) {
+  if (!cat) return '';
+  const key = `category${cat}`;
+  const t = translate(key);
+  return t === key ? cat : t;
+}
 
 async function renderFeed() {
   const view = document.getElementById('view');
@@ -633,6 +1040,14 @@ async function renderFeed() {
       ${state.wallet && state.following.size > 0
         ? `<button class="pill ${state.feedFollowingOnly ? 'active' : ''}" id="followingToggle" title="${translate('followingOnlyTitle')}">${translate('followingFilter', { n: state.following.size })}</button>`
         : ''}
+      <button class="pill ${feedHideAdult ? 'active' : ''}" id="adultToggle" title="${translate('adultToggleTitle')}">${translate('adultToggleHide')}</button>
+    </div>
+    <div class="cat-pills" role="tablist" aria-label="${translate('categoryFilterLabel')}">
+      <button class="pill ${!feedCategory ? 'active' : ''}" data-category="" role="tab">${translate('categoryAll')}</button>
+      ${COIN_CATEGORIES.map(
+        (cat) =>
+          `<button class="pill ${feedCategory === cat ? 'active' : ''}" data-category="${esc(cat)}" role="tab">${esc(categoryLabel(cat))}</button>`
+      ).join('')}
     </div>
     <div id="followingCallouts"></div>
     <div id="coinList"><p class="muted">${translate('loadingCoins')}</p></div>`;
@@ -663,6 +1078,23 @@ async function renderFeed() {
       loadCoins();
     });
   }
+  const adultToggle = document.getElementById('adultToggle');
+  if (adultToggle) {
+    adultToggle.addEventListener('click', () => {
+      feedHideAdult = !feedHideAdult;
+      adultToggle.classList.toggle('active', feedHideAdult);
+      loadCoins();
+    });
+  }
+  view.querySelectorAll('[data-category]').forEach((b) => {
+    b.addEventListener('click', () => {
+      feedCategory = b.dataset.category || null;
+      view.querySelectorAll('[data-category]').forEach((x) =>
+        x.classList.toggle('active', (x.dataset.category || null) === feedCategory)
+      );
+      loadCoins();
+    });
+  });
   loadTrendStrip();
   loadCoins();
 
@@ -686,7 +1118,7 @@ async function renderFeed() {
             <div class="trend-chip" data-mint="${esc(c.mintAddress)}" title="${esc(c.name)} ($${esc(c.ticker)})">
               ${logoHtml(c)}
               <div style="min-width:0">
-                <div class="tc-name">${esc(c.ticker)}${i < 3 ? '<span class="hot">HOT</span>' : ''}</div>
+                <div class="tc-name">${esc(c.ticker)}${i < 3 ? '<span class="hot">HOT</span>' : ''}${c.isLive ? `<span class="badge badge-live-stream">● ${translate('liveBadge')}</span>` : ''}${c.isAdult ? '<span class="badge badge-adult">18+</span>' : ''}</div>
                 <div class="tc-price">${fmtPriceBoth(c.priceUsd, c.price)}</div>
                 <div class="tc-mc">${fmtMarketCap(c)}</div>
               </div>
@@ -727,11 +1159,15 @@ async function renderFeed() {
     try {
       const params = new URLSearchParams({ sort: feedSort });
       if (feedSearch.trim()) params.set('search', feedSearch.trim());
+      if (feedCategory) params.set('category', feedCategory);
       if (state.feedFollowingOnly && state.wallet) {
         params.set('following', state.wallet);
       }
       const data = await apiGet(`/api/coins?${params}`);
-      if (!data.coins.length) {
+      // The 18+ hide toggle filters client-side (the API has no
+      // hide-adult parameter); hidden coins never render.
+      const coins = feedHideAdult ? data.coins.filter((c) => !c.isAdult) : data.coins;
+      if (!coins.length) {
         list.innerHTML = state.feedFollowingOnly
           ? `
           <div class="card empty">
@@ -743,10 +1179,11 @@ async function renderFeed() {
             <h2>${translate('emptyFeedTitle')}</h2>
             <p>${translate('emptyFeedBody')}</p>
             <p><a class="btn btn-primary" href="#/create">${translate('emptyFeedCta')}</a></p>
+            <p class="small muted">${translate('emptyFeedReRegisterNote')} <a href="#/re-register">${translate('emptyFeedReRegisterLink')}</a></p>
           </div>`;
         return;
       }
-      list.innerHTML = `<div class="coin-grid">${data.coins.map(coinCard).join('')}</div>`;
+      list.innerHTML = `<div class="coin-grid">${coins.map(coinCard).join('')}</div>`;
       list.querySelectorAll('.coin-card').forEach((card) => {
         card.addEventListener('click', () => {
           location.hash = `#/coin/${card.dataset.mint}`;
@@ -756,22 +1193,37 @@ async function renderFeed() {
       list.querySelectorAll('.coin-card .addr-link').forEach((a) => {
         a.addEventListener('click', (e) => e.stopPropagation());
       });
+      wireAdultReveals(list);
     } catch (err) {
       list.innerHTML = `<div class="alert alert-error">${esc(translate('errLoadCoins', { msg: err.message }))}</div>`;
     }
   }
 }
 
+// Wire the 18+ click-to-reveal buttons inside `container`: confirming the
+// age modal re-renders the current view with the coin unblurred.
+function wireAdultReveals(container) {
+  container.querySelectorAll('[data-adult-reveal]').forEach((b) => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showAgeConfirmModal(() => route());
+    });
+  });
+}
+
 function coinCard(c) {
   const chg = c.changePct >= 0 ? 'profit' : 'loss';
   const pairAsset = (c.pairAsset && c.pairAsset.symbol) || 'SOL';
   const pairLabel = c.pairLabel || `${c.ticker}/SOL`;
+  // 18+ coins are blurred for viewers who have not confirmed their age;
+  // the veil button opens the one-time age confirmation.
+  const adultBlurred = c.isAdult && !isAgeConfirmed();
   return `
-    <div class="card coin-card" data-mint="${esc(c.mintAddress)}">
+    <div class="card coin-card${adultBlurred ? ' adult-blurred' : ''}" data-mint="${esc(c.mintAddress)}">
       <div class="coin-head">
         ${logoHtml(c)}
         <div class="coin-id">
-          <div class="coin-name">${esc(c.name)} <span class="coin-ticker">$${esc(c.ticker)}</span></div>
+          <div class="coin-name">${esc(c.name)} <span class="coin-ticker">$${esc(c.ticker)}</span>${c.isAdult ? '<span class="badge badge-adult">18+</span>' : ''}${c.isLive ? `<span class="badge badge-live-stream">● ${translate('liveBadge')}${c.viewerCount ? ` ${c.viewerCount}` : ''}</span>` : ''}</div>
           <div class="coin-pair">${esc(pairLabel)} • ${fmtAgo(c.createdAt)}</div>
         </div>
         <div style="text-align:right;flex-shrink:0">
@@ -780,6 +1232,7 @@ function coinCard(c) {
         </div>
         ${c.tradingEnabled ? '' : `<span class="badge badge-warn">${translate('badgeTradingOff')}</span>`}
       </div>
+      <div class="coin-badges">${categoryBadgeHtml(c.category)}</div>
       ${c.description ? `<p class="coin-desc">${esc(c.description)}</p>` : ''}
       <div class="coin-price-row">
         <span class="coin-price"><b>${fmtPriceBoth(c.priceUsd, c.price)}</b> <span class="${chg}">${fmtPct(c.changePct)}</span></span>
@@ -788,7 +1241,8 @@ function coinCard(c) {
       <div class="progress" title="${translate('cardProgressTitle', { pct: c.progressPct.toFixed(1) })}">
         <div style="width:${c.progressPct.toFixed(1)}%"></div>
       </div>
-      <div class="coin-foot">${translate('cardFoot', { pct: c.progressPct.toFixed(1), n: c.txCount, creator: creatorLink(c.creatorWallet, displayName(c.creatorProfile, c.creatorWallet)) })}</div>
+      <div class="coin-foot">${translate('cardFoot', { pct: c.progressPct.toFixed(1), n: c.txCount, creator: creatorLink(c.creatorWallet, displayName(c.creatorProfile, c.creatorWallet)) + verifiedBadgeHtml(c.creatorProfile) + badgesHtml(c.creatorProfile && c.creatorProfile.badges) })}</div>
+      ${adultBlurred ? `<button class="adult-veil" data-adult-reveal="${esc(c.mintAddress)}">🔞 ${translate('adultRevealBtn')}</button>` : ''}
     </div>`;
 }
 
@@ -801,6 +1255,7 @@ async function renderCreate() {
   view.innerHTML = `
     <h1>${translate('createTitle')}</h1>
     <p class="muted">${translate('createIntro')}</p>
+    <p class="small muted">${translate('createReRegisterNote')} <a href="#/re-register">${translate('createReRegisterLink')}</a></p>
     <div id="pendingMintBox"></div>
     <div class="create-layout">
     <div class="card">
@@ -830,6 +1285,29 @@ async function renderCreate() {
           <div id="pairList" style="margin-top:8px"><p class="muted small">${translate('loadingGeneric')}</p></div>
         </div>
       </div>
+      <div class="field">
+        <label for="coinCategory">${translate('categoryLabel')}</label>
+        <select id="coinCategory">
+          ${COIN_CATEGORIES.map((cat) => `<option value="${esc(cat)}" ${cat === 'Lainnya' ? 'selected' : ''}>${esc(categoryLabel(cat))}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label for="coinTax">${translate('taxLabel')}</label>
+        <select id="coinTax">
+          <option value="0">0%</option>
+          <option value="50">0.5%</option>
+          <option value="100" selected>1% ${translate('taxDefaultSuffix')}</option>
+          <option value="200">2%</option>
+          <option value="300">3%</option>
+          <option value="500">5%</option>
+          <option value="1000">10%</option>
+        </select>
+        <div class="hint">${translate('taxHint')}</div>
+      </div>
+      <label class="check-row">
+        <input type="checkbox" id="coinAdult">
+        <span>${translate('adultCheckboxLabel')}</span>
+      </label>
       <div id="walletStatus"></div>
       <div id="mintSteps"></div>
       <div id="mintError"></div>
@@ -859,6 +1337,7 @@ async function renderCreate() {
             </div>
           </div>
           <p class="coin-desc" id="pvDesc">${translate('previewDescDefault')}</p>
+          <div class="coin-badges"><span id="pvCategory"></span> <span id="pvAdult"></span></div>
           <div class="coin-price-row">
             <span class="coin-price"><b>~$0.000005</b></span>
             <span class="small muted">${translate('cardVolume')} <b style="color:var(--text)" id="pvVol">0 SOL</b></span>
@@ -868,6 +1347,7 @@ async function renderCreate() {
         </div>
         <p class="preview-note">${translate('previewNote')}</p>
         <p class="preview-note" id="pvPairNote">${translate('pairPreviewNote', { pair: 'SOL' })}</p>
+        <p class="preview-note" id="pvTaxNote"></p>
       </div>
     </div>
     </div>`;
@@ -879,6 +1359,9 @@ async function renderCreate() {
   });
   document.getElementById('coinName').addEventListener('input', renderPreview);
   document.getElementById('coinDesc').addEventListener('input', renderPreview);
+  document.getElementById('coinCategory').addEventListener('change', renderPreview);
+  document.getElementById('coinTax').addEventListener('change', renderPreview);
+  document.getElementById('coinAdult').addEventListener('change', renderPreview);
 
   // Live preview: mirror the form into the preview card (pump.fun's create
   // page shows the same "how your coin will look" panel).
@@ -901,6 +1384,24 @@ async function renderCreate() {
     }
     const pvVol = document.getElementById('pvVol');
     if (pvVol) pvVol.textContent = `0 ${selectedPairSymbol()}`;
+    // Category + 18+ badges and the creator tax shown in the preview so
+    // the creator sees exactly what traders will see.
+    const pvCategory = document.getElementById('pvCategory');
+    if (pvCategory) {
+      const cat = document.getElementById('coinCategory')?.value || 'Lainnya';
+      pvCategory.innerHTML = categoryBadgeHtml(cat);
+    }
+    const pvAdult = document.getElementById('pvAdult');
+    if (pvAdult) {
+      pvAdult.innerHTML = document.getElementById('coinAdult')?.checked
+        ? '<span class="badge badge-adult">18+</span>'
+        : '';
+    }
+    const pvTax = document.getElementById('pvTaxNote');
+    if (pvTax) {
+      const bps = Number(document.getElementById('coinTax')?.value || 100);
+      pvTax.textContent = translate('previewTaxNote', { pct: (bps / 100).toLocaleString('id-ID') });
+    }
     // Without a logo, the preview avatar shows the ticker's initials.
     if (!logoData) {
       document.getElementById('logoPreview').innerHTML =
@@ -982,6 +1483,10 @@ async function renderCreate() {
 
   renderPendingMint();
   updateWalletStatus();
+  // Initial preview render (must run AFTER `let logoData` above — the
+  // preview reads it): the panel reflects the default form state
+  // (category, tax note, 18+ badge) before the user types anything.
+  renderPreview();
   document.getElementById('mintBtn').addEventListener('click', () => doMint(logoData));
 
   // A mint that landed on-chain but failed to register: offer a retry
@@ -1015,6 +1520,9 @@ async function renderCreate() {
           txSignature: pending.txSignature,
           fundingTxSignature: pending.fundingTxSignature || undefined,
           pairMint: pending.pairMint || undefined,
+          category: pending.category || undefined,
+          feeBps: pending.feeBps ?? undefined,
+          isAdult: pending.isAdult || undefined,
           image: pending.image || undefined,
         });
         savePendingMint(null);
@@ -1092,6 +1600,9 @@ async function renderCreate() {
     const name = document.getElementById('coinName').value.trim();
     const ticker = document.getElementById('coinTicker').value.trim();
     const description = document.getElementById('coinDesc').value.trim();
+    const category = document.getElementById('coinCategory').value || 'Lainnya';
+    const feeBps = Number(document.getElementById('coinTax').value || 100);
+    const isAdult = document.getElementById('coinAdult').checked;
     const errEl = document.getElementById('mintError');
     const stepsEl = document.getElementById('mintSteps');
     const btn = document.getElementById('mintBtn');
@@ -1243,6 +1754,9 @@ async function renderCreate() {
               txSignature: mintSignature,
               fundingTxSignature: null,
               pairMint: selectedPairMint,
+              category,
+              feeBps,
+              isAdult,
               image: logo,
               error: translate('pendingErrFundingCancelled'),
             });
@@ -1265,6 +1779,9 @@ async function renderCreate() {
           txSignature: mintSignature,
           fundingTxSignature: fundingSignature || undefined,
           pairMint: selectedPairMint || undefined,
+          category,
+          feeBps,
+          isAdult,
           image: logo,
         });
       } catch (regErr) {
@@ -1279,6 +1796,9 @@ async function renderCreate() {
           txSignature: mintSignature,
           fundingTxSignature: fundingSignature || null,
           pairMint: selectedPairMint,
+          category,
+          feeBps,
+          isAdult,
           image: logo,
           error: regErr.message,
         });
@@ -1303,8 +1823,190 @@ async function renderCreate() {
   }
 }
 
+// ---------- Re-register an existing mint ----------
+// Restores a coin that vanished from the feed after a database reset
+// (every Render redeploy wipes the ephemeral SQLite DB) — the token and
+// its pool funding are still on-chain. The creator re-enters the registry
+// data (name, ticker, description, logo, pair, category, tax, 18+ flag)
+// and proves creatorship by signing a canonical message; the server
+// verifies the mint profile + pool balance on-chain and reconstructs the
+// curve from the pool's on-chain state. Trades, burns, callouts and
+// follows start empty — the form says so plainly.
+async function renderReRegister() {
+  const view = document.getElementById('view');
+  view.innerHTML = `
+    <h1>${translate('reregisterTitle')}</h1>
+    <p class="muted">${translate('reregisterIntro')}</p>
+    <div class="alert alert-info">${translate('reregisterFreshHistory')}</div>
+    <div class="card">
+      <div class="field">
+        <label for="rrMint">${translate('reregisterMintLabel')}</label>
+        <input id="rrMint" type="text" placeholder="${translate('reregisterMintPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <div class="hint">${translate('reregisterMintHint')}</div>
+      </div>
+      <div class="field">
+        <label for="rrName">${translate('createNameLabel')}</label>
+        <input id="rrName" maxlength="32" placeholder="${translate('createNamePlaceholder')}">
+      </div>
+      <div class="field">
+        <label for="rrTicker">${translate('createTickerLabel')}</label>
+        <input id="rrTicker" maxlength="10" placeholder="${translate('createTickerPlaceholder')}">
+        <div class="hint">${translate('createTickerHint')}</div>
+      </div>
+      <div class="field">
+        <label for="rrDesc">${translate('createDescLabel')}</label>
+        <textarea id="rrDesc" rows="3" maxlength="500" placeholder="${translate('createDescPlaceholder')}"></textarea>
+      </div>
+      <div class="field">
+        <label for="rrLogo">${translate('createLogoLabel')}</label>
+        <input id="rrLogo" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+      </div>
+      <div class="field">
+        <label for="rrPair">${translate('pairPickerTitle')}</label>
+        <select id="rrPair">
+          <option value="">SOL</option>
+        </select>
+        <div class="hint">${translate('reregisterPairHint')}</div>
+      </div>
+      <div class="field">
+        <label for="rrCategory">${translate('categoryLabel')}</label>
+        <select id="rrCategory">
+          ${COIN_CATEGORIES.map((cat) => `<option value="${esc(cat)}" ${cat === 'Lainnya' ? 'selected' : ''}>${esc(categoryLabel(cat))}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label for="rrTax">${translate('taxLabel')}</label>
+        <select id="rrTax">
+          <option value="0">0%</option>
+          <option value="50">0.5%</option>
+          <option value="100" selected>1% ${translate('taxDefaultSuffix')}</option>
+          <option value="200">2%</option>
+          <option value="300">3%</option>
+          <option value="500">5%</option>
+          <option value="1000">10%</option>
+        </select>
+        <div class="hint">${translate('taxHint')}</div>
+      </div>
+      <label class="check-row">
+        <input type="checkbox" id="rrAdult">
+        <span>${translate('adultCheckboxLabel')}</span>
+      </label>
+      <div id="rrWalletStatus"></div>
+      <div id="rrResult" style="margin-top:8px"></div>
+      <button class="btn btn-primary" id="rrSubmitBtn" style="margin-top:8px">${translate('reregisterSubmitBtn')}</button>
+    </div>`;
+
+  const tickerInput = document.getElementById('rrTicker');
+  tickerInput.addEventListener('input', () => {
+    tickerInput.value = tickerInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  });
+
+  // Pair options: SOL + every listed site coin.
+  const pairSelect = document.getElementById('rrPair');
+  apiGet('/api/pairs')
+    .then((data) => {
+      (data.pairs || [])
+        .filter((p) => p.type === 'COIN')
+        .forEach((p) => {
+          const opt = document.createElement('option');
+          opt.value = p.mint;
+          opt.textContent = `$${p.symbol}${p.name ? ` — ${p.name}` : ''}`;
+          pairSelect.appendChild(opt);
+        });
+    })
+    .catch(() => {
+      /* pairs unavailable — SOL stays the only option */
+    });
+
+  let logoData = null;
+  document.getElementById('rrLogo').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    logoData = null;
+    if (!file) return;
+    if (file.size > 675000) {
+      toast(translate('errFileTooBig'));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const [meta, base64] = String(reader.result).split(',');
+      logoData = { dataBase64: base64, mimeType: file.type };
+    };
+    reader.readAsDataURL(file);
+  });
+
+  const walletEl = document.getElementById('rrWalletStatus');
+  if (!state.wallet) {
+    walletEl.innerHTML = `<div class="alert alert-info">${translate('reregisterConnectFirst')} <button class="btn btn-sm btn-primary" id="rrConnectBtn">${translate('headerConnect')}</button></div>`;
+    document.getElementById('rrConnectBtn').onclick = connectWallet;
+  } else {
+    walletEl.innerHTML = `<p class="small muted">${translate('reregisterWalletAs', { addr: esc(shortAddr(state.wallet)) })}</p>`;
+  }
+
+  document.getElementById('rrSubmitBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('rrSubmitBtn');
+    const resEl = document.getElementById('rrResult');
+    const mintAddress = document.getElementById('rrMint').value.trim();
+    const name = document.getElementById('rrName').value.trim();
+    const ticker = document.getElementById('rrTicker').value.trim();
+    const description = document.getElementById('rrDesc').value.trim();
+    const fail = (msg) => {
+      resEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
+      btn.disabled = false;
+    };
+    if (!mintAddress || !name || !ticker) {
+      fail(translate('errReregisterFields'));
+      return;
+    }
+    if (!state.wallet) {
+      fail(translate('errConnectFirst'));
+      return;
+    }
+    btn.disabled = true;
+    resEl.innerHTML = `<p class="muted">${translate('reregisterVerifying')}</p>`;
+    try {
+      const phantom = (await waitForPhantom(3000)) || getPhantom();
+      if (!phantom) throw new Error(translate('errPhantomShort'));
+      if (typeof phantom.signMessage !== 'function') {
+        throw new Error(translate('errNoSignMessage'));
+      }
+      if (!(await syncWalletAccount())) {
+        throw new Error(translate('errReadAccountShort'));
+      }
+      const message = reRegisterMessage({ wallet: state.wallet, mint: mintAddress });
+      toast(translate('toastSignReregister'));
+      const signature = await signWalletMessage(phantom, message);
+      const res = await apiPost('/api/coins/re-register', {
+        mintAddress,
+        name,
+        ticker,
+        description,
+        creatorWallet: state.wallet,
+        pairMint: pairSelect.value || undefined,
+        category: document.getElementById('rrCategory').value,
+        feeBps: Number(document.getElementById('rrTax').value || 100),
+        isAdult: document.getElementById('rrAdult').checked,
+        image: logoData || undefined,
+        message,
+        signature,
+      });
+      resEl.innerHTML = `<div class="alert alert-success">${translate('reregisterSuccess', {
+        ticker: esc(res.coin.ticker),
+        price: fmtPriceBoth(res.coin.priceUsd, res.coin.price),
+      })}</div>`;
+      toast(translate('toastCoinRegistered', { ticker: res.coin.ticker }));
+      setTimeout(() => {
+        location.hash = `#/coin/${mintAddress}`;
+      }, 800);
+    } catch (err) {
+      fail(esc(translate('reregisterFailed', { msg: friendlyError(err) })));
+    }
+  });
+}
+
 // ---------- Coin detail ----------
 async function renderCoin(mintAddress) {
+  const mySeq = ++coinRenderSeq;
   const view = document.getElementById('view');
   view.innerHTML = `<p class="muted">${translate('loadingCoin')}</p>`;
   let data;
@@ -1317,7 +2019,8 @@ async function renderCoin(mintAddress) {
     return;
   }
   state.coinCache = data;
-  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd } = data;
+  if (mySeq !== coinRenderSeq) return; // a newer coin render started
+  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd, rewardPool, stream, pairCoin, solBuyAvailable, solBuyUnavailableReason } = data;
   const chg = stats.changePct >= 0 ? 'profit' : 'loss';
   const isCreator = state.wallet && state.wallet === coin.creatorWallet;
   // Pair asset: SOL for SOL pairs, the pair coin's ticker for coin pairs.
@@ -1325,13 +2028,30 @@ async function renderCoin(mintAddress) {
   const pairAvailable = !coin.pairAsset || coin.pairAsset.available !== false;
   const pairLabel = coin.pairLabel || `${coin.ticker}/SOL`;
 
+  // 18+ gate: viewers who have not confirmed their age see a gate card
+  // instead of the coin detail (same one-time confirmation as the feed).
+  if (coin.isAdult && !isAgeConfirmed()) {
+    view.innerHTML = `
+      <div class="card empty">
+        <h2>${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span> <span class="badge badge-adult">18+</span></h2>
+        <p>${translate('adultGateBody')}</p>
+        <p><button class="btn btn-primary" id="adultGateBtn">${translate('adultRevealBtn')}</button></p>
+        <p><a href="#/">${translate('backHome')}</a></p>
+      </div>`;
+    document.getElementById('adultGateBtn').addEventListener('click', () => {
+      showAgeConfirmModal(() => renderCoin(mintAddress));
+    });
+    return;
+  }
+
   view.innerHTML = `
     <div class="card">
       <div class="coin-head">
         ${logoHtml(coin, 'coin-logo detail-head-logo')}
         <div>
-          <div class="coin-name" style="font-size:1.3rem">${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span></div>
-          <div class="small muted">${esc(pairLabel)} • ${translate('coinCreatedBy', { ago: fmtAgo(coin.createdAt), creator: creatorLink(coin.creatorWallet) })}</div>
+          <div class="coin-name" style="font-size:1.3rem">${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span>${coin.isAdult ? '<span class="badge badge-adult">18+</span>' : ''}${coin.isLive ? `<span class="badge badge-live-stream">● ${translate('liveBadge')}${coin.viewerCount ? ` · ${coin.viewerCount}` : ''}</span>` : ''}</div>
+          <div class="small muted">${esc(pairLabel)} • ${translate('coinCreatedBy', { ago: fmtAgo(coin.createdAt), creator: creatorLink(coin.creatorWallet) + verifiedBadgeHtml(coin.creatorProfile) + badgesHtml(coin.creatorProfile && coin.creatorProfile.badges) })}</div>
+          <div class="coin-badges" style="margin-top:6px">${categoryBadgeHtml(coin.category)}<span class="badge badge-tax">${translate('taxBadge', { pct: creatorFeePct })}</span></div>
         </div>
         <span class="badge badge-ok" style="margin-left:auto">${translate('badgeVerified')}</span>
         ${coin.tradingEnabled ? '' : `<span class="badge badge-warn">${translate('badgeTradingOff')}</span>`}
@@ -1364,6 +2084,7 @@ async function renderCoin(mintAddress) {
 
     <div class="detail-layout">
     <div class="detail-main">
+    <div class="card" id="streamCard"></div>
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
         <h2 style="margin:0">${translate('chartTitle')}</h2>
@@ -1451,9 +2172,11 @@ async function renderCoin(mintAddress) {
       <div id="calloutList">
         ${(callouts || []).length === 0
           ? `<p class="muted">${translate('calloutsEmpty')}</p>`
-          : (callouts || []).map((c) => calloutHtml(c)).join('')}
+          : (callouts || []).map((c) => calloutHtml(c, { showClaim: true })).join('')}
       </div>
     </div>
+
+    <div class="card" id="rewardCard"></div>
     </div>
     <aside class="detail-side">
       <div class="card trade-box">
@@ -1736,6 +2459,7 @@ async function renderCoin(mintAddress) {
   }
   // Live on-chain balances before the trade form renders (MAX uses them).
   await refreshOnchainBalances();
+  if (mySeq !== coinRenderSeq) return; // a newer coin render started
   renderTradeForm();
   renderPnlCard();
   renderBurnForm();
@@ -1744,6 +2468,16 @@ async function renderCoin(mintAddress) {
   renderTransferForm();
   renderTradesTable();
   renderCalloutForm();
+  renderStreamPanel();
+  renderRewardCard();
+
+  // Callout reward claims (author only — the buttons render only for the
+  // author, on eligible unclaimed tiers).
+  view.querySelectorAll('[data-claim-reward]').forEach((b) => {
+    b.addEventListener('click', () => {
+      claimCalloutReward(mintAddress, Number(b.dataset.claimReward), Number(b.dataset.tier), b);
+    });
+  });
 
   // Callout form: only wallets with a real buy of this coin may post
   // (the server re-verifies from the trade records).
@@ -1793,6 +2527,167 @@ async function renderCoin(mintAddress) {
     });
   }
 
+  // Livestream panel: the creator's go-live controls, or the viewer
+  // (video + live chat) when the coin is live. Re-renders are safe while
+  // streaming — an active broadcaster/viewer session re-attaches its
+  // stream to the new video element instead of re-joining.
+  function renderStreamPanel() {
+    const card = document.getElementById('streamCard');
+    if (!card) return;
+    const isActiveBroadcaster =
+      streamState.mint === mintAddress && streamState.role === 'broadcaster';
+    const isActiveViewer = streamState.mint === mintAddress && streamState.role === 'viewer';
+    const live = !!stream || isActiveBroadcaster;
+    if (!live && !isActiveViewer) {
+      const mediaOk =
+        typeof navigator !== 'undefined' &&
+        navigator.mediaDevices &&
+        typeof navigator.mediaDevices.getUserMedia === 'function';
+      card.innerHTML = `
+        <h2 style="margin-top:0">🔴 ${translate('streamTitle')}</h2>
+        <p class="muted">${translate('streamNotLive')}</p>
+        <p class="small muted">${translate('streamMeshNote')}</p>
+        ${isCreator
+          ? `<div id="streamControls">
+              <button class="btn btn-primary" id="streamStartBtn" ${mediaOk ? '' : 'disabled'}>${translate('streamGoLiveBtn')}</button>
+              ${mediaOk ? '' : `<p class="small muted">${translate('streamNoMedia')}</p>`}
+            </div>
+            <p class="small muted">${translate('streamCreatorNote')}</p>`
+          : ''}
+        <div id="streamStatus" class="small muted"></div>`;
+      const startBtn = document.getElementById('streamStartBtn');
+      if (startBtn) startBtn.addEventListener('click', () => startStream(mintAddress));
+      return;
+    }
+    card.innerHTML = `
+      <h2 style="margin-top:0">🔴 ${translate('streamTitle')} <span class="badge badge-live-stream">● ${translate('liveBadge')}</span> <span class="small muted" id="streamViewerCount"></span></h2>
+      <div class="stream-video-wrap">
+        <video id="streamVideo" autoplay playsinline ${isActiveBroadcaster ? 'muted' : ''}></video>
+      </div>
+      <p class="small muted" id="streamStatus">${translate('streamConnecting')}</p>
+      <div id="streamControls">${isActiveBroadcaster ? `<button class="btn btn-sell" id="streamStopBtn">${translate('streamStopBtn')}</button>` : ''}</div>
+      <div class="stream-chat">
+        <h3>${translate('streamChatTitle')}</h3>
+        <div class="stream-chat-log" id="streamChatLog"><p class="muted small stream-chat-empty">${translate('streamChatEmpty')}</p></div>
+        <div id="streamChatAuth"></div>
+      </div>
+      <p class="small muted">${translate('streamMeshNote')}</p>`;
+    const video = document.getElementById('streamVideo');
+    if (video) {
+      if (isActiveBroadcaster && streamState.localStream) {
+        video.srcObject = streamState.localStream;
+        video.muted = true;
+        video.play().catch(() => {});
+      } else if (isActiveViewer && streamState.remoteStream) {
+        video.srcObject = streamState.remoteStream;
+        video.play().catch(() => {});
+      }
+    }
+    const stopBtn = document.getElementById('streamStopBtn');
+    if (stopBtn) {
+      stopBtn.addEventListener('click', () => {
+        stopStream();
+        route();
+      });
+    }
+    if (isActiveBroadcaster) {
+      setStreamStatus('streamLiveNow');
+      refreshStreamControls();
+      refreshStreamChatAuth();
+      updateStreamViewerCount(streamState.viewerCount);
+    } else if (isActiveViewer) {
+      setStreamStatus(streamState.ended ? 'streamEnded' : 'streamWatching');
+      refreshStreamChatAuth();
+      updateStreamViewerCount(streamState.viewerCount);
+    } else {
+      // Live but not connected yet (fresh page load): join as a viewer.
+      joinStreamAsViewer(mintAddress);
+      refreshStreamChatAuth();
+      updateStreamViewerCount((stream && stream.viewerCount) || 0);
+    }
+  }
+
+  // Callout reward pool: creator-funded SOL, tiered claims for callout
+  // authors (+10% / +25% / +50% live PnL -> 0.01 / 0.025 / 0.05 SOL).
+  // The creator funds the pool with a real SOL transfer to the pool
+  // wallet (verified on-chain); claims pay out real SOL from the pool.
+  function renderRewardCard() {
+    const card = document.getElementById('rewardCard');
+    if (!card) return;
+    const pool = rewardPool || { balanceSol: 0, totalFundedSol: 0, totalClaimedSol: 0, tiers: [] };
+    const tiers = pool.tiers && pool.tiers.length ? pool.tiers : [];
+    card.innerHTML = `
+      <h2 style="margin-top:0">⭐ ${translate('rewardTitle')}</h2>
+      <p class="small muted">${translate('rewardIntro')}</p>
+      <div class="stat-grid" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="stat"><div class="label">${translate('rewardPoolBalance')}</div><div class="value">${fmtSol(pool.balanceSol)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('rewardTotalFunded')}</div><div class="value">${fmtSol(pool.totalFundedSol)} SOL</div></div>
+        <div class="stat"><div class="label">${translate('rewardTotalClaimed')}</div><div class="value">${fmtSol(pool.totalClaimedSol)} SOL</div></div>
+      </div>
+      <div class="reward-tiers">
+        ${tiers
+          .map(
+            (t) =>
+              `<span class="reward-chip" title="${translate('rewardTierTitle', { pct: t.pct, amount: fmtSol(t.amountSol) })}">+${t.pct}% → ${fmtSol(t.amountSol)} SOL</span>`
+          )
+          .join('')}
+      </div>
+      ${isCreator
+        ? `<div style="margin-top:12px">
+            <h3 style="margin:0 0 4px">${translate('rewardFundTitle')}</h3>
+            <p class="small muted">${translate('rewardFundIntro')}</p>
+            <div class="field">
+              <label>${translate('rewardFundAmountLabel')}</label>
+              <input id="rewardFundAmount" type="number" min="0" step="any" placeholder="0.1">
+            </div>
+            <button class="btn btn-primary" id="rewardFundBtn">${translate('rewardFundBtn')}</button>
+            <div id="rewardFundResult" style="margin-top:8px"></div>
+          </div>`
+        : ''}`;
+    const fundBtn = document.getElementById('rewardFundBtn');
+    if (!fundBtn) return;
+    fundBtn.addEventListener('click', async () => {
+      const amount = Number(document.getElementById('rewardFundAmount').value);
+      const resEl = document.getElementById('rewardFundResult');
+      if (!(amount > 0)) {
+        toast(translate('errRewardFundAmount'));
+        return;
+      }
+      fundBtn.disabled = true;
+      resEl.innerHTML = `<p class="muted">${translate('rewardFunding')}</p>`;
+      try {
+        if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
+        const phantom = (await waitForPhantom(3000)) || getPhantom();
+        if (!phantom) throw new Error(translate('errPhantomShort'));
+        if (!(await syncWalletAccount())) {
+          throw new Error(translate('errReadAccountShort'));
+        }
+        const poolAddress = await loadPoolAddress();
+        if (!poolAddress) throw new Error(translate('errPoolUnavailable'));
+        const built = await buildSolTransferTransaction(state.wallet, poolAddress, amount);
+        const sim = await simulateTransaction(built.transaction);
+        if (!sim.ok) throw new Error(`Simulasi gagal: ${sim.error}`);
+        const sig = await signAndSend(phantom, built.transaction);
+        resEl.innerHTML = `<p class="muted">${translate('rewardVerifying')}</p>`;
+        await apiPost(`/api/coins/${coin.mintAddress}/reward-fund`, {
+          wallet: state.wallet,
+          amountSol: amount,
+          txSignature: sig,
+        });
+        resEl.innerHTML = `<div class="alert alert-success">${translate('rewardFundSuccess', {
+          amount: fmtSol(amount),
+          tx: txLink(sig),
+        })}</div>`;
+        await refreshBalance();
+        renderHeader();
+        setTimeout(() => renderCoin(mintAddress), 1200);
+      } catch (err) {
+        resEl.innerHTML = `<div class="alert alert-error">${esc(translate('rewardFundFailed', { msg: friendlyError(err) }))}</div>`;
+        fundBtn.disabled = false;
+      }
+    });
+  }
+
   function renderTradeForm() {
     const form = document.getElementById('tradeForm');
     const pnl = walletPnl;
@@ -1818,50 +2713,113 @@ async function renderCoin(mintAddress) {
       return;
     }
     if (state.tradeSide === 'buy') {
-      // Quick amounts are pair-aware: SOL pairs use SOL amounts, coin
-      // pairs use pair-token amounts (min buy is 1,000 pair tokens).
-      const quickAmounts = pairAsset === 'SOL' ? [0.1, 0.5, 1, 5] : [1000, 100000, 1000000, 10000000];
-      form.innerHTML = `
+      // Payment choice (custom-pair coins only): pay with SOL (default —
+      // routed SOL -> pair tokens -> target tokens, one hop) or directly
+      // with the pair asset. SOL pairs have no choice (SOL is the pair).
+      const isCoinPair = !!coin.pairMint;
+      const solBuyOk = isCoinPair ? solBuyAvailable !== false : true;
+      let payWith = isCoinPair && solBuyOk ? 'sol' : 'pair';
+      const payChoiceHtml = isCoinPair
+        ? `<div class="field">
+          <label>${translate('payWithLabel')}</label>
+          <div class="pay-choice">
+            <label class="pay-option"><input type="radio" name="payWith" value="sol" ${payWith === 'sol' ? 'checked' : ''} ${solBuyOk ? '' : 'disabled'}> ${translate('payWithSol')}</label>
+            <label class="pay-option"><input type="radio" name="payWith" value="pair" ${payWith === 'pair' ? 'checked' : ''}> ${translate('payWithPair', { asset: esc(pairAsset) })}</label>
+          </div>
+          ${solBuyOk
+            ? `<p class="small muted">${translate('payWithSolHint', { pair: esc(pairAsset), ticker: esc(coin.ticker) })}</p>`
+            : `<p class="small muted">${translate(solBuyUnavailableReason === 'deep-chain' ? 'payWithSolDeepChain' : 'payWithSolUnavailable', { pair: esc(pairAsset) })}</p>`}
+        </div>`
+        : '';
+      // Quick amounts + labels follow the selected payment asset.
+      const renderAmountField = () => {
+        const useSol = !isCoinPair || payWith === 'sol';
+        const asset = useSol ? 'SOL' : pairAsset;
+        const quickAmounts = useSol ? [0.1, 0.5, 1, 5] : [1000, 100000, 1000000, 10000000];
+        return `
         <div class="field">
-          <label>${translate('buyAmountLabel', { asset: esc(pairAsset) })}</label>
-          <input id="buySol" type="number" min="0" step="any" placeholder="${pairAsset === 'SOL' ? '0.5' : '100000'}">
+          <label>${translate('buyAmountLabel', { asset: esc(asset) })}</label>
+          <input id="buySol" type="number" min="0" step="any" placeholder="${useSol ? '0.5' : '100000'}">
           <div class="quick">
-            ${quickAmounts.map((v) => `<button class="btn" data-quick="${v}">${fmtTokens(v)} ${esc(pairAsset)}</button>`).join('')}
+            ${quickAmounts.map((v) => `<button class="btn" data-quick="${v}">${fmtTokens(v)} ${esc(asset)}</button>`).join('')}
           </div>
           <div class="estimate" id="buyEstimate"></div>
-        </div>
-        <button class="btn btn-buy" id="buyBtn">${translate('buyBtnLabel', { ticker: esc(coin.ticker) })}</button>
-        <p class="small muted" style="margin-top:8px">${translate('buyNote', { asset: esc(pairAsset) })}</p>`;
-      const input = document.getElementById('buySol');
-      const update = () => {
-        const sol = Number(input.value);
-        const est = document.getElementById('buyEstimate');
-        if (sol > 0) {
-          const tokens = (coin.tokenReserve * sol) / (coin.solReserve + sol);
-          const fee = (sol * creatorFeePct) / 100;
-          const execSol = sol / tokens;
-          const execUsd = assetUsd !== null ? execSol * assetUsd : null;
-          est.textContent = translate('buyEstimate', {
-            tokens: fmtTokens(tokens),
-            ticker: coin.ticker,
-            price: fmtPriceBoth(execUsd, execSol),
-            pct: creatorFeePct,
-            fee: fmtSol(fee),
-            asset: pairAsset,
-          });
-        } else est.textContent = '';
+        </div>`;
       };
-      input.addEventListener('input', update);
-      form.querySelectorAll('[data-quick]').forEach((b) => {
-        b.addEventListener('click', () => {
-          input.value = b.dataset.quick;
-          update();
+      form.innerHTML = `
+        ${payChoiceHtml}
+        <div id="buyAmountWrap">${renderAmountField()}</div>
+        <button class="btn btn-buy" id="buyBtn">${translate('buyBtnLabel', { ticker: esc(coin.ticker) })}</button>
+        <p class="small muted" style="margin-top:8px">${translate('buyNote', { asset: esc(payWith === 'sol' || !isCoinPair ? 'SOL' : pairAsset) })}</p>`;
+      const wireAmountField = () => {
+        const input = document.getElementById('buySol');
+        const update = () => {
+          const amount = Number(input.value);
+          const est = document.getElementById('buyEstimate');
+          if (!(amount > 0)) {
+            est.innerHTML = '';
+            return;
+          }
+          if (payWith === 'sol' && isCoinPair && pairCoin) {
+            // Two-hop local estimate (mirrors bonding.quoteRoutedBuy):
+            // SOL -> pair tokens through the pair coin's curve, then
+            // pair tokens -> target tokens through this coin's curve.
+            const pairFeePct = (pairCoin.feeBps ?? 100) / 100;
+            const pairOut = (pairCoin.tokenReserve * amount) / (pairCoin.solReserve + amount);
+            const tokens = (coin.tokenReserve * pairOut) / (coin.solReserve + pairOut);
+            const feePair = (amount * pairFeePct) / 100;
+            const feeTarget = (pairOut * creatorFeePct) / 100;
+            const execSol = amount / tokens;
+            const execUsd = Number.isFinite(solUsd) && solUsd > 0 ? execSol * solUsd : null;
+            const usdPaid =
+              Number.isFinite(solUsd) && solUsd > 0 ? ` (≈${fmtUsd(amount * solUsd)})` : '';
+            est.innerHTML = translate('routeBuyEstimate', {
+              sol: fmtSol(amount),
+              usd: usdPaid || '',
+              pairAmount: fmtTokens(pairOut),
+              pairSymbol: pairAsset,
+              tokens: fmtTokens(tokens),
+              ticker: coin.ticker,
+              price: fmtPriceBoth(execUsd, execSol),
+              feePair: fmtSol(feePair),
+              feeTarget: fmtTokens(feeTarget),
+            });
+          } else {
+            const tokens = (coin.tokenReserve * amount) / (coin.solReserve + amount);
+            const fee = (amount * creatorFeePct) / 100;
+            const execSol = amount / tokens;
+            const execUsd = assetUsd !== null ? execSol * assetUsd : null;
+            est.textContent = translate('buyEstimate', {
+              tokens: fmtTokens(tokens),
+              ticker: coin.ticker,
+              price: fmtPriceBoth(execUsd, execSol),
+              pct: creatorFeePct,
+              fee: fmtSol(fee),
+              asset: pairAsset,
+            });
+          }
+        };
+        input.addEventListener('input', update);
+        form.querySelectorAll('[data-quick]').forEach((b) => {
+          b.addEventListener('click', () => {
+            input.value = b.dataset.quick;
+            update();
+          });
+        });
+      };
+      wireAmountField();
+      form.querySelectorAll('input[name="payWith"]').forEach((r) => {
+        r.addEventListener('change', () => {
+          payWith = r.value;
+          document.getElementById('buyAmountWrap').innerHTML = renderAmountField();
+          wireAmountField();
         });
       });
       document.getElementById('buyBtn').addEventListener('click', async () => {
-        const sol = Number(input.value);
-        if (!(sol > 0)) return toast(translate('errEnterSol', { asset: pairAsset }));
-        await submitTrade('buy', { solAmount: sol });
+        const amount = Number(document.getElementById('buySol').value);
+        const asset = payWith === 'sol' || !isCoinPair ? 'SOL' : pairAsset;
+        if (!(amount > 0)) return toast(translate('errEnterSol', { asset }));
+        await submitTrade('buy', { solAmount: amount, payWith: isCoinPair ? payWith : undefined });
       });
     } else {
       form.innerHTML = `
@@ -1959,9 +2917,11 @@ async function renderCoin(mintAddress) {
       });
 
       // 2. Build the user's leg and simulate it before asking to sign.
+      // Routed SOL buys (payWith 'sol' on a coin-paired coin) pay SOL,
+      // so their leg is the plain SOL transfer like a SOL-pair buy.
       setBusy(translate('tradeBuilding'));
       let built;
-      if (side === 'buy' && coin.pairMint) {
+      if (side === 'buy' && coin.pairMint && amounts.payWith !== 'sol') {
         built = await buildPairBuyTransaction(
           state.wallet,
           coin.mintAddress,
@@ -1987,6 +2947,7 @@ async function renderCoin(mintAddress) {
         mintAddress: coin.mintAddress,
         wallet: state.wallet,
         ...(side === 'buy' ? { solAmount: prepared.solAmount } : { tokenAmount: prepared.tokenAmount }),
+        ...(side === 'buy' && amounts.payWith ? { payWith: amounts.payWith } : {}),
         userTxSignature: userSig,
       });
       const receivedNote =
@@ -2002,7 +2963,16 @@ async function renderCoin(mintAddress) {
         asset: pairAsset,
         price: fmtPriceBoth(execUsd, res.trade.price),
       });
-      resEl.innerHTML = `<div class="alert alert-success">${successMsg}${receivedNote}<br>
+      // Routed buy: show the route the SOL took (SOL -> PAIR -> TICKER).
+      const routeNote = res.route
+        ? `<br>${translate('tradeSuccessRoute', {
+            sol: fmtSol(res.route.solAmount),
+            pairAmount: fmtTokens(res.route.via.amount),
+            pairSymbol: esc(res.route.via.symbol),
+            feePair: fmtSol(res.route.via.feeSol),
+          })}`
+        : '';
+      resEl.innerHTML = `<div class="alert alert-success">${successMsg}${receivedNote}${routeNote}<br>
       ${translate('tradeSuccessTxs', { userTx: txLink(res.trade.userTxSignature), poolTx: txLink(res.trade.poolTxSignature) })}</div>`;
       await refreshBalance();
       renderHeader();
@@ -2451,7 +3421,10 @@ async function renderCoin(mintAddress) {
     form.innerHTML = `
       <div class="field">
         <label>${translate('transferRecipientLabel')}</label>
-        <input id="transferTo" type="text" placeholder="${translate('transferRecipientPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <select id="transferContact" hidden>
+          <option value="">${translate('contactPickerPlaceholder')}</option>
+        </select>
+        <input id="transferTo" type="text" placeholder="${translate('transferRecipientPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false" style="margin-top:6px">
       </div>
       <div class="field">
         <label>${translate('transferAmountLabel', { ticker: esc(coin.ticker) })}</label>
@@ -2463,6 +3436,7 @@ async function renderCoin(mintAddress) {
       <button class="btn btn-primary" id="transferBtn">${translate('transferBtn', { ticker: esc(coin.ticker) })}</button>
       <p class="small muted" style="margin-top:8px">${translate('transferNote')}</p>`;
     const input = document.getElementById('transferAmount');
+    loadContactPicker(document.getElementById('transferContact'), document.getElementById('transferTo'));
     document.getElementById('maxTransfer').addEventListener('click', () => {
       input.value = liveHoldings;
     });
@@ -2473,6 +3447,461 @@ async function renderCoin(mintAddress) {
       if (!(amount > 0)) return toast(translate('errTransferEnterAmount'));
       await submitTransfer(coin, to, amount, document.getElementById('transferResult'));
     });
+  }
+}
+
+// ---------- Livestream client (WebRTC mesh) ----------
+// The server only relays signaling + chat; media flows directly between
+// the broadcaster and each viewer (mesh). See src/stream.js for the
+// protocol and the honest limits: the broadcaster uploads one stream per
+// viewer (~10 is the practical max, 25 is the server cap), public STUN
+// only (no TURN — strict symmetric NATs may fail), no recording, chat is
+// in-memory only.
+const streamState = {
+  mint: null,
+  role: null, // 'broadcaster' | 'viewer' | null
+  ws: null,
+  viewerId: null,
+  localStream: null, // broadcaster's camera/mic
+  remoteStream: null, // viewer's received stream
+  peers: new Map(), // broadcaster: viewerId -> RTCPeerConnection
+  viewerPeer: null, // viewer: the single peer to the broadcaster
+  authed: false,
+  viewerCount: 0,
+  ended: false,
+};
+
+const STREAM_STUN = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+function streamWsUrl(mint) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/ws/stream?mint=${encodeURIComponent(mint)}`;
+}
+
+// Full cleanup: close the socket + all peer connections + the camera/mic.
+// Safe to call when nothing is active; route() calls it on every
+// navigation so a stream never survives leaving the coin page.
+function stopStream() {
+  if (streamState.ws) {
+    try {
+      if (streamState.ws.readyState === WebSocket.OPEN) {
+        streamState.ws.send(JSON.stringify({ type: 'leave' }));
+      }
+      streamState.ws.close();
+    } catch {
+      /* already gone */
+    }
+  }
+  for (const pc of streamState.peers.values()) {
+    try {
+      pc.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  if (streamState.viewerPeer) {
+    try {
+      streamState.viewerPeer.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  if (streamState.localStream) {
+    streamState.localStream.getTracks().forEach((t) => t.stop());
+  }
+  streamState.mint = null;
+  streamState.role = null;
+  streamState.ws = null;
+  streamState.viewerId = null;
+  streamState.localStream = null;
+  streamState.remoteStream = null;
+  streamState.peers = new Map();
+  streamState.viewerPeer = null;
+  streamState.authed = false;
+  streamState.viewerCount = 0;
+  streamState.ended = false;
+}
+
+function streamSend(obj) {
+  if (streamState.ws && streamState.ws.readyState === WebSocket.OPEN) {
+    streamState.ws.send(JSON.stringify(obj));
+  }
+}
+
+function streamStatusEl() {
+  return document.getElementById('streamStatus');
+}
+
+function setStreamStatus(key, vars) {
+  const el = streamStatusEl();
+  if (el) el.textContent = translate(key, vars || {});
+}
+
+function updateStreamViewerCount(n) {
+  streamState.viewerCount = n;
+  const el = document.getElementById('streamViewerCount');
+  if (el) el.textContent = translate('streamViewers', { n });
+}
+
+// Append one chat message to the stream chat log (verified checkmark +
+// community badges, same as callouts).
+function appendStreamChat(msg) {
+  const log = document.getElementById('streamChatLog');
+  if (!log) return;
+  const empty = log.querySelector('.stream-chat-empty');
+  if (empty) empty.remove();
+  const profile = {
+    username: msg.username || null,
+    avatarUrl: msg.avatarUrl || null,
+    border: msg.border || 'none',
+    verified: !!msg.verified,
+    badges: msg.badges || [],
+  };
+  const div = document.createElement('div');
+  div.className = 'stream-chat-msg';
+  div.innerHTML = `${avatarHtml(profile, msg.wallet, 22, true)} ${creatorLink(msg.wallet, displayName(profile, msg.wallet))}${verifiedBadgeHtml(profile)}${badgesHtml(profile.badges)} <span class="stream-chat-text">${esc(msg.text)}</span> <span class="muted small">${fmtTime(msg.time)}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// Shared WebSocket message handling for both roles.
+function handleStreamMessage(msg) {
+  switch (msg.type) {
+    case 'joined': {
+      streamState.viewerId = msg.viewerId || null;
+      streamState.authed = !!msg.chatAuthed;
+      updateStreamViewerCount(msg.viewerCount || 0);
+      if (streamState.role === 'broadcaster') {
+        setStreamStatus('streamLiveNow');
+        // The panel was rendered as "not live" before the join confirmed
+        // (no video/chat elements) — re-render the coin page so it shows
+        // the live broadcaster view; renderStreamPanel re-attaches the
+        // local stream to the new video element.
+        if (!document.getElementById('streamChatLog') && streamState.mint) {
+          renderCoin(streamState.mint);
+        } else {
+          refreshStreamControls();
+        }
+        // Waiting viewers who joined before the stream started.
+        (msg.viewers || []).forEach((viewerId) => createViewerPeer(viewerId));
+      } else if (msg.live) {
+        setStreamStatus('streamConnecting');
+      } else {
+        setStreamStatus('streamWaiting');
+      }
+      refreshStreamChatAuth();
+      break;
+    }
+    case 'viewer-joined':
+      updateStreamViewerCount(msg.viewerCount || 0);
+      if (streamState.role === 'broadcaster') createViewerPeer(msg.viewerId);
+      break;
+    case 'viewer-left':
+      updateStreamViewerCount(msg.viewerCount || 0);
+      if (streamState.role === 'broadcaster') closeViewerPeer(msg.viewerId);
+      break;
+    case 'viewer-count':
+      updateStreamViewerCount(msg.viewerCount || 0);
+      break;
+    case 'stream-started':
+      updateStreamViewerCount(msg.viewerCount || 0);
+      setStreamStatus('streamConnecting');
+      break;
+    case 'stream-ended': {
+      streamState.ended = true;
+      if (streamState.viewerPeer) {
+        try {
+          streamState.viewerPeer.close();
+        } catch {
+          /* already closed */
+        }
+        streamState.viewerPeer = null;
+      }
+      streamState.remoteStream = null;
+      setStreamStatus('streamEnded');
+      const video = document.getElementById('streamVideo');
+      if (video) video.srcObject = null;
+      break;
+    }
+    case 'offer':
+      // Viewer: the broadcaster's offer — answer it.
+      if (streamState.role !== 'viewer') break;
+      answerStreamOffer(msg.sdp);
+      break;
+    case 'answer':
+      // Broadcaster: a viewer's answer to our offer.
+      if (streamState.role !== 'broadcaster') break;
+      {
+        const pc = streamState.peers.get(msg.from);
+        if (pc && pc.signalingState !== 'closed') {
+          pc.setRemoteDescription(new RTCSessionDescription(msg.sdp)).catch(() => {});
+        }
+      }
+      break;
+    case 'ice': {
+      const pc =
+        streamState.role === 'broadcaster'
+          ? streamState.peers.get(msg.from)
+          : streamState.viewerPeer;
+      if (pc && msg.candidate) {
+        pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(() => {});
+      }
+      break;
+    }
+    case 'chat':
+      appendStreamChat(msg);
+      break;
+    case 'authed':
+      streamState.authed = true;
+      refreshStreamChatAuth();
+      toast(translate('streamChatEnabled'));
+      break;
+    case 'error':
+      setStreamStatus('streamError');
+      toast(translate('streamErrorToast', { msg: msg.error || '' }));
+      break;
+    default:
+      break;
+  }
+}
+
+function openStreamSocket(mint, onOpen) {
+  const ws = new WebSocket(streamWsUrl(mint));
+  streamState.ws = ws;
+  ws.onopen = onOpen;
+  ws.onmessage = (e) => {
+    try {
+      handleStreamMessage(JSON.parse(e.data));
+    } catch {
+      /* ignore malformed frames */
+    }
+  };
+  ws.onclose = () => {
+    // The socket closing ends the stream for this tab (server restart,
+    // network drop, or the broadcaster leaving). Keep the panel's
+    // "stream ended" state instead of silently hanging.
+    if (streamState.ws === ws && streamState.role) {
+      streamState.ended = true;
+      setStreamStatus('streamEnded');
+    }
+  };
+  ws.onerror = () => {
+    setStreamStatus('streamError');
+  };
+}
+
+// Broadcaster: one peer connection per viewer, fed with the local stream.
+async function createViewerPeer(viewerId) {
+  if (!viewerId || streamState.peers.has(viewerId)) return;
+  const pc = new RTCPeerConnection(STREAM_STUN);
+  streamState.peers.set(viewerId, pc);
+  if (streamState.localStream) {
+    streamState.localStream.getTracks().forEach((t) => pc.addTrack(t, streamState.localStream));
+  }
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      streamSend({ type: 'ice', to: viewerId, candidate: e.candidate.toJSON() });
+    }
+  };
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    streamSend({ type: 'offer', to: viewerId, sdp: pc.localDescription });
+  } catch {
+    closeViewerPeer(viewerId);
+  }
+}
+
+function closeViewerPeer(viewerId) {
+  const pc = streamState.peers.get(viewerId);
+  if (pc) {
+    try {
+      pc.close();
+    } catch {
+      /* already closed */
+    }
+    streamState.peers.delete(viewerId);
+  }
+}
+
+// Viewer: answer the broadcaster's offer, then render the remote stream.
+async function answerStreamOffer(sdp) {
+  try {
+    if (streamState.viewerPeer) {
+      try {
+        streamState.viewerPeer.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    const pc = new RTCPeerConnection(STREAM_STUN);
+    streamState.viewerPeer = pc;
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        streamSend({ type: 'ice', to: 'broadcaster', candidate: e.candidate.toJSON() });
+      }
+    };
+    pc.ontrack = (e) => {
+      streamState.remoteStream = e.streams[0] || null;
+      const video = document.getElementById('streamVideo');
+      if (video && streamState.remoteStream) {
+        video.srcObject = streamState.remoteStream;
+        video.play().catch(() => {});
+      }
+      setStreamStatus('streamWatching');
+    };
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    streamSend({ type: 'answer', sdp: pc.localDescription });
+  } catch {
+    setStreamStatus('streamError');
+  }
+}
+
+// Creator goes live: camera + mic -> signaling join (signature-proven).
+async function startStream(mint) {
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    toast(translate('streamNoMedia'));
+    return;
+  }
+  if (!state.wallet) {
+    toast(translate('errConnectFirst'));
+    return;
+  }
+  setStreamStatus('streamStarting');
+  try {
+    const localStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true,
+    });
+    streamState.localStream = localStream;
+    const video = document.getElementById('streamVideo');
+    if (video) {
+      video.srcObject = localStream;
+      video.muted = true;
+      video.play().catch(() => {});
+    }
+    const phantom = (await waitForPhantom(3000)) || getPhantom();
+    if (!phantom) throw new Error(translate('errPhantomShort'));
+    if (typeof phantom.signMessage !== 'function') {
+      throw new Error(translate('errNoSignMessage'));
+    }
+    const message = streamStartMessage({ wallet: state.wallet, mint });
+    toast(translate('toastSignStreamStart'));
+    const signature = await signWalletMessage(phantom, message);
+    streamState.mint = mint;
+    streamState.role = 'broadcaster';
+    streamState.ended = false;
+    openStreamSocket(mint, () => {
+      streamSend({
+        type: 'join',
+        role: 'broadcaster',
+        wallet: state.wallet,
+        message,
+        signature,
+      });
+    });
+    // The panel flips to the broadcaster view (stop button, live chat)
+    // when the server confirms the join — see refreshStreamControls().
+  } catch (err) {
+    if (streamState.localStream) {
+      streamState.localStream.getTracks().forEach((t) => t.stop());
+      streamState.localStream = null;
+    }
+    setStreamStatus('streamError');
+    toast(translate('streamStartFailed', { msg: friendlyError(err) }));
+  }
+}
+
+// Viewer joins a live room (watch-only; chat needs a one-time signature).
+function joinStreamAsViewer(mint) {
+  if (streamState.ws && streamState.mint === mint && streamState.role === 'viewer') return;
+  stopStream();
+  streamState.mint = mint;
+  streamState.role = 'viewer';
+  streamState.ended = false;
+  setStreamStatus('streamConnecting');
+  openStreamSocket(mint, () => {
+    streamSend({ type: 'join', role: 'viewer' });
+  });
+}
+
+// One-time chat auth: sign the canonical stream-join message so the
+// server knows the chat author is the wallet owner.
+async function authStreamChat(mint) {
+  if (!state.wallet) {
+    toast(translate('errConnectFirst'));
+    return;
+  }
+  try {
+    const phantom = (await waitForPhantom(3000)) || getPhantom();
+    if (!phantom) throw new Error(translate('errPhantomShort'));
+    if (typeof phantom.signMessage !== 'function') {
+      throw new Error(translate('errNoSignMessage'));
+    }
+    const message = streamJoinMessage({ wallet: state.wallet, mint });
+    toast(translate('toastSignStreamJoin'));
+    const signature = await signWalletMessage(phantom, message);
+    streamSend({ type: 'auth', wallet: state.wallet, message, signature });
+  } catch (err) {
+    toast(translate('streamAuthFailed', { msg: friendlyError(err) }));
+  }
+}
+
+function sendStreamChat() {
+  const input = document.getElementById('streamChatInput');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  streamSend({ type: 'chat', text });
+  input.value = '';
+}
+
+// Swap the stream controls to the broadcaster view (stop button) once the
+// server confirms the join. Stopping ends the stream for every viewer.
+function refreshStreamControls() {
+  const box = document.getElementById('streamControls');
+  if (!box) return;
+  if (streamState.role === 'broadcaster' && !streamState.ended) {
+    box.innerHTML = `<button class="btn btn-sell" id="streamStopBtn">${translate('streamStopBtn')}</button>`;
+    const btn = document.getElementById('streamStopBtn');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        stopStream();
+        route();
+      });
+    }
+  }
+}
+
+// Show the chat input (authed) or the auth button (wallet connected but
+// not authed) or the connect hint (no wallet).
+function refreshStreamChatAuth() {
+  const box = document.getElementById('streamChatAuth');
+  if (!box) return;
+  if (streamState.authed) {
+    box.innerHTML = `
+      <div class="stream-chat-input-row">
+        <input id="streamChatInput" type="text" maxlength="280" placeholder="${translate('streamChatPlaceholder')}">
+        <button class="btn btn-sm btn-primary" id="streamChatSendBtn">${translate('streamChatSend')}</button>
+      </div>`;
+    const input = document.getElementById('streamChatInput');
+    const sendBtn = document.getElementById('streamChatSendBtn');
+    if (sendBtn) sendBtn.addEventListener('click', sendStreamChat);
+    if (input) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') sendStreamChat();
+      });
+    }
+  } else if (state.wallet) {
+    box.innerHTML = `<button class="btn btn-sm" id="streamAuthBtn">${translate('streamAuthBtn')}</button>`;
+    const btn = document.getElementById('streamAuthBtn');
+    if (btn) {
+      btn.addEventListener('click', () => authStreamChat(streamState.mint));
+    }
+  } else {
+    box.innerHTML = `<p class="small muted">${translate('streamChatConnectFirst')}</p>`;
   }
 }
 
@@ -2542,6 +3971,123 @@ async function claimFeesForCoin(mintAddress, btn) {
   }
 }
 
+// Contact picker for transfer forms: loads the sender's address book
+// (GET /api/contacts?owner=) into a <select>; picking a contact fills the
+// recipient input. When the book is empty (or fails to load) the picker
+// stays hidden and the manual input still works.
+async function loadContactPicker(selectEl, inputEl) {
+  if (!selectEl || !inputEl || !state.wallet) return;
+  try {
+    const data = await apiGet(`/api/contacts?owner=${encodeURIComponent(state.wallet)}`);
+    const contacts = data.contacts || [];
+    if (!contacts.length) return;
+    selectEl.hidden = false;
+    contacts.forEach((c) => {
+      const opt = document.createElement('option');
+      opt.value = c.wallet;
+      opt.textContent = `${c.name} (${shortAddr(c.wallet)})`;
+      selectEl.appendChild(opt);
+    });
+    selectEl.addEventListener('change', () => {
+      if (selectEl.value) inputEl.value = selectEl.value;
+    });
+  } catch {
+    // Contacts unavailable — the manual address input still works.
+  }
+}
+
+// ---------- Transfer receipt ----------
+// Shared receipt markup (modal after a transfer + the permanent
+// #/receipt/<id> page): sender, recipient, coin + logo, amount sent
+// (tokens + the USD value snapshotted at transfer time), date/time, and
+// the tx signature with an Explorer link.
+function receiptHtml(transfer, coin) {
+  const ticker = (coin && coin.ticker) || transfer.coinTicker || '';
+  const name = (coin && coin.name) || transfer.coinName || '';
+  const logoUrl = (coin && coin.logoUrl) || transfer.coinLogoUrl || null;
+  const coinLabel = name ? `${name} ($${ticker})` : ticker ? `$${ticker}` : shortAddr(transfer.mintAddress);
+  const logo = logoUrl
+    ? `<img src="${esc(logoUrl)}" alt="" class="coin-logo">`
+    : `<div class="coin-avatar">${esc((ticker || '?').slice(0, 2).toUpperCase())}</div>`;
+  return `
+    <div class="receipt">
+      <h2 style="margin-top:0">🧾 ${translate('receiptTitle')}</h2>
+      <div class="receipt-coin">${logo} <b>${esc(coinLabel)}</b></div>
+      <div class="receipt-rows">
+        <div class="receipt-row"><span class="muted">${translate('receiptFrom')}</span><span>${creatorLink(transfer.fromWallet)}</span></div>
+        <div class="receipt-row"><span class="muted">${translate('receiptTo')}</span><span>${creatorLink(transfer.toWallet)}</span></div>
+        <div class="receipt-row"><span class="muted">${translate('receiptAmount')}</span><span><b>${fmtTokens(transfer.amount)} ${esc(ticker)}</b>${transfer.usdValue !== null && transfer.usdValue !== undefined ? ` <span class="muted">(${fmtUsd(transfer.usdValue)})</span>` : ''}</span></div>
+        <div class="receipt-row"><span class="muted">${translate('receiptDate')}</span><span>${fmtDate(transfer.createdAt)} ${fmtTime(transfer.createdAt)}</span></div>
+        <div class="receipt-row"><span class="muted">${translate('receiptTx')}</span><span>${txLink(transfer.txSignature)}</span></div>
+      </div>
+      <div class="row receipt-actions" style="justify-content:flex-start;margin-top:12px">
+        <button class="btn btn-sm" id="receiptCopyBtn">${translate('copyBtn')}</button>
+        <button class="btn btn-sm" id="receiptShareBtn">${translate('receiptShareBtn')}</button>
+        <button class="btn btn-sm" id="receiptPrintBtn">${translate('receiptPrintBtn')}</button>
+      </div>
+      <p class="small muted"><a href="#/receipt/${transfer.id}">${translate('receiptPermalink')}</a></p>
+    </div>`;
+}
+
+// Copy (receipt URL) / share (Web Share API, clipboard fallback) / print
+// (opens the receipt page, then the print dialog — the print stylesheet
+// hides the app chrome so only the receipt prints).
+function wireReceiptActions(transfer) {
+  const url = `${location.origin}${location.pathname}#/receipt/${transfer.id}`;
+  const copyBtn = document.getElementById('receiptCopyBtn');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(url).then(() => toast(translate('receiptCopied')));
+    });
+  }
+  const shareBtn = document.getElementById('receiptShareBtn');
+  if (shareBtn) {
+    shareBtn.addEventListener('click', async () => {
+      const text = translate('receiptShareText', {
+        amount: fmtTokens(transfer.amount),
+        ticker: transfer.coinTicker || '',
+      });
+      if (navigator.share) {
+        try {
+          await navigator.share({ title: translate('receiptTitle'), text, url });
+        } catch {
+          /* share dismissed */
+        }
+      } else {
+        navigator.clipboard.writeText(`${text} ${url}`).then(() => toast(translate('receiptCopied')));
+      }
+    });
+  }
+  const printBtn = document.getElementById('receiptPrintBtn');
+  if (printBtn) {
+    printBtn.addEventListener('click', () => {
+      if (location.hash === `#/receipt/${transfer.id}`) {
+        window.print();
+      } else {
+        hideModal();
+        location.hash = `#/receipt/${transfer.id}`;
+        setTimeout(() => window.print(), 1000);
+      }
+    });
+  }
+}
+
+// Permanent receipt page (#/receipt/<id>).
+async function renderReceipt(transferId) {
+  const view = document.getElementById('view');
+  view.innerHTML = `<p class="muted">${translate('loadingGeneric')}</p>`;
+  let data;
+  try {
+    data = await apiGet(`/api/transfers/${transferId}`);
+  } catch (err) {
+    view.innerHTML = `<div class="alert alert-error">${esc(translate('errLoadReceipt', { msg: err.message }))}</div>
+      <p><a href="#/">${translate('backHome')}</a></p>`;
+    return;
+  }
+  view.innerHTML = `<div class="card">${receiptHtml(data.transfer, data.coin)}</div>`;
+  wireReceiptActions(data.transfer);
+}
+
 // Shared transfer flow (coin detail page + portfolio): validate the
 // recipient address format and the LIVE on-chain balance -> build ->
 // simulate -> sign in Phantom -> send + confirm -> server verifies the
@@ -2590,7 +4136,7 @@ async function submitTransfer(coin, toWallet, amount, resEl) {
     setBusy(translate('transferSigning'));
     const sig = await signAndSend(phantom, built.transaction);
     setBusy(translate('transferVerifying'));
-    await apiPost('/api/transfers', {
+    const recorded = await apiPost('/api/transfers', {
       mintAddress: coin.mintAddress,
       fromWallet: state.wallet,
       toWallet,
@@ -2607,6 +4153,11 @@ async function submitTransfer(coin, toWallet, amount, resEl) {
       resEl.innerHTML = `<div class="alert alert-success">${successHtml}</div>`;
     } else {
       toast(successHtml.replace(/<[^>]*>/g, ''));
+    }
+    // Receipt modal (with a permalink to the permanent receipt page).
+    if (recorded && recorded.transfer) {
+      showModal(receiptHtml(recorded.transfer, null));
+      wireReceiptActions(recorded.transfer);
     }
     await refreshBalance();
     renderHeader();
@@ -2724,7 +4275,7 @@ async function renderCreator(walletAddress) {
       <div class="coin-head">
         ${avatarHtml(profile, walletAddress, 56)}
         <div>
-          <div class="coin-name" style="font-size:1.3rem">${esc(displayName(profile, walletAddress))}</div>
+          <div class="coin-name" style="font-size:1.3rem">${esc(displayName(profile, walletAddress))}${verifiedBadgeHtml({ verified: data.verified })}${badgesHtml(data.badges || [])}</div>
           <div class="small muted mono" style="word-break:break-all">${esc(walletAddress)}</div>
         </div>
         <span class="badge ${isSelf ? 'badge-ok' : 'badge-live'}" style="margin-left:auto">${isSelf ? translate('profileSelf') : translate('profileCreatorTrader')}</span>
@@ -2733,6 +4284,16 @@ async function renderCreator(walletAddress) {
           ? `<button class="btn btn-sm ${data.isFollowing ? '' : 'btn-primary'}" id="profileFollowBtn">${data.isFollowing ? translate('followFollowing') : translate('followBtn')}</button>`
           : ''}
       </div>
+      <div class="badge-shelf">
+        ${(data.badges || []).length
+          ? (data.badges || [])
+              .map(
+                (b) => `<span class="badge-shelf-item" title="${esc(translate(b.descKey))}">${esc(b.icon)} ${esc(translate(b.nameKey))}</span>`
+              )
+              .join('')
+          : `<span class="muted small">${translate('badgesEmpty')}</span>`}
+      </div>
+      <p class="small muted">${translate('verifiedRuleFull')}</p>
       <div class="stat-grid" style="margin-top:16px">
         <div class="stat"><div class="label">${translate('profileCoinsCreated')}</div><div class="value">${data.coins.length}</div></div>
         <div class="stat"><div class="label">${translate('profileVolume')}</div><div class="value">${fmtMoneyBoth(data.totalVolumeUsd, data.totalVolumeSol)}</div></div>
@@ -2838,6 +4399,7 @@ async function renderCreator(walletAddress) {
   view.querySelectorAll('.coin-card .addr-link').forEach((a) => {
     a.addEventListener('click', (e) => e.stopPropagation());
   });
+  wireAdultReveals(view);
 
   const followBtn = document.getElementById('profileFollowBtn');
   if (followBtn) {
@@ -3181,6 +4743,13 @@ async function renderPortfolio() {
       </div>
     </div>
     <div class="card" id="depositCard">${depositSectionHtml(state.wallet)}</div>
+    <div class="card" id="contactsCard">
+      <h2 style="margin-top:0">${translate('contactsTitle')}</h2>
+      <p class="small muted">${translate('contactsIntro')}</p>
+      <div id="contactsList"><p class="muted">${translate('loadingGeneric')}</p></div>
+      <div id="contactsForm" style="margin-top:12px"></div>
+      <div id="contactsResult" style="margin-top:8px"></div>
+    </div>
     <div class="card">
       <h2 style="margin-top:0">${translate('portfolioPositionsTitle')}</h2>
       ${
@@ -3223,6 +4792,7 @@ async function renderPortfolio() {
     </div>`;
 
   wireDepositSection(state.wallet);
+  renderContactsSection();
   renderTransferHistory(data.transfers || []);
 
   // Per-holding transfer: clicking "Kirim" opens the transfer card below
@@ -3238,7 +4808,10 @@ async function renderPortfolio() {
       form.innerHTML = `
         <div class="field">
           <label>${translate('transferRecipientLabel')}</label>
-          <input id="pfTransferTo" type="text" placeholder="${translate('transferRecipientPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+          <select id="pfTransferContact" hidden>
+            <option value="">${translate('contactPickerPlaceholder')}</option>
+          </select>
+          <input id="pfTransferTo" type="text" placeholder="${translate('transferRecipientPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false" style="margin-top:6px">
         </div>
         <div class="field">
           <label>${translate('transferAmountLabel', { ticker: esc(ticker) })}</label>
@@ -3250,6 +4823,7 @@ async function renderPortfolio() {
         <button class="btn btn-primary" id="pfTransferBtn">${translate('transferBtn', { ticker: esc(ticker) })}</button>
         <p class="small muted" style="margin-top:8px">${translate('transferNote')}</p>`;
       const input = document.getElementById('pfTransferAmount');
+      loadContactPicker(document.getElementById('pfTransferContact'), document.getElementById('pfTransferTo'));
       document.getElementById('pfMaxTransfer').addEventListener('click', () => {
         input.value = liveHoldings;
       });
@@ -3268,6 +4842,157 @@ async function renderPortfolio() {
       card.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
     });
   });
+
+  // Contacts (address book for transfers): add/edit/delete, all
+  // signature-proved over the canonical contact messages (same pattern
+  // as profile edits). The contact picker in both transfer forms reads
+  // from this same book.
+  async function renderContactsSection() {
+    const list = document.getElementById('contactsList');
+    const form = document.getElementById('contactsForm');
+    const resEl = document.getElementById('contactsResult');
+    const signContact = async (message) => {
+      const phantom = (await waitForPhantom(3000)) || getPhantom();
+      if (!phantom) throw new Error(translate('errPhantomShort'));
+      if (typeof phantom.signMessage !== 'function') {
+        throw new Error(translate('errNoSignMessage'));
+      }
+      toast(translate('toastSignContact'));
+      return signWalletMessage(phantom, message);
+    };
+    const load = async () => {
+      try {
+        const data = await apiGet(`/api/contacts?owner=${encodeURIComponent(state.wallet)}`);
+        const contacts = data.contacts || [];
+        if (!contacts.length) {
+          list.innerHTML = `<p class="muted">${translate('contactsEmpty')}</p>`;
+        } else {
+          list.innerHTML = `<ul class="contact-list">${contacts
+            .map(
+              (c) => `<li data-contact="${c.id}">
+                <span><b>${esc(c.name)}</b> <span class="mono muted">${esc(shortAddr(c.wallet))}</span></span>
+                <span>
+                  <button class="btn btn-sm" data-edit-contact="${c.id}">${translate('contactsEditBtn')}</button>
+                  <button class="btn btn-sm" data-delete-contact="${c.id}">${translate('contactsDeleteBtn')}</button>
+                </span>
+              </li>`
+            )
+            .join('')}</ul>`;
+        }
+        list.querySelectorAll('[data-delete-contact]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const id = Number(b.dataset.deleteContact);
+            b.disabled = true;
+            try {
+              const message = contactDeleteMessage({ owner: state.wallet, contactId: String(id) });
+              const signature = await signContact(message);
+              await apiDelete(`/api/contacts/${id}`, {
+                ownerWallet: state.wallet,
+                message,
+                signature,
+              });
+              toast(translate('contactsDeleted'));
+              load();
+            } catch (err) {
+              toast(translate('contactsDeleteFailed', { msg: friendlyError(err) }));
+              b.disabled = false;
+            }
+          });
+        });
+        list.querySelectorAll('[data-edit-contact]').forEach((b) => {
+          b.addEventListener('click', () => {
+            const id = Number(b.dataset.editContact);
+            const contact = contacts.find((c) => c.id === id);
+            if (!contact) return;
+            const li = list.querySelector(`[data-contact="${id}"]`);
+            li.innerHTML = `
+              <span class="contact-edit">
+                <input id="editContactName-${id}" type="text" maxlength="32" value="${esc(contact.name)}">
+                <input id="editContactWallet-${id}" type="text" value="${esc(contact.wallet)}" autocapitalize="off" autocomplete="off" spellcheck="false">
+              </span>
+              <span>
+                <button class="btn btn-sm btn-primary" data-save-contact="${id}">${translate('contactsSaveBtn')}</button>
+                <button class="btn btn-sm" data-cancel-edit="${id}">${translate('contactsCancelBtn')}</button>
+              </span>`;
+            li.querySelector(`[data-cancel-edit="${id}"]`).addEventListener('click', load);
+            li.querySelector(`[data-save-contact="${id}"]`).addEventListener('click', async (e) => {
+              const btn = e.target;
+              const name = document.getElementById(`editContactName-${id}`).value.trim();
+              const wallet = document.getElementById(`editContactWallet-${id}`).value.trim();
+              if (!name || !wallet) {
+                toast(translate('errContactFields'));
+                return;
+              }
+              btn.disabled = true;
+              try {
+                const message = contactEditMessage({
+                  owner: state.wallet,
+                  contactId: String(id),
+                  name,
+                  wallet,
+                });
+                const signature = await signContact(message);
+                await apiPut(`/api/contacts/${id}`, {
+                  ownerWallet: state.wallet,
+                  name,
+                  wallet,
+                  message,
+                  signature,
+                });
+                toast(translate('contactsSaved'));
+                load();
+              } catch (err) {
+                toast(translate('contactsSaveFailed', { msg: friendlyError(err) }));
+                btn.disabled = false;
+              }
+            });
+          });
+        });
+      } catch (err) {
+        list.innerHTML = `<div class="alert alert-error">${esc(translate('contactsLoadFailed', { msg: err.message }))}</div>`;
+      }
+    };
+    form.innerHTML = `
+      <div class="field">
+        <label for="newContactName">${translate('contactsNameLabel')}</label>
+        <input id="newContactName" type="text" maxlength="32" placeholder="${translate('contactsNamePlaceholder')}">
+      </div>
+      <div class="field">
+        <label for="newContactWallet">${translate('contactsWalletLabel')}</label>
+        <input id="newContactWallet" type="text" placeholder="${translate('contactsWalletPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+      </div>
+      <button class="btn btn-primary" id="addContactBtn">${translate('contactsAddBtn')}</button>`;
+    document.getElementById('addContactBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('addContactBtn');
+      const name = document.getElementById('newContactName').value.trim();
+      const wallet = document.getElementById('newContactWallet').value.trim();
+      if (!name || !wallet) {
+        resEl.innerHTML = `<div class="alert alert-error">${translate('errContactFields')}</div>`;
+        return;
+      }
+      btn.disabled = true;
+      resEl.innerHTML = `<p class="muted">${translate('contactsAdding')}</p>`;
+      try {
+        const message = contactAddMessage({ owner: state.wallet, name, wallet });
+        const signature = await signContact(message);
+        await apiPost('/api/contacts', {
+          ownerWallet: state.wallet,
+          name,
+          wallet,
+          message,
+          signature,
+        });
+        resEl.innerHTML = `<div class="alert alert-success">${translate('contactsAdded', { name: esc(name) })}</div>`;
+        document.getElementById('newContactName').value = '';
+        document.getElementById('newContactWallet').value = '';
+        load();
+      } catch (err) {
+        resEl.innerHTML = `<div class="alert alert-error">${esc(translate('contactsAddFailed', { msg: friendlyError(err) }))}</div>`;
+      }
+      btn.disabled = false;
+    });
+    load();
+  }
 
   function renderTransferHistory(transfers) {
     const wrap = document.getElementById('transferHistory');
@@ -3289,13 +5014,200 @@ async function renderPortfolio() {
                 <td><a href="#/coin/${esc(tr.mintAddress)}"><b>${esc(tr.coinName || tr.coinTicker || shortAddr(tr.mintAddress))}</b> <span class="muted">$${esc(tr.coinTicker || '')}</span></a></td>
                 <td>${fmtTokens(tr.amount)}</td>
                 <td>${creatorLink(other)}${other === state.wallet ? translate('youSuffix') : ''}</td>
-                <td>${txLink(tr.txSignature)}</td>
+                <td>${txLink(tr.txSignature)} <a class="btn btn-sm" href="#/receipt/${tr.id}">${translate('receiptLink')}</a></td>
               </tr>`;
             })
             .join('')}
         </tbody>
       </table></div>`;
   }
+}
+
+// ---------- Admin: grant trader badges ----------
+// Admin-only panel (route #/admin, sidebar link shown only for wallets
+// in ADMIN_WALLETS). Every action is signature-proved over the canonical
+// admin message and enforced server-side — the client check only hides
+// the UI. Granted badges display on profiles exactly like earned ones.
+const ADMIN_BADGES = [
+  ['creator', '🚀'],
+  ['earlyBird', '🐦'],
+  ['topTrader', '📈'],
+  ['calloutStar', '⭐'],
+  ['whale', '🐋'],
+];
+
+function adminBadgeNameKey(key) {
+  return `badge${key[0].toUpperCase()}${key.slice(1)}`;
+}
+
+async function renderAdmin() {
+  const view = document.getElementById('view');
+  view.innerHTML = `<h1>${translate('navAdmin')}</h1>`;
+  if (!state.wallet) {
+    view.innerHTML += `
+      <div class="card empty">
+        <h2>${translate('adminConnectTitle')}</h2>
+        <p>${translate('adminConnectBody')}</p>
+        <p><button class="btn btn-primary" id="connectAdmin">${translate('headerConnect')}</button></p>
+      </div>`;
+    document.getElementById('connectAdmin').onclick = connectWallet;
+    return;
+  }
+  view.innerHTML += `<p class="muted">${translate('loadingGeneric')}</p>`;
+  // Fresh admin check (not the cached header state — the panel must not
+  // render admin controls for a wallet that just lost admin status).
+  let isAdmin = false;
+  try {
+    const data = await apiGet(`/api/admin/status?wallet=${encodeURIComponent(state.wallet)}`);
+    isAdmin = !!data.isAdmin;
+    state.isAdmin = isAdmin;
+    state.adminCheckedWallet = state.wallet;
+    renderAdminNavLink();
+  } catch {
+    isAdmin = false;
+  }
+  if (!isAdmin) {
+    view.innerHTML = `
+      <h1>${translate('navAdmin')}</h1>
+      <div class="card empty">
+        <h2>${translate('adminNotAdminTitle')}</h2>
+        <p>${translate('adminNotAdminBody')}</p>
+      </div>`;
+    return;
+  }
+  view.innerHTML = `
+    <h1>${translate('navAdmin')}</h1>
+    <p class="muted">${translate('adminIntro')}</p>
+    <div class="card">
+      <h2 style="margin-top:0">${translate('adminGrantTitle')}</h2>
+      <div class="field">
+        <label for="adminWallet">${translate('adminWalletLabel')}</label>
+        <input id="adminWallet" type="text" placeholder="${translate('adminWalletPlaceholder')}" autocapitalize="off" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="adminBadge">${translate('adminBadgeLabel')}</label>
+        <select id="adminBadge">
+          ${ADMIN_BADGES.map(
+            ([key, icon]) => `<option value="${key}">${icon} ${esc(translate(adminBadgeNameKey(key)))}</option>`
+          ).join('')}
+        </select>
+      </div>
+      <button class="btn btn-primary" id="adminGrantBtn">${translate('adminGrantBtn')}</button>
+      <div id="adminGrantResult" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">${translate('adminListTitle')}</h2>
+      <p class="small muted">${translate('adminListIntro')}</p>
+      <p><button class="btn" id="adminLoadListBtn">${translate('adminLoadListBtn')}</button></p>
+      <div id="adminGrantsList"></div>
+    </div>`;
+
+  async function signAdmin(action, wallet, badge) {
+    const phantom = (await waitForPhantom(3000)) || getPhantom();
+    if (!phantom) throw new Error(translate('errPhantomShort'));
+    if (typeof phantom.signMessage !== 'function') {
+      throw new Error(translate('errNoSignMessage'));
+    }
+    const message = adminMessage({ admin: state.wallet, action, wallet, badge });
+    toast(translate('toastSignAdmin'));
+    const signature = await signWalletMessage(phantom, message);
+    return { message, signature };
+  }
+
+  async function loadGrants() {
+    const list = document.getElementById('adminGrantsList');
+    list.innerHTML = `<p class="muted">${translate('adminListLoading')}</p>`;
+    try {
+      const { message, signature } = await signAdmin('list');
+      const data = await apiPost('/api/admin/badges/list', {
+        adminWallet: state.wallet,
+        message,
+        signature,
+      });
+      const grants = data.grants || [];
+      if (!grants.length) {
+        list.innerHTML = `<p class="muted">${translate('adminListEmpty')}</p>`;
+        return;
+      }
+      list.innerHTML = `
+        <div class="table-wrap"><table>
+          <thead><tr><th>${translate('adminThWallet')}</th><th>${translate('adminThBadge')}</th><th>${translate('adminThGrantedBy')}</th><th>${translate('adminThWhen')}</th><th></th></tr></thead>
+          <tbody>
+            ${grants
+              .map((g) => {
+                const icon = (ADMIN_BADGES.find(([k]) => k === g.badge) || [])[1] || '🏅';
+                return `<tr>
+                  <td>${creatorLink(g.wallet)}</td>
+                  <td>${icon} ${esc(translate(adminBadgeNameKey(g.badge)))}</td>
+                  <td>${creatorLink(g.grantedBy)}</td>
+                  <td>${fmtTime(g.createdAt)}</td>
+                  <td><button class="btn btn-sm" data-revoke="${esc(g.wallet)}" data-badge="${esc(g.badge)}">${translate('adminRevokeBtn')}</button></td>
+                </tr>`;
+              })
+              .join('')}
+          </tbody>
+        </table></div>`;
+      list.querySelectorAll('[data-revoke]').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const wallet = b.dataset.revoke;
+          const badge = b.dataset.badge;
+          b.disabled = true;
+          try {
+            const { message, signature } = await signAdmin('revoke', wallet, badge);
+            await apiPost('/api/admin/badges/revoke', {
+              adminWallet: state.wallet,
+              wallet,
+              badge,
+              message,
+              signature,
+            });
+            toast(translate('adminRevokeSuccess', { badge: translate(adminBadgeNameKey(badge)) }));
+            loadGrants();
+          } catch (err) {
+            toast(translate('adminRevokeFailed', { msg: friendlyError(err) }));
+            b.disabled = false;
+          }
+        });
+      });
+    } catch (err) {
+      list.innerHTML = `<div class="alert alert-error">${esc(translate('adminListFailed', { msg: friendlyError(err) }))}</div>`;
+    }
+  }
+
+  document.getElementById('adminLoadListBtn').addEventListener('click', loadGrants);
+
+  document.getElementById('adminGrantBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('adminGrantBtn');
+    const resEl = document.getElementById('adminGrantResult');
+    const wallet = document.getElementById('adminWallet').value.trim();
+    const badge = document.getElementById('adminBadge').value;
+    if (!wallet) {
+      resEl.innerHTML = `<div class="alert alert-error">${translate('errAdminFields')}</div>`;
+      return;
+    }
+    btn.disabled = true;
+    resEl.innerHTML = `<p class="muted">${translate('adminGranting')}</p>`;
+    try {
+      const { message, signature } = await signAdmin('grant', wallet, badge);
+      await apiPost('/api/admin/badges/grant', {
+        adminWallet: state.wallet,
+        wallet,
+        badge,
+        message,
+        signature,
+      });
+      resEl.innerHTML = `<div class="alert alert-success">${translate('adminGrantSuccess', {
+        badge: translate(adminBadgeNameKey(badge)),
+        addr: esc(shortAddr(wallet)),
+      })}</div>`;
+      document.getElementById('adminWallet').value = '';
+      // Refresh the list if it is already loaded.
+      if (document.querySelector('#adminGrantsList table')) loadGrants();
+    } catch (err) {
+      resEl.innerHTML = `<div class="alert alert-error">${esc(translate('adminGrantFailed', { msg: friendlyError(err) }))}</div>`;
+    }
+    btn.disabled = false;
+  });
 }
 
 // ---------- Boot ----------
@@ -3370,6 +5282,7 @@ function fillPoolAddress() {
 
 loadPoolAddress().then(fillPoolAddress);
 wirePhantom();
+wireSidebar();
 window.addEventListener('load', wirePhantom);
 
 renderHeader();

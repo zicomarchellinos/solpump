@@ -59,6 +59,25 @@ function pairLabel(ticker, pairAsset) {
   return `${ticker}/${pairAsset.symbol}`;
 }
 
+// SOL-pay buys (one routing hop) for custom-pair coins: the buyer pays
+// SOL, the server routes SOL -> pair tokens through the pair coin's curve
+// and then pair tokens -> target tokens through the target coin's curve.
+// v1 supports exactly ONE routing hop: the pair coin itself must be
+// SOL-paired. A deeper chain (pair of a pair) is not routed recursively
+// — the UI hides/disables the SOL option and the API rejects it.
+// Returns { available, reason } where reason is null when available,
+// 'missing-pair' when the pair coin is gone from the registry, or
+// 'deep-chain' when the pair coin is itself coin-paired. SOL-paired
+// coins are trivially available (a SOL buy there is a direct buy).
+function solBuyInfo(coinRow, coinMap) {
+  const pairMint = coinRow ? coinRow.pair_mint || null : null;
+  if (!pairMint) return { available: true, reason: null };
+  const pairRow = coinMap ? coinMap.get(pairMint) : undefined;
+  if (!pairRow) return { available: false, reason: 'missing-pair' };
+  if (pairRow.pair_mint) return { available: false, reason: 'deep-chain' };
+  return { available: true, reason: null };
+}
+
 // USD price of ONE TOKEN of a coin, resolved through its pair chain toward
 // SOL. Returns null when the chain cannot resolve (missing pair coin,
 // cycle, too deep, or no SOL/USD price). `cache` memoizes per request so
@@ -156,6 +175,7 @@ module.exports = {
   MAX_PAIR_DEPTH,
   pairAssetOf,
   pairLabel,
+  solBuyInfo,
   resolveTokenUsdPrice,
   resolvePairAssetUsdPrice,
   validatePairChoice,
