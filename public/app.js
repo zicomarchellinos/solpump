@@ -4,6 +4,11 @@
 // creator profile (#/creator/<wallet>), portfolio (#/portfolio).
 // Minting AND trading are real on Solana devnet via Phantom + the pool
 // wallet; every trade takes a 1% creator fee (see src/bonding.js).
+// Display currency: token prices + market cap are USD (pump.fun style —
+// the server supplies the SOL/USD rate and the *Usd fields; the UI falls
+// back to SOL when no rate is available). The trading pair is TICKER/SOL:
+// buy/sell amounts, amounts received, pool balances and fees stay in SOL
+// because that is the currency actually moving.
 
 const EXPLORER = 'https://explorer.solana.com';
 
@@ -89,6 +94,89 @@ function fmtSignedSol(x) {
   return `${n >= 0 ? '+' : '−'}${fmtSol(Math.abs(n))} SOL`;
 }
 
+// USD price formatting (pump.fun style): plain decimals, never scientific
+// notation, $ prefix, dot decimal separator. Token prices are tiny, so keep
+// 4 significant digits and trim trailing zeros: $0.000005, $0.000002987.
+function fmtPriceUsd(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n) || n === 0) return '$0';
+  if (n >= 0.0001) return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 6 });
+  const decimals = Math.min(-Math.floor(Math.log10(n)) + 3, 20);
+  const fixed = n.toFixed(decimals);
+  const trimmed = fixed.replace(/\.?0+$/, '') || '0';
+  return '$' + trimmed;
+}
+
+// USD money amounts (PnL, values): 2 decimals from $1 up, plain decimals
+// with 4 significant digits below $1. Never scientific notation.
+function fmtUsd(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n) || n === 0) return '$0';
+  const abs = Math.abs(n);
+  const sign = n < 0 ? '−' : '';
+  if (abs >= 1) {
+    return `${sign}$${abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+  const decimals = Math.min(-Math.floor(Math.log10(abs)) + 3, 20);
+  const trimmed = abs.toFixed(decimals).replace(/\.?0+$/, '') || '0';
+  return `${sign}$${trimmed}`;
+}
+
+function fmtSignedUsd(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return '$0';
+  return `${n >= 0 ? '+' : '−'}${fmtUsd(Math.abs(n))}`;
+}
+
+// Market cap in USD with compact suffixes: $5K, $500K, $5M, $50M, $500M,
+// $5B. One decimal when it adds information ($5.2K, $12.4M), none for round
+// values. Mirrors the server's fmtMarketCapUsd (src/bonding.js).
+function fmtMarketCapUsd(usd) {
+  if (usd === null || usd === undefined) return null; // Number(null) is 0
+  const n = Number(usd);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const oneDecimal = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+  const scales = [
+    [1e9, 'B'],
+    [1e6, 'M'],
+    [1e3, 'K'],
+  ];
+  for (let i = 0; i < scales.length; i++) {
+    const [div, suffix] = scales[i];
+    if (n < div) continue;
+    let v = Math.round((n / div) * 10) / 10;
+    if (v >= 1000 && i > 0) {
+      const [upDiv, upSuffix] = scales[i - 1];
+      v = Math.round((n / upDiv) * 10) / 10;
+      return `$${oneDecimal(v)}${upSuffix}`;
+    }
+    return `$${oneDecimal(v)}${suffix}`;
+  }
+  return `$${oneDecimal(Math.round(n * 10) / 10)}`;
+}
+
+// Price display: USD when the server has a SOL price, SOL otherwise (the
+// API carries the *Usd fields only when a price was available).
+function fmtPriceBoth(usdValue, solValue) {
+  if (Number.isFinite(usdValue)) return fmtPriceUsd(usdValue);
+  return `${fmtPrice(solValue)} SOL`;
+}
+
+// Market-cap display: USD with suffixes when available, SOL otherwise.
+function fmtMarketCap(c) {
+  if (c && Number.isFinite(c.marketCapUsd)) return fmtMarketCapUsd(c.marketCapUsd);
+  return `${fmtSol(c.marketCapSol)} SOL`;
+}
+
+// Money figure (PnL, value): USD primary, SOL as a small secondary line.
+// Falls back to SOL only when no USD price is available.
+function fmtMoneyBoth(usd, sol, signed = false) {
+  const solStr = signed ? fmtSignedSol(sol) : `${fmtSol(sol)} SOL`;
+  if (!Number.isFinite(usd)) return solStr;
+  const usdStr = signed ? fmtSignedUsd(usd) : fmtUsd(usd);
+  return `${usdStr}<div class="small muted">${solStr}</div>`;
+}
+
 function fmtTime(ts) {
   return new Date(ts).toLocaleString('id-ID', {
     day: '2-digit',
@@ -162,10 +250,14 @@ function followMessage(action, followingWallet) {
 
 // One callout (social trade call). Entry price + holdings were computed
 // server-side from the trader's real trades; PnL is live vs the current
-// price. Prices use fmtPrice (plain decimals, never scientific notation);
-// PnL uses the same green=profit / pink=loss styling as the PnL card.
+// price. Prices are USD (plain decimals, never scientific notation), PnL is
+// USD primary with the SOL figure in parentheses; PnL uses the same
+// green=profit / pink=loss styling as the PnL card.
 function calloutHtml(c, { showCoin = false } = {}) {
   const cls = c.pnlSol >= 0 ? 'profit' : 'loss';
+  const pnlUsd = Number.isFinite(c.pnlUsd)
+    ? `${fmtSignedUsd(c.pnlUsd)} <span class="muted">(${fmtSignedSol(c.pnlSol)})</span>`
+    : fmtSignedSol(c.pnlSol);
   return `
     <div class="callout">
       <div class="callout-head">
@@ -176,10 +268,10 @@ function calloutHtml(c, { showCoin = false } = {}) {
       </div>
       <p class="callout-text">${esc(c.text)}</p>
       <div class="callout-meta small">
-        <span>Entry <b>${fmtPrice(c.entryPrice)} SOL</b></span>
+        <span>Entry <b>${fmtPriceBoth(c.entryPriceUsd, c.entryPrice)}</b></span>
         <span>Dipergang <b>${fmtTokens(c.holdingsAtPost)}</b></span>
-        <span>Harga kini <b>${fmtPrice(c.currentPrice)} SOL</b></span>
-        <span>PnL <b class="${cls}">${fmtSignedSol(c.pnlSol)} (${fmtPct(c.pnlPct)})</b></span>
+        <span>Harga kini <b>${fmtPriceBoth(c.currentPriceUsd, c.currentPrice)}</b></span>
+        <span>PnL <b class="${cls}">${pnlUsd} (${fmtPct(c.pnlPct)})</b></span>
       </div>
     </div>`;
 }
@@ -482,13 +574,14 @@ function coinCard(c) {
         <div class="coin-id">
           <div class="coin-name">${esc(c.name)}</div>
           <div class="coin-ticker">$${esc(c.ticker)}</div>
+          <div class="small muted">${esc(c.ticker)}/SOL</div>
         </div>
         ${c.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
       </div>
       ${c.description ? `<p class="coin-desc">${esc(c.description)}</p>` : ''}
-      <div class="coin-price"><b>${fmtPrice(c.price)} SOL</b> <span class="${chg}">${fmtPct(c.changePct)}</span></div>
+      <div class="coin-price"><b>${fmtPriceBoth(c.priceUsd, c.price)}</b> <span class="${chg}">${fmtPct(c.changePct)}</span></div>
       <div class="coin-stats">
-        <span>Market cap <b>${fmtSol(c.marketCapSol)} SOL</b></span>
+        <span>Market cap <b>${fmtMarketCap(c)}</b></span>
         <span>Vol <b>${fmtSol(c.volumeSol)}</b></span>
       </div>
       <div class="progress" title="Progres kurva bonding: ${c.progressPct.toFixed(1)}%">
@@ -897,7 +990,7 @@ async function renderCoin(mintAddress) {
     return;
   }
   state.coinCache = data;
-  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, walletPnl, walletTrades } = data;
+  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, walletPnl, walletTrades, solUsd } = data;
   const chg = stats.changePct >= 0 ? 'profit' : 'loss';
   const isCreator = state.wallet && state.wallet === coin.creatorWallet;
 
@@ -907,7 +1000,7 @@ async function renderCoin(mintAddress) {
         ${logoHtml(coin)}
         <div>
           <div class="coin-name" style="font-size:1.3rem">${esc(coin.name)} <span class="muted">$${esc(coin.ticker)}</span></div>
-          <div class="small muted">Dibuat ${fmtDate(coin.createdAt)} oleh ${creatorLink(coin.creatorWallet)}</div>
+          <div class="small muted">${esc(coin.ticker)}/SOL • Dibuat ${fmtDate(coin.createdAt)} oleh ${creatorLink(coin.creatorWallet)}</div>
         </div>
         <span class="badge badge-ok" style="margin-left:auto">✓ Terverifikasi on-chain</span>
         ${coin.tradingEnabled ? '' : '<span class="badge badge-warn">Trading nonaktif</span>'}
@@ -953,9 +1046,9 @@ async function renderCoin(mintAddress) {
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
         <h2 style="margin:0">Grafik Harga</h2>
-        <div style="text-align:right"><span style="font-size:1.2rem;font-weight:800">${fmtPrice(stats.price)} SOL</span>
+        <div style="text-align:right"><span style="font-size:1.2rem;font-weight:800">${fmtPriceBoth(stats.priceUsd, stats.price)}</span>
         <span class="${chg}"> ${fmtPct(stats.changePct)}</span>
-        <div class="small muted">Market Cap <b style="color:var(--text)">${fmtSol(stats.marketCapSol)} SOL</b></div></div>
+        <div class="small muted">Market Cap <b style="color:var(--text)">${fmtMarketCap(stats)}</b></div></div>
       </div>
       <div class="range-btns" style="margin-top:12px">
         ${[0, 10, 25, 50]
@@ -972,10 +1065,10 @@ async function renderCoin(mintAddress) {
 
     <div class="card">
       <div class="stat-grid">
-        <div class="stat"><div class="label">Market Cap</div><div class="value">${fmtSol(stats.marketCapSol)} SOL</div></div>
+        <div class="stat"><div class="label">Market Cap</div><div class="value">${fmtMarketCap(stats)}</div></div>
         <div class="stat"><div class="label">Perubahan</div><div class="value ${chg}">${fmtPct(stats.changePct)}</div></div>
-        <div class="stat"><div class="label">Tertinggi</div><div class="value">${fmtPrice(stats.high)} SOL</div></div>
-        <div class="stat"><div class="label">Terendah</div><div class="value">${fmtPrice(stats.low)} SOL</div></div>
+        <div class="stat"><div class="label">Tertinggi</div><div class="value">${fmtPriceBoth(stats.highUsd, stats.high)}</div></div>
+        <div class="stat"><div class="label">Terendah</div><div class="value">${fmtPriceBoth(stats.lowUsd, stats.low)}</div></div>
         <div class="stat"><div class="label">Volume</div><div class="value">${fmtSol(stats.volumeSol)} SOL</div></div>
         <div class="stat"><div class="label">Fee Kreator Terkumpul</div><div class="value">${fmtSol(stats.totalFeesSol)} SOL</div></div>
         <div class="stat"><div class="label">Transaksi</div><div class="value">${stats.txCount}</div></div>
@@ -1233,7 +1326,9 @@ async function renderCoin(mintAddress) {
         if (sol > 0) {
           const tokens = (coin.tokenReserve * sol) / (coin.solReserve + sol);
           const fee = (sol * creatorFeePct) / 100;
-          est.textContent = `≈ ${fmtTokens(tokens)} ${coin.ticker} (harga eksekusi ≈ ${fmtPrice(sol / tokens)} SOL) • Fee kreator ${creatorFeePct}%: ${fmtSol(fee)} SOL`;
+          const execSol = sol / tokens;
+          const execUsd = Number.isFinite(solUsd) ? execSol * solUsd : null;
+          est.textContent = `≈ ${fmtTokens(tokens)} ${coin.ticker} (harga eksekusi ≈ ${fmtPriceBoth(execUsd, execSol)}) • Fee kreator ${creatorFeePct}%: ${fmtSol(fee)} SOL`;
         } else est.textContent = '';
       };
       input.addEventListener('input', update);
@@ -1267,7 +1362,9 @@ async function renderCoin(mintAddress) {
         if (tokens > 0) {
           const sol = (coin.solReserve * tokens) / (coin.tokenReserve + tokens);
           const fee = (sol * creatorFeePct) / 100;
-          est.textContent = `≈ ${fmtSol(sol - fee)} SOL diterima setelah fee kreator ${creatorFeePct}% (${fmtSol(fee)} SOL) • Harga eksekusi ≈ ${fmtPrice(sol / tokens)} SOL`;
+          const execSol = sol / tokens;
+          const execUsd = Number.isFinite(solUsd) ? execSol * solUsd : null;
+          est.textContent = `≈ ${fmtSol(sol - fee)} SOL diterima setelah fee kreator ${creatorFeePct}% (${fmtSol(fee)} SOL) • Harga eksekusi ≈ ${fmtPriceBoth(execUsd, execSol)}`;
         } else est.textContent = '';
       };
       input.addEventListener('input', update);
@@ -1282,11 +1379,14 @@ async function renderCoin(mintAddress) {
       });
     }
     if (pnl && pnl.totalTrades > 0) {
+      const pnlUsd = Number.isFinite(pnl.totalPnlUsd)
+        ? `${fmtSignedUsd(pnl.totalPnlUsd)} <span class="muted">(${fmtSignedSol(pnl.totalPnlSol)})</span>`
+        : fmtSignedSol(pnl.totalPnlSol);
       form.insertAdjacentHTML(
         'beforeend',
         `<p class="small" style="margin-top:10px">Saldo on-chain: <b>${fmtTokens(liveHoldings)} ${esc(
           coin.ticker
-        )}</b> • PnL <b class="${pnl.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(pnl.totalPnlSol)} (${fmtPct(
+        )}</b> • PnL <b class="${pnl.totalPnlSol >= 0 ? 'profit' : 'loss'}">${pnlUsd} (${fmtPct(
           pnl.roiPct
         )})</b></p>`
       );
@@ -1353,9 +1453,10 @@ async function renderCoin(mintAddress) {
         side === 'sell'
           ? ` Kamu menerima ${fmtSol(res.netSolAmount)} SOL setelah fee kreator ${fmtSol(res.trade.feeSol)} SOL.`
           : ` Termasuk fee kreator ${fmtSol(res.trade.feeSol)} SOL.`;
+      const execUsd = Number.isFinite(solUsd) ? res.trade.price * solUsd : null;
       resEl.innerHTML = `<div class="alert alert-success">${side === 'buy' ? 'Beli' : 'Jual'} berhasil: ${fmtTokens(
         res.trade.tokenAmount
-      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPrice(res.trade.price)} SOL.${receivedNote}<br>
+      )} ${esc(coin.ticker)} untuk ${fmtSol(res.trade.solAmount)} SOL @ ${fmtPriceBoth(execUsd, res.trade.price)}.${receivedNote}<br>
       Transaksimu: ${txLink(res.trade.userTxSignature)} • Transaksi pool: ${txLink(res.trade.poolTxSignature)}</div>`;
       await refreshBalance();
       renderHeader();
@@ -1390,12 +1491,12 @@ async function renderCoin(mintAddress) {
       <div class="pnl-grid">
         <div class="stat"><div class="label">Holdings (dari trading)</div><div class="value">${fmtTokens(p.holdings)}</div></div>
         <div class="stat"><div class="label">Saldo On-chain di Dompet</div><div class="value">${fmtTokens(state.onchainBalances[coin.mintAddress] || 0)}</div></div>
-        <div class="stat"><div class="label">Harga Rata-rata Beli</div><div class="value">${fmtPrice(p.avgBuyPrice)} SOL</div></div>
-        <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtSol(p.costBasisSol)} SOL</div></div>
-        <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtSol(p.currentValueSol)} SOL</div></div>
-        <div class="stat"><div class="label">Unrealized PnL</div><div class="value ${p.unrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(p.unrealizedPnlSol)}</div></div>
-        <div class="stat"><div class="label">Realized PnL</div><div class="value ${p.realizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(p.realizedPnlSol)}</div></div>
-        <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtSignedSol(p.totalPnlSol)}</div></div>
+        <div class="stat"><div class="label">Harga Rata-rata Beli</div><div class="value">${fmtPriceBoth(p.avgBuyPriceUsd, p.avgBuyPrice)}</div></div>
+        <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtMoneyBoth(p.costBasisUsd, p.costBasisSol)}</div></div>
+        <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtMoneyBoth(p.currentValueUsd, p.currentValueSol)}</div></div>
+        <div class="stat"><div class="label">Unrealized PnL</div><div class="value ${p.unrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.unrealizedPnlUsd, p.unrealizedPnlSol, true)}</div></div>
+        <div class="stat"><div class="label">Realized PnL</div><div class="value ${p.realizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.realizedPnlUsd, p.realizedPnlSol, true)}</div></div>
+        <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtMoneyBoth(p.totalPnlUsd, p.totalPnlSol, true)}</div></div>
         <div class="stat"><div class="label">ROI</div><div class="value ${cls}">${fmtPct(p.roiPct)}</div></div>
         <div class="stat"><div class="label">Fee Kreator Dibayar</div><div class="value">${fmtSol(p.totalFeesPaidSol || 0)} SOL</div></div>
       </div>
@@ -1461,7 +1562,7 @@ async function renderCoin(mintAddress) {
                 <td>${fmtTokens(t.tokenAmount)}</td>
                 <td>${fmtSol(t.solAmount)}</td>
                 <td>${fmtSol(t.feeSol || 0)}</td>
-                <td>${fmtPrice(t.price)}</td>
+                <td>${fmtPriceBoth(t.priceUsd, t.price)}</td>
                 <td>${creatorLink(t.wallet)}${t.wallet === state.wallet ? ' (kamu)' : ''}</td>
                 <td>${txLink(t.userTxSignature)}</td>
                 <td>${txLink(t.poolTxSignature)}</td>
@@ -1724,7 +1825,7 @@ function renderChartEl(wrap, points, range) {
     tip.style.display = 'block';
     tip.style.left = `${Math.min(Math.max(e.clientX - rect.left + 12, 0), rect.width - 180)}px`;
     tip.style.top = `${Math.max(e.clientY - rect.top - 40, 0)}px`;
-    tip.innerHTML = `${esc(fmtTime(best.t))}<br><b>${fmtPrice(best.price)} SOL</b>${
+    tip.innerHTML = `${esc(fmtTime(best.t))}<br><b>${fmtPriceBoth(best.priceUsd, best.price)}</b>${
       best.side ? ` • ${best.side === 'buy' ? 'Beli' : 'Jual'}` : ' • Peluncuran'
     }`;
   });
@@ -1765,11 +1866,11 @@ async function renderPortfolio() {
     <p class="muted">Dompet <span class="mono">${esc(state.wallet)}</span> • Semua angka dari trading devnet yang tercatat. Kolom "Saldo On-chain" dibaca langsung dari devnet.</p>
     <div class="card">
       <div class="stat-grid">
-        <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtSignedSol(s.totalPnlSol)} (${fmtPct(s.totalPnlPct)})</div></div>
-        <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtSol(s.totalCurrentValueSol)} SOL</div></div>
-        <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtSol(s.totalCostBasisSol)} SOL</div></div>
-        <div class="stat"><div class="label">Realized PnL</div><div class="value ${s.totalRealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(s.totalRealizedPnlSol)}</div></div>
-        <div class="stat"><div class="label">Unrealized PnL</div><div class="value ${s.totalUnrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(s.totalUnrealizedPnlSol)}</div></div>
+        <div class="stat"><div class="label">Total PnL</div><div class="value ${cls}">${fmtMoneyBoth(s.totalPnlUsd, s.totalPnlSol, true)} (${fmtPct(s.totalPnlPct)})</div></div>
+        <div class="stat"><div class="label">Nilai Sekarang</div><div class="value">${fmtMoneyBoth(s.totalCurrentValueUsd, s.totalCurrentValueSol)}</div></div>
+        <div class="stat"><div class="label">Cost Basis</div><div class="value">${fmtMoneyBoth(s.totalCostBasisUsd, s.totalCostBasisSol)}</div></div>
+        <div class="stat"><div class="label">Realized PnL</div><div class="value ${s.totalRealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(s.totalRealizedPnlUsd, s.totalRealizedPnlSol, true)}</div></div>
+        <div class="stat"><div class="label">Unrealized PnL</div><div class="value ${s.totalUnrealizedPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(s.totalUnrealizedPnlUsd, s.totalUnrealizedPnlSol, true)}</div></div>
         <div class="stat"><div class="label">Total Beli</div><div class="value">${fmtSol(s.totalBuySol)} SOL</div></div>
         <div class="stat"><div class="label">Total Jual</div><div class="value">${fmtSol(s.totalSellSol)} SOL</div></div>
         <div class="stat"><div class="label">Coin • Transaksi</div><div class="value">${s.coinCount} • ${s.totalTrades}</div></div>
@@ -1781,7 +1882,7 @@ async function renderPortfolio() {
         data.positions.length === 0
           ? '<p class="muted">Belum ada posisi. Mulai trading di salah satu coin.</p>'
           : `<div class="table-wrap"><table>
-              <thead><tr><th>Coin</th><th>Holdings</th><th>Saldo On-chain</th><th>Harga Rata-rata</th><th>Nilai</th><th>PnL</th><th>ROI</th><th></th></tr></thead>
+              <thead><tr><th>Coin</th><th>Holdings</th><th>Saldo On-chain</th><th>Harga Rata-rata</th><th>Harga Kini</th><th>Market Cap</th><th>Nilai</th><th>PnL</th><th>ROI</th><th></th></tr></thead>
               <tbody>
                 ${data.positions
                   .map(
@@ -1789,9 +1890,11 @@ async function renderPortfolio() {
                       <td><a href="#/coin/${esc(p.mintAddress)}"><b>${esc(p.name)}</b> <span class="muted">$${esc(p.ticker)}</span></a></td>
                       <td>${fmtTokens(p.holdings)}</td>
                       <td>${fmtTokens(state.onchainBalances[p.mintAddress] || 0)}</td>
-                      <td>${fmtPrice(p.avgBuyPrice)} SOL</td>
-                      <td>${fmtSol(p.currentValueSol)} SOL</td>
-                      <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtSignedSol(p.totalPnlSol)}</td>
+                      <td>${fmtPriceBoth(p.avgBuyPriceUsd, p.avgBuyPrice)}</td>
+                      <td>${fmtPriceBoth(p.priceUsd, p.price)}</td>
+                      <td>${fmtMarketCap(p)}</td>
+                      <td>${fmtMoneyBoth(p.currentValueUsd, p.currentValueSol)}</td>
+                      <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtMoneyBoth(p.totalPnlUsd, p.totalPnlSol, true)}</td>
                       <td class="${p.totalPnlSol >= 0 ? 'profit' : 'loss'}">${fmtPct(p.roiPct)}</td>
                       <td><a class="btn btn-sm" href="#/coin/${esc(p.mintAddress)}">Lihat</a></td>
                     </tr>`

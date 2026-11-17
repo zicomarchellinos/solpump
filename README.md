@@ -15,7 +15,7 @@ Tidak ada program on-chain kustom — trading memakai **dompet pool kustodian** 
 
 1. **Pool wallet.** Saat server pertama kali jalan, server membuat satu keypair pool dan menyimpan secret-nya di tabel `meta` di database (atau memakai `POOL_SECRET_KEY` dari environment — lihat Konfigurasi). Alamat pool tampil di footer situs dan di panel trading, dengan tautan ke Solana Explorer.
 2. **Funding.** Setelah mint (1B token ke kreator), kreator menandatangani satu transaksi lagi untuk memindahkan **800.000.000 token** ke ATA pool (200.000.000 token tetap di dompet kreator). Server memverifikasi transfer itu on-chain; baru setelah itu coin masuk feed dengan trading aktif. Kalau funding dilewati/gagal, coin tetap tampil tapi trading nonaktif — kreator bisa funding belakangan dari halaman coin.
-3. **Beli.** Pengguna menandatangani transfer SOL asli (Phantom) ke pool. Server menunggu konfirmasi on-chain, lalu mengirim token SPL dari pool ke ATA pembeli (transaksi asli yang ditandatangani server), baru kemudian mencatat trade. Harga dari kurva bonding constant-product (cadangan virtual 30 SOL / 800.000.000 token).
+3. **Beli.** Pengguna menandatangani transfer SOL asli (Phantom) ke pool. Server menunggu konfirmasi on-chain, lalu mengirim token SPL dari pool ke ATA pembeli (transaksi asli yang ditandatangani server), baru kemudian mencatat trade. Harga dari kurva bonding constant-product (cadangan virtual 55 SOL / 800.000.000 token).
 4. **Jual.** Pengguna menandatangani transfer token asli ke pool; server mengonfirmasi, lalu mengirim SOL dari pool ke pengguna, baru mencatat trade.
 5. **Pra-pemeriksaan.** Sebelum pengguna menandatangani apa pun, server memeriksa saldo pool (token untuk beli, SOL untuk jual) dan saldo token pengguna on-chain — trade yang tidak bisa diselesaikan ditolak dulu dengan pesan yang jelas.
 6. **Setiap trade mencatat kedua tanda tangan transaksi** (kaki pengguna + kaki pool) dan menampilkannya di tabel transaksi dengan tautan Explorer. Kaki pool yang gagal dicatat di tabel `failed_trades` (bukan trade) dan pengguna diberi tahu beserta tanda tangannya.
@@ -23,6 +23,15 @@ Tidak ada program on-chain kustom — trading memakai **dompet pool kustodian** 
 **Peringatan:** ini devnet saja — SOL di sini token testnet gratis tanpa nilai uang. Dompet pool bersifat kustodian: server memegang kuncinya dan menyelesaikan sisi kedua setiap trade. Jangan gunakan model ini di mainnet tanpa audit keamanan.
 
 **Pool keypair di Render (tier gratis):** database SQLite di Render bersifat ephemeral. Kalau service restart tanpa `POOL_SECRET_KEY` yang diset, server membuat pool wallet BARU dan token/SOL di pool lama terlantar (trading gagal secara aman: trade baru ditolak di pra-pemeriksaan). Untuk deployment yang bertahan, set `POOL_SECRET_KEY` di environment Render dengan secret keypair yang sama. Saat pertama kali dibuat, server mencatat alamat pool dan secret-nya (base64) sekali di log dengan peringatan untuk menyimpannya.
+
+## Harga dalam USD
+
+Harga token dan market cap ditampilkan dalam USD, ala pump.fun — pasangannya tetap **TICKER/SOL**, dan semua jumlah yang benar-benar berpindah (input beli/jual, jumlah diterima, saldo pool, fee kreator) tetap dalam SOL.
+
+- **Harga token**: harga SOL dari kurva bonding × kurs SOL/USD, ditampilkan desimal biasa tanpa notasi ilmiah (mis. `$0.000005`).
+- **Market cap**: harga × kurs SOL/USD × 1.000.000.000 (suplai total), dengan sufiks ringkas: `$5K`, `$500K`, `$5M`, `$50M`, `$500M`, `$5B`.
+- **Kurs SOL/USD** diambil server dari API harga publik tanpa API key (Jupiter lite price API utama, CoinGecko sebagai cadangan), di-cache 60 detik di server (`src/solprice.js`), dan disertakan di respons API (`solUsd` + field `*Usd`). Kalau semua sumber harga tidak bisa dijangkau, server memakai harga terakhir yang ter-cache; kalau belum pernah ada harga sama sekali, UI kembali menampilkan SOL (tidak pernah crash atau NaN).
+- **Market cap awal ≈ $5.000**: cadangan virtual 55 SOL dipilih agar coin baru mulai di sekitar $5K — market cap awal = 55 SOL × (1B / 800M) = 68,75 SOL ≈ **$5.008** pada kurs ~$72,85 (17 Nov 2026). Angka ini kira-kira saja karena kurs SOL/USD bergerak; kalau SOL bergerak jauh, setel ulang `VIRTUAL_SOL` di `src/bonding.js` dengan rumus `5000 / (1,25 × kurs SOL/USD)`.
 
 ## Teknologi
 
@@ -67,6 +76,7 @@ npm run test:mint-flow  # kode klien persis (public/solana.js): deteksi Phantom,
 | `PORT` | `3000` | Port server (Render mengaturnya sendiri) |
 | `SOLANA_DEVNET_RPC` | `https://api.devnet.solana.com` | Endpoint RPC devnet untuk verifikasi on-chain |
 | `POOL_SECRET_KEY` | _(dibuat & disimpan di DB)_ | Secret keypair pool wallet: array JSON 64 angka, atau string base64. Set ini di production agar pool wallet bertahan restart. |
+| `SOL_USD_PRICE` | _(harga live dari API)_ | Override kurs SOL/USD (pengujian + jalan darurat kalau API harga terblokir; jangan diset di production) |
 
 ## Deploy ke Render
 
@@ -78,6 +88,7 @@ npm run test:mint-flow  # kode klien persis (public/solana.js): deteksi Phantom,
 server.js            entry point Express (API + frontend statis)
 src/db.js            skema SQLite (coins, trades, meta, failed_trades)
 src/bonding.js       matematika bonding-curve + PnL (average-cost)
+src/solprice.js      kurs SOL/USD (Jupiter/CoinGecko, cache 60 detik)
 src/rpc.js           koneksi devnet RPC bersama + retry
 src/pool.js          keypair pool wallet + transfer SOL/token dari pool
 src/verify.js        verifikasi on-chain via devnet RPC (mint, funding, transfer)
@@ -92,6 +103,7 @@ test/                skrip uji
 | Endpoint | Deskripsi |
 |---|---|
 | `GET /api/pool` | Alamat dompet pool (publik) |
+| `GET /api/sol-price` | Kurs SOL/USD saat ini (cache 60 detik; null kalau belum pernah ada harga) |
 | `GET /api/coins?search=&sort=` | Daftar coin + statistik pasar |
 | `GET /api/coins/:mint?wallet=` | Detail coin: chart, statistik, trade, PnL dompet |
 | `GET /api/portfolio?wallet=` | Portofolio satu dompet |
@@ -103,5 +115,5 @@ test/                skrip uji
 
 ## Catatan
 
-- Harga dari kurva bonding virtual (cadangan awal 30 SOL / 800.000.000 token, kelulusan di 85 SOL), bukan dari pasar on-chain — tapi SOL dan token yang berpindah adalah aset devnet asli.
+- Harga dari kurva bonding virtual (cadangan awal 55 SOL / 800.000.000 token, kelulusan di 85 SOL), bukan dari pasar on-chain — tapi SOL dan token yang berpindah adalah aset devnet asli.
 - Devnet tidak bernilai uang sungguhan. Jangan gunakan aplikasi ini di mainnet tanpa audit keamanan.

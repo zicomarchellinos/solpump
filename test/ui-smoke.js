@@ -4,8 +4,9 @@
 // views and asserts the key elements render. Requires the server running
 // (default http://localhost:3100). Seeds one test coin + trades + a callout
 // directly in the local DB, then removes all test data. Also unit-checks
-// the price formatter: plain decimals everywhere, never scientific
-// notation. Run with:
+// the price formatters: plain decimals everywhere, never scientific
+// notation — SOL prices, USD prices ($0.000005), USD money ($12.35) and
+// the $K/$M/$B market-cap suffixes. Run with:
 //   node test/ui-smoke.js [baseUrl]
 
 const path = require('path');
@@ -37,16 +38,19 @@ async function main() {
   const db = new Database(path.join(__dirname, '..', 'data', 'solpump.db'));
   const mint = Keypair.generate().publicKey.toBase58();
   const now = Date.now();
-  // Coin with reserves moved by two recorded trades (buy 1.5 SOL, buy 0.5 SOL).
-  // trading_enabled=1 so the real trade panel renders.
-  const tok1 = (800000000 * 1.5) / 31.5;
-  const tok2 = ((800000000 - tok1) * 0.5) / 32;
+  // Coin with reserves moved by two recorded trades (buy 1.5 SOL, buy 0.5 SOL)
+  // from the 55 SOL launch reserve. trading_enabled=1 so the real trade
+  // panel renders.
+  const tok1 = (800000000 * 1.5) / 56.5;
+  const tok2 = ((800000000 - tok1) * 0.5) / 57;
+  const finalTok = 800000000 - tok1 - tok2;
+  const smokePrice = 57 / finalTok;
   db.prepare(
     `INSERT INTO coins
        (mint_address, name, ticker, description, logo_url, creator_wallet, tx_signature,
         sol_reserve, token_reserve, trading_enabled, funding_tx_signature, created_at)
-     VALUES (?, 'Smoke Cat', 'SMOKE', 'UI smoke test coin', NULL, ?, ?, 32, ?, 1, ?, ?)`
-  ).run(mint, WALLET_A, 'z'.repeat(88), 800000000 - tok1 - tok2, 'f'.repeat(88), now - 60000);
+     VALUES (?, 'Smoke Cat', 'SMOKE', 'UI smoke test coin', NULL, ?, ?, 57, ?, 1, ?, ?)`
+  ).run(mint, WALLET_A, 'z'.repeat(88), finalTok, 'f'.repeat(88), now - 60000);
   const insertTrade = db.prepare(
     `INSERT INTO trades
        (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
@@ -95,6 +99,17 @@ async function main() {
       15000,
       'coin card in feed'
     );
+    // Expected USD strings for the smoke coin, from the live SOL/USD rate
+    // (the test server is started with SOL_USD_PRICE=100; if a server ever
+    // has no price, the UI falls back to SOL and the fallback branch below
+    // is checked instead). Computed here — after the wait above — because
+    // the page's scripts may not have run yet when fromURL resolves.
+    const solPriceRes = await fetch(`${BASE}/api/sol-price`).then((r) => r.json());
+    const solUsd = solPriceRes.solUsd;
+    const expPrice = Number.isFinite(solUsd) ? window.fmtPriceUsd(smokePrice * solUsd) : null;
+    const expMc = Number.isFinite(solUsd)
+      ? window.fmtMarketCapUsd(smokePrice * 1000000000 * solUsd)
+      : null;
     assert(
       document.body.textContent.includes('Smoke Cat'),
       'feed shows the seeded coin'
@@ -103,6 +118,14 @@ async function main() {
     assert(document.querySelector('#sortSelect'), 'feed sort select renders');
     assert(document.body.textContent.includes('Market cap'), 'coin card shows market cap');
     assert(document.querySelector('.coin-card .addr-link'), 'coin card links the creator profile');
+    const cardText = document.querySelector('.coin-card').textContent;
+    assert(cardText.includes('SMOKE/SOL'), 'coin card shows the TICKER/SOL pair label');
+    if (expPrice) {
+      assert(cardText.includes(expPrice), `coin card shows the USD price (${expPrice})`);
+      assert(cardText.includes(expMc), `coin card shows the USD market cap (${expMc})`);
+    } else {
+      assert(cardText.includes('SOL'), 'coin card falls back to SOL without a price');
+    }
     // Price formatting: plain decimals, never scientific notation — unit
     // checks against the page's own fmtPrice, plus a sweep over tiny prices.
     assert(window.fmtPrice(4.1e-8) === '0,000000041', `fmtPrice(4.1e-8) = ${window.fmtPrice(4.1e-8)}`);
@@ -113,6 +136,36 @@ async function main() {
     for (const p of [1e-9, 9.99e-9, 1.23456789e-8, 5e-7, 9.9999e-5, 0.001, 12.345]) {
       const out = window.fmtPrice(p);
       assert(!/[eE][-+]?\d/.test(out) && !out.includes('×10'), `fmtPrice(${p}) has no scientific notation: ${out}`);
+    }
+    // USD price formatter: plain decimals, $ prefix, never scientific.
+    assert(window.fmtPriceUsd(5e-6) === '$0.000005', `fmtPriceUsd(5e-6) = ${window.fmtPriceUsd(5e-6)}`);
+    assert(window.fmtPriceUsd(2.987e-6) === '$0.000002987', `fmtPriceUsd(2.987e-6) = ${window.fmtPriceUsd(2.987e-6)}`);
+    assert(window.fmtPriceUsd(0.5) === '$0.5', `fmtPriceUsd(0.5) = ${window.fmtPriceUsd(0.5)}`);
+    assert(window.fmtPriceUsd(0) === '$0', 'fmtPriceUsd(0) = $0');
+    for (const p of [1e-9, 9.99e-9, 1.23456789e-8, 5e-7, 9.9999e-5, 0.001, 12.345]) {
+      const out = window.fmtPriceUsd(p);
+      assert(!/[eE][-+]?\d/.test(out) && !out.includes('×10'), `fmtPriceUsd(${p}) has no scientific notation: ${out}`);
+    }
+    // USD money formatter (PnL, values): 2 decimals from $1 up.
+    assert(window.fmtUsd(12.345) === '$12.35', `fmtUsd(12.345) = ${window.fmtUsd(12.345)}`);
+    assert(window.fmtUsd(0.0004) === '$0.0004', `fmtUsd(0.0004) = ${window.fmtUsd(0.0004)}`);
+    assert(window.fmtUsd(-5) === '−$5.00', `fmtUsd(-5) = ${window.fmtUsd(-5)}`);
+    assert(window.fmtSignedUsd(2.5) === '+$2.50', `fmtSignedUsd(2.5) = ${window.fmtSignedUsd(2.5)}`);
+    assert(window.fmtSignedUsd(-0.0004) === '−$0.0004', `fmtSignedUsd(-0.0004) = ${window.fmtSignedUsd(-0.0004)}`);
+    // Market-cap suffix formatter (frontend copy mirrors the server).
+    const mcCases = [
+      [4999, '$5K'],
+      [5200, '$5.2K'],
+      [500000, '$500K'],
+      [5000000, '$5M'],
+      [12400000, '$12.4M'],
+      [50000000, '$50M'],
+      [500000000, '$500M'],
+      [5000000000, '$5B'],
+      [999999, '$1M'],
+    ];
+    for (const [value, expected] of mcCases) {
+      assert(window.fmtMarketCapUsd(value) === expected, `fmtMarketCapUsd(${value}) = ${expected}`);
     }
     // Footer shows the pool wallet address (loaded from /api/pool).
     const poolAddr = await waitFor(() => {
@@ -128,9 +181,30 @@ async function main() {
     await waitFor(() => document.querySelector('#chartSvg'), 15000, 'price chart SVG');
     assert(document.body.textContent.includes('Grafik Harga'), 'detail shows price chart heading');
     assert(document.body.textContent.includes('Market Cap'), 'detail shows market cap stat');
+    assert(document.body.textContent.includes('SMOKE/SOL'), 'detail shows the TICKER/SOL pair label');
     // Market cap appears in the chart header too (next to the price).
     const chartCard = document.querySelector('#chartWrap').closest('.card');
     assert(chartCard.textContent.includes('Market Cap'), 'chart header shows market cap next to the price');
+    if (expPrice) {
+      assert(chartCard.textContent.includes(expPrice), `chart header shows the USD price (${expPrice})`);
+      assert(chartCard.textContent.includes(expMc), `chart header shows the USD market cap (${expMc})`);
+      // High/low stats and the trade table price column are USD too.
+      const expHigh = window.fmtPriceUsd((0.5 / tok2) * solUsd);
+      const expLow = window.fmtPriceUsd((55 / 800000000) * solUsd);
+      assert(document.body.textContent.includes(expHigh), `detail shows the USD high (${expHigh})`);
+      assert(document.body.textContent.includes(expLow), `detail shows the USD low (${expLow})`);
+      const expTradePrice = window.fmtPriceUsd((1.5 / tok1) * solUsd);
+      assert(
+        document.querySelector('#tradesTable').textContent.includes(expTradePrice),
+        `trade table shows the USD price (${expTradePrice})`
+      );
+      // Callout entry price is USD.
+      const expEntry = window.fmtPriceUsd((2.0 / (tok1 + tok2)) * solUsd);
+      assert(
+        document.querySelector('#calloutsCard').textContent.includes(expEntry),
+        `callout shows the USD entry price (${expEntry})`
+      );
+    }
     assert(document.body.textContent.includes('Terverifikasi on-chain'), 'detail shows verified badge');
     assert(document.body.textContent.includes('explorer.solana.com') || document.querySelector('a[href*="explorer.solana.com"]'), 'detail links to Solana Explorer');
     assert(document.querySelector('.trade-box'), 'buy/sell panel renders');

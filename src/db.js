@@ -26,7 +26,7 @@ db.exec(`
     logo_url TEXT,
     creator_wallet TEXT NOT NULL,
     tx_signature TEXT NOT NULL,
-    sol_reserve REAL NOT NULL DEFAULT 30,
+    sol_reserve REAL NOT NULL DEFAULT 55,
     token_reserve REAL NOT NULL DEFAULT 800000000,
     created_at INTEGER NOT NULL
   );

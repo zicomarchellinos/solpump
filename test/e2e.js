@@ -17,7 +17,12 @@
 //   8. follows: signature verification (wrong message/signature 401,
 //      self-follow 400), follow/unfollow + lists, creator profile
 //      aggregation, and the feed's ?following= filter
-//   9. market cap = price x 1B supply, everywhere it is exposed
+//   9. market cap = price x 1B supply, everywhere it is exposed — in SOL
+//      and in USD (x SOL/USD), with the $K/$M/$B suffix formatter, and a
+//      fresh coin starting near a $5K USD market cap at current SOL prices
+//  10. SOL/USD price: /api/sol-price, the *Usd fields on coins/stats/
+//      trades/PnL/callouts, and the price-API fallback (stale cache, then
+//      null — never a crash or NaN)
 // The actual Phantom signature steps cannot be exercised here (no wallet
 // extension), so no real on-chain trade is executed by this test — and the
 // claim success path (a real pool payout) cannot be tested without
@@ -30,6 +35,7 @@ const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const { Keypair } = require('@solana/web3.js');
 const bonding = require('../src/bonding');
+const solprice = require('../src/solprice');
 
 // A throwaway wallet that can sign follow messages: a real Solana keypair,
 // signed with Node's built-in Ed25519 (same scheme Phantom uses).
@@ -108,8 +114,9 @@ async function main() {
     bonding.quoteBuySolForTokens(after2, 800000000) === Infinity,
     'inverse buy quote is Infinity past the curve'
   );
+  assert(bonding.VIRTUAL_SOL === 55, 'virtual SOL reserve is 55 (tuned for a ~$5K starting market cap)');
   assert(
-    approx(bonding.INITIAL_PRICE, 30 / 800000000),
+    approx(bonding.INITIAL_PRICE, bonding.VIRTUAL_SOL / 800000000),
     `initial price = ${bonding.INITIAL_PRICE}`
   );
   assert(bonding.FUNDING_TOKENS === 800000000, 'funding is 800M tokens');
@@ -121,12 +128,62 @@ async function main() {
   assert(approx(bonding.creatorFeeSol(1.5), 0.015), 'creatorFeeSol(1.5 SOL) = 0.015 SOL');
   assert(approx(bonding.creatorFeeSol(0.0005), 0.000005), 'creatorFeeSol(0.0005 SOL) = 0.000005 SOL');
   // Market cap = current price x 1B total supply.
-  const mcFresh = { sol_reserve: 30, token_reserve: 800000000 };
+  const mcFresh = { sol_reserve: bonding.VIRTUAL_SOL, token_reserve: 800000000 };
   assert(
     approx(bonding.marketCapSol(mcFresh), bonding.currentPrice(mcFresh) * 1000000000),
     'marketCapSol = price x 1B supply'
   );
-  assert(approx(bonding.marketCapSol(mcFresh), 37.5), `fresh-coin market cap is 37.5 SOL`);
+  assert(approx(bonding.marketCapSol(mcFresh), 68.75), `fresh-coin market cap is 68.75 SOL`);
+  // Starting market cap in USD at a mocked current SOL price: ~$5K.
+  const mockedSolUsd = 72.85; // SOL/USD on 2026-11-17 (Jupiter / CoinGecko)
+  const startingMcUsd = bonding.marketCapUsd(mcFresh, mockedSolUsd);
+  assert(
+    startingMcUsd > 4500 && startingMcUsd < 5500,
+    `fresh-coin market cap at $${mockedSolUsd}/SOL is $${startingMcUsd.toFixed(0)} (near $5K)`
+  );
+  const startingPriceUsd = bonding.INITIAL_PRICE * mockedSolUsd;
+  assert(
+    startingPriceUsd > 4.5e-6 && startingPriceUsd < 5.5e-6,
+    `fresh-coin starting price is ~$${startingPriceUsd.toExponential(2)}`
+  );
+  // marketCapUsd is null without a usable price (never NaN).
+  assert(bonding.marketCapUsd(mcFresh, null) === null, 'marketCapUsd is null without a price');
+  assert(bonding.marketCapUsd(mcFresh, NaN) === null, 'marketCapUsd is null for a NaN price');
+  assert(bonding.marketCapUsd(mcFresh, 0) === null, 'marketCapUsd is null for a zero price');
+  assert(bonding.marketCapUsd(mcFresh, -5) === null, 'marketCapUsd is null for a negative price');
+  // Compact USD market-cap suffixes across the full range.
+  const mcCases = [
+    [4999, '$5K'],
+    [5000, '$5K'],
+    [5200, '$5.2K'],
+    [500000, '$500K'],
+    [5000000, '$5M'],
+    [12400000, '$12.4M'],
+    [50000000, '$50M'],
+    [500000000, '$500M'],
+    [5000000000, '$5B'],
+    [999999, '$1M'],
+    [999, '$999'],
+    [0, '$0'],
+  ];
+  for (const [value, expected] of mcCases) {
+    assert(
+      bonding.fmtMarketCapUsd(value) === expected,
+      `fmtMarketCapUsd(${value}) = ${bonding.fmtMarketCapUsd(value)} (expected ${expected})`
+    );
+  }
+  assert(bonding.fmtMarketCapUsd(null) === null, 'fmtMarketCapUsd(null) is null');
+  assert(bonding.fmtMarketCapUsd(NaN) === null, 'fmtMarketCapUsd(NaN) is null');
+  // Chart points carry priceUsd when a price is given, null otherwise.
+  const chartWithUsd = bonding.chartPoints(mcFresh, [], 100);
+  assert(
+    approx(chartWithUsd[0].priceUsd, bonding.INITIAL_PRICE * 100),
+    'chart launch point priceUsd = initial price x SOL/USD'
+  );
+  assert(
+    bonding.chartPoints(mcFresh, [])[0].priceUsd === null,
+    'chart priceUsd is null without a price'
+  );
   // PnL is net of the creator fee on sells: the seller received
   // solOut - fee, so realized PnL and totalSellSol use the net amount.
   const feeSell = bonding.creatorFeeSol(solOut);
@@ -146,6 +203,49 @@ async function main() {
     approx(pnlNet.realizedPnlSol, solOut - feeSell - (1.5 / tok1) * halfA),
     'PnL realized uses net sell proceeds'
   );
+  // PnL USD fields: SOL figures converted at the current rate; null
+  // without a price.
+  const pnlUsd = bonding.computePnl(
+    [
+      { side: 'buy', sol_amount: 1.5, token_amount: tok1, fee_sol: bonding.creatorFeeSol(1.5) },
+      { side: 'sell', sol_amount: solOut, token_amount: halfA, fee_sol: feeSell },
+    ],
+    bonding.currentPrice({ sol_reserve: 32 - solOut, token_reserve: 800000000 - tok1 - tok2 + halfA }),
+    100
+  );
+  assert(approx(pnlUsd.totalPnlUsd, pnlUsd.totalPnlSol * 100), 'PnL totalPnlUsd = totalPnlSol x SOL/USD');
+  assert(approx(pnlUsd.realizedPnlUsd, pnlUsd.realizedPnlSol * 100), 'PnL realizedPnlUsd = realizedPnlSol x SOL/USD');
+  assert(approx(pnlUsd.costBasisUsd, pnlUsd.costBasisSol * 100), 'PnL costBasisUsd = costBasisSol x SOL/USD');
+  assert(approx(pnlUsd.avgBuyPriceUsd, pnlUsd.avgBuyPrice * 100), 'PnL avgBuyPriceUsd = avgBuyPrice x SOL/USD');
+  assert(pnlNet.totalPnlUsd === null, 'PnL USD fields are null without a price');
+
+  // ---------- 1b. SOL/USD price fallback (module level) ----------
+  // The test process itself must not see SOL_USD_PRICE (only the server
+  // process is started with it); drop it defensively for this section.
+  console.log('sol price fallback (module):');
+  const savedEnvPrice = process.env.SOL_USD_PRICE;
+  delete process.env.SOL_USD_PRICE;
+  const realFetch = globalThis.fetch;
+  try {
+    solprice.setCachedPriceForTest(123.45);
+    let pr = await solprice.getSolUsdPrice();
+    assert(pr.price === 123.45 && pr.stale === false, 'fresh cached price is served without a network call');
+    // Stale cache + dead network -> last cached price, marked stale.
+    solprice.setCachedPriceForTest(123.45, Date.now() - 61_000);
+    globalThis.fetch = async () => {
+      throw new Error('network down');
+    };
+    pr = await solprice.getSolUsdPrice();
+    assert(pr.price === 123.45 && pr.stale === true, 'dead network falls back to the stale cached price');
+    // No cache + dead network -> null, never a crash or NaN.
+    solprice.clearCacheForTest();
+    pr = await solprice.getSolUsdPrice();
+    assert(pr.price === null, 'dead network with no cache returns null');
+  } finally {
+    globalThis.fetch = realFetch;
+    solprice.clearCacheForTest();
+    if (savedEnvPrice !== undefined) process.env.SOL_USD_PRICE = savedEnvPrice;
+  }
 
   // ---------- 2. Server: seed two coins ----------
   const db = new Database(path.join(__dirname, '..', 'data', 'solpump.db'));
@@ -213,6 +313,30 @@ async function main() {
       'feed market cap = price x 1B supply'
     );
     assert(approx(funded.totalFeesSol, totalFees), 'feed totalFeesSol sums the 1% trade fees');
+
+    // SOL/USD price + USD fields. The test server is started with
+    // SOL_USD_PRICE=100, so the USD path is exercised; if a server ever
+    // has no price, the *Usd fields must be null (SOL fallback), never NaN.
+    const solPriceRes = await get('/api/sol-price');
+    assert(
+      solPriceRes.solUsd === null || (Number.isFinite(solPriceRes.solUsd) && solPriceRes.solUsd > 0),
+      `/api/sol-price returns a positive price or null (got ${solPriceRes.solUsd})`
+    );
+    const solUsd = feed.solUsd;
+    if (Number.isFinite(solUsd)) {
+      assert(solPriceRes.solUsd === solUsd, 'feed solUsd matches /api/sol-price');
+      assert(
+        approx(funded.priceUsd, funded.price * solUsd),
+        'feed priceUsd = price x SOL/USD'
+      );
+      assert(
+        approx(funded.marketCapUsd, funded.marketCapSol * solUsd),
+        'feed marketCapUsd = marketCapSol x SOL/USD'
+      );
+    } else {
+      assert(funded.priceUsd === null, 'feed priceUsd is null without a SOL price');
+      assert(funded.marketCapUsd === null, 'feed marketCapUsd is null without a SOL price');
+    }
 
     // ---------- 4. Prepare: rejections BEFORE any signing ----------
     console.log('prepare rejections:');
@@ -361,6 +485,38 @@ async function main() {
       approx(pnl.totalPnlSol, pnl.realizedPnlSol + pnl.unrealizedPnlSol),
       'total PnL = realized + unrealized'
     );
+    // Detail USD fields: stats, chart points, trade rows, wallet PnL.
+    if (Number.isFinite(solUsd)) {
+      assert(
+        approx(detail.stats.priceUsd, detail.stats.price * solUsd),
+        'detail priceUsd = price x SOL/USD'
+      );
+      assert(
+        approx(detail.stats.marketCapUsd, detail.stats.marketCapSol * solUsd),
+        'detail marketCapUsd = marketCapSol x SOL/USD'
+      );
+      assert(
+        approx(detail.stats.highUsd, detail.stats.high * solUsd) &&
+          approx(detail.stats.lowUsd, detail.stats.low * solUsd),
+        'detail highUsd/lowUsd = high/low x SOL/USD'
+      );
+      assert(
+        detail.chart.every((pt) => approx(pt.priceUsd, pt.price * solUsd)),
+        'chart points carry priceUsd = price x SOL/USD'
+      );
+      assert(
+        detail.trades.every((t) => approx(t.priceUsd, t.price * solUsd)),
+        'trade rows carry priceUsd = price x SOL/USD'
+      );
+      assert(
+        approx(pnl.totalPnlUsd, pnl.totalPnlSol * solUsd) &&
+          approx(pnl.avgBuyPriceUsd, pnl.avgBuyPrice * solUsd),
+        'wallet PnL USD fields = SOL fields x SOL/USD'
+      );
+    } else {
+      assert(detail.stats.priceUsd === null, 'detail priceUsd is null without a SOL price');
+      assert(pnl.totalPnlUsd === null, 'wallet PnL USD fields are null without a SOL price');
+    }
 
     // Portfolio aggregates across the wallet's positions.
     const pf = await get(`/api/portfolio?wallet=${WALLET_A}`);
@@ -372,6 +528,31 @@ async function main() {
       approx(pf.summary.totalPnlPct, (pnl.totalPnlSol / 1.5) * 100),
       'portfolio ROI matches'
     );
+    const pfPos = pf.positions[0];
+    assert(
+      approx(pfPos.marketCapSol, pfPos.price * 1000000000),
+      'portfolio position marketCapSol = price x 1B supply'
+    );
+    if (Number.isFinite(solUsd)) {
+      assert(
+        approx(pfPos.priceUsd, pfPos.price * solUsd),
+        'portfolio position priceUsd = price x SOL/USD'
+      );
+      assert(
+        approx(pfPos.marketCapUsd, pfPos.marketCapSol * solUsd),
+        'portfolio position marketCapUsd = marketCapSol x SOL/USD'
+      );
+      assert(
+        approx(pf.summary.totalPnlUsd, pf.summary.totalPnlSol * solUsd),
+        'portfolio summary totalPnlUsd = totalPnlSol x SOL/USD'
+      );
+      assert(
+        approx(pf.summary.totalCurrentValueUsd, pf.summary.totalCurrentValueSol * solUsd),
+        'portfolio summary current value USD = SOL x SOL/USD'
+      );
+    } else {
+      assert(pfPos.priceUsd === null, 'portfolio priceUsd is null without a SOL price');
+    }
 
     // ---------- 8. Creator fees, claims, follows, profiles ----------
     console.log('creator fees + claims + follows + profiles:');
@@ -587,6 +768,16 @@ async function main() {
       approx(c.pnlPct, ((currentPrice - bEntry) / bEntry) * 100),
       'callout live PnL (%) = price move vs entry'
     );
+    if (Number.isFinite(solUsd)) {
+      assert(
+        approx(c.entryPriceUsd, bEntry * solUsd) &&
+          approx(c.currentPriceUsd, currentPrice * solUsd) &&
+          approx(c.pnlUsd, c.pnlSol * solUsd),
+        'callout USD fields = SOL fields x SOL/USD'
+      );
+    } else {
+      assert(c.entryPriceUsd === null, 'callout USD fields are null without a SOL price');
+    }
     const coinCallouts = await get(`/api/coins/${mint}/callouts`);
     assert(
       coinCallouts.callouts.length === 1 && coinCallouts.callouts[0].id === c.id,

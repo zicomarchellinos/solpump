@@ -5,11 +5,18 @@
 // through the server pool wallet (see src/pool.js); the curve only prices
 // how much of the other asset each leg delivers.
 //
-// Virtual reserves at launch: 30 SOL against 800,000,000 tokens (80% of the
+// Virtual reserves at launch: 55 SOL against 800,000,000 tokens (80% of the
 // 1,000,000,000-token supply sits on the curve). The curve is "complete"
 // when 85 SOL has been raised into the reserve.
+//
+// The 55 SOL reserve is tuned so a fresh coin starts near a $5,000 USD
+// market cap, pump.fun style: starting market cap = 55 SOL x (1B / 800M) =
+// 68.75 SOL, which at the SOL/USD price of ~$72.85 (2026-11-17, Jupiter /
+// CoinGecko) is ~$5,008. This is approximate by nature — SOL/USD moves, so
+// the starting cap drifts with the price. If SOL moves a lot, re-tune
+// VIRTUAL_SOL = 5000 / (1.25 x SOL/USD) and round to a clean number.
 
-const VIRTUAL_SOL = 30;
+const VIRTUAL_SOL = 55;
 const VIRTUAL_TOKENS = 800_000_000;
 const TOTAL_SUPPLY = 1_000_000_000;
 const GRADUATION_SOL = 85;
@@ -37,6 +44,42 @@ function currentPrice(coin) {
 
 function marketCapSol(coin) {
   return currentPrice(coin) * TOTAL_SUPPLY;
+}
+
+// Market cap in USD: price (SOL) x SOL/USD x 1B supply. Returns null when
+// no SOL price is available (the caller then falls back to SOL).
+function marketCapUsd(coin, solUsd) {
+  if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
+  return marketCapSol(coin) * solUsd;
+}
+
+// Compact USD formatting, pump.fun style: $5K, $500K, $5M, $50M, $500M,
+// $5B. One decimal when it adds information ($5.2K, $12.4M), none for
+// round values ($5K). Values under $1K render as plain dollars ($999).
+// Rounding that crosses a scale boundary bumps up ($999,999 -> $1M, not
+// $1000K). Returns null for a non-finite or negative input.
+function fmtMarketCapUsd(usd) {
+  if (usd === null || usd === undefined) return null; // Number(null) is 0
+  const n = Number(usd);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const oneDecimal = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+  const scales = [
+    [1e9, 'B'],
+    [1e6, 'M'],
+    [1e3, 'K'],
+  ];
+  for (let i = 0; i < scales.length; i++) {
+    const [div, suffix] = scales[i];
+    if (n < div) continue;
+    let v = Math.round((n / div) * 10) / 10;
+    if (v >= 1000 && i > 0) {
+      const [upDiv, upSuffix] = scales[i - 1];
+      v = Math.round((n / upDiv) * 10) / 10;
+      return `$${oneDecimal(v)}${upSuffix}`;
+    }
+    return `$${oneDecimal(v)}${suffix}`;
+  }
+  return `$${oneDecimal(Math.round(n * 10) / 10)}`;
 }
 
 // Progress toward graduation: 0% at launch, 100% once 85 SOL is raised.
@@ -67,8 +110,10 @@ function quoteSellTokensForSol(coin, solOut) {
 }
 
 // Market stats derived from the trade history. `trades` must be in
-// chronological order (oldest first).
-function computeStats(coin, trades) {
+// chronological order (oldest first). Pass the current SOL/USD price to
+// include the USD fields (priceUsd, marketCapUsd, highUsd, lowUsd); they
+// stay null when no price is given.
+function computeStats(coin, trades, solUsd = null) {
   const price = currentPrice(coin);
   const changePct = ((price - INITIAL_PRICE) / INITIAL_PRICE) * 100;
   let high = INITIAL_PRICE;
@@ -83,12 +128,17 @@ function computeStats(coin, trades) {
     totalFeesSol += t.fee_sol || 0;
     traders.add(t.wallet);
   }
+  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
   return {
     price,
+    priceUsd: toUsd(price),
     marketCapSol: marketCapSol(coin),
+    marketCapUsd: marketCapUsd(coin, solUsd),
     changePct,
     high,
+    highUsd: toUsd(high),
     low,
+    lowUsd: toUsd(low),
     volumeSol,
     totalFeesSol,
     txCount: trades.length,
@@ -98,11 +148,16 @@ function computeStats(coin, trades) {
 }
 
 // Chart points: one point per trade plus a launch point at the initial price.
-// `trades` must be in chronological order (oldest first).
-function chartPoints(coin, trades) {
-  const points = [{ t: coin.created_at, price: INITIAL_PRICE, side: null }];
+// `trades` must be in chronological order (oldest first). Pass the current
+// SOL/USD price to include priceUsd per point (for the tooltip); it stays
+// null when no price is given.
+function chartPoints(coin, trades, solUsd = null) {
+  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
+  const points = [
+    { t: coin.created_at, price: INITIAL_PRICE, priceUsd: toUsd(INITIAL_PRICE), side: null },
+  ];
   for (const t of trades) {
-    points.push({ t: t.created_at, price: t.price, side: t.side });
+    points.push({ t: t.created_at, price: t.price, priceUsd: toUsd(t.price), side: t.side });
   }
   return points;
 }
@@ -115,7 +170,12 @@ function chartPoints(coin, trades) {
 // creator fee is part of what they paid, so the cost basis is the full
 // amount); on a sell the trader actually received sol_amount - fee_sol,
 // so realized PnL and totalSellSol use the NET proceeds.
-function computePnl(trades, price) {
+// Pass the current SOL/USD price to also get the USD figures
+// (avgBuyPriceUsd, costBasisUsd, currentValueUsd, realized/unrealized/
+// total PnL in USD) — the SOL figures converted at the current rate,
+// which is the same as computing them from USD prices at that rate.
+// The USD fields are null when no price is given.
+function computePnl(trades, price, solUsd = null) {
   let holdings = 0;
   let cost = 0; // cost basis of the current holdings
   let realized = 0;
@@ -148,14 +208,21 @@ function computePnl(trades, price) {
   const unrealized = currentValue - cost;
   const totalPnl = realized + unrealized;
   const roiPct = totalBuySol > 0 ? (totalPnl / totalBuySol) * 100 : 0;
+  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
   return {
     holdings,
     avgBuyPrice,
+    avgBuyPriceUsd: toUsd(avgBuyPrice),
     costBasisSol: cost,
+    costBasisUsd: toUsd(cost),
     currentValueSol: currentValue,
+    currentValueUsd: toUsd(currentValue),
     realizedPnlSol: realized,
+    realizedPnlUsd: toUsd(realized),
     unrealizedPnlSol: unrealized,
+    unrealizedPnlUsd: toUsd(unrealized),
     totalPnlSol: totalPnl,
+    totalPnlUsd: toUsd(totalPnl),
     roiPct,
     isProfit: totalPnl >= 0,
     totalBuySol,
@@ -179,6 +246,8 @@ module.exports = {
   INITIAL_PRICE,
   currentPrice,
   marketCapSol,
+  marketCapUsd,
+  fmtMarketCapUsd,
   curveProgressPct,
   quoteBuy,
   quoteSell,

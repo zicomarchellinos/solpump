@@ -7,6 +7,10 @@
 //                                   creator fees + fee claims)
 //   GET  /api/portfolio             wallet portfolio (from recorded trades)
 //   GET  /api/pool                  pool wallet address (public)
+//   GET  /api/sol-price             current SOL/USD price (cached 60s;
+//                                   null when no price was ever fetched)
+// Coin/stats responses also carry solUsd + marketCapUsd (null when no SOL
+// price is available — the UI then falls back to market cap in SOL).
 //   POST /api/trades/prepare        quote + pool/user balance pre-checks
 //   POST /api/trades/buy            settle a buy after the user's SOL tx
 //   POST /api/trades/sell           settle a sell after the user's token tx
@@ -39,6 +43,7 @@ const express = require('express');
 const db = require('./db');
 const bonding = require('./bonding');
 const pool = require('./pool');
+const { getSolUsdPrice } = require('./solprice');
 const {
   verifyMint,
   verifyFunding,
@@ -98,8 +103,8 @@ function walletTradesAsc(mintAddress, wallet) {
     .all(mintAddress, wallet);
 }
 
-function publicCoin(row, trades) {
-  const stats = bonding.computeStats(row, trades);
+function publicCoin(row, trades, solUsd = null) {
+  const stats = bonding.computeStats(row, trades, solUsd);
   return {
     mintAddress: row.mint_address,
     name: row.name,
@@ -117,7 +122,8 @@ function publicCoin(row, trades) {
   };
 }
 
-function publicTrade(row) {
+function publicTrade(row, solUsd = null) {
+  const priceUsd = Number.isFinite(solUsd) && solUsd > 0 ? row.price * solUsd : null;
   return {
     id: row.id,
     mintAddress: row.mint_address,
@@ -126,6 +132,7 @@ function publicTrade(row) {
     solAmount: row.sol_amount,
     tokenAmount: row.token_amount,
     price: row.price,
+    priceUsd,
     feeSol: row.fee_sol || 0,
     userTxSignature: row.user_tx_signature || null,
     poolTxSignature: row.pool_tx_signature || null,
@@ -168,20 +175,24 @@ function coinFeeClaims(mintAddress) {
 // Callout helpers. A callout's live PnL is derived at read time from the
 // entry price + holdings recorded at posting (both computed server-side
 // from real trades) against the coin's current price.
-function publicCallout(row, coinRow) {
+function publicCallout(row, coinRow, solUsd = null) {
   const price = bonding.currentPrice(coinRow);
   const pnlSol = (price - row.entry_price) * row.holdings_at_post;
   const pnlPct =
     row.entry_price > 0 ? ((price - row.entry_price) / row.entry_price) * 100 : 0;
+  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
   return {
     id: row.id,
     mintAddress: row.mint_address,
     wallet: row.wallet,
     text: row.text,
     entryPrice: row.entry_price,
+    entryPriceUsd: toUsd(row.entry_price),
     holdingsAtPost: row.holdings_at_post,
     currentPrice: price,
+    currentPriceUsd: toUsd(price),
     pnlSol,
+    pnlUsd: toUsd(pnlSol),
     pnlPct,
     isProfit: pnlSol >= 0,
     createdAt: row.created_at,
@@ -197,13 +208,13 @@ function withCoinMeta(callout, coinRow) {
   };
 }
 
-function coinCallouts(mintAddress) {
+function coinCallouts(mintAddress, solUsd = null) {
   const coinRow = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(mintAddress);
   if (!coinRow) return [];
   return db
     .prepare('SELECT * FROM callouts WHERE mint_address = ? ORDER BY created_at DESC, id DESC')
     .all(mintAddress)
-    .map((row) => publicCallout(row, coinRow));
+    .map((row) => publicCallout(row, coinRow, solUsd));
 }
 
 // A wallet's buy history for a coin: total SOL spent, total tokens bought,
@@ -288,11 +299,19 @@ router.get('/pool', (req, res) => {
   res.json({ address: pool.getPoolAddress(), network: 'devnet' });
 });
 
+// ---- GET /api/sol-price ----
+// Current SOL/USD price for the USD market-cap display. Cached server-side
+// for 60s; `solUsd` is null when no price was ever fetched.
+router.get('/sol-price', async (req, res) => {
+  const { price, source, fetchedAt, stale } = await getSolUsdPrice();
+  res.json({ solUsd: price, source, fetchedAt, stale });
+});
+
 // ---- GET /api/coins ----
 // Query: ?search= (name/ticker) &sort=newest|price|marketcap|volume|change
 //   &creator=<wallet> (only that creator's coins)
 //   &following=<wallet> (only coins by creators that wallet follows)
-router.get('/coins', (req, res) => {
+router.get('/coins', async (req, res) => {
   const search = String(req.query.search || '').trim().toLowerCase();
   const sort = String(req.query.sort || 'newest');
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 60));
@@ -322,7 +341,8 @@ router.get('/coins', (req, res) => {
         c.name.toLowerCase().includes(search) || c.ticker.toLowerCase().includes(search)
     );
   }
-  const coins = rows.map((row) => publicCoin(row, coinTradesAsc(row.mint_address)));
+  const { price: solUsd } = await getSolUsdPrice();
+  const coins = rows.map((row) => publicCoin(row, coinTradesAsc(row.mint_address), solUsd));
   switch (sort) {
     case 'price':
       coins.sort((a, b) => b.price - a.price);
@@ -339,67 +359,75 @@ router.get('/coins', (req, res) => {
     default:
       coins.sort((a, b) => b.createdAt - a.createdAt);
   }
-  res.json({ coins: coins.slice(0, limit) });
+  res.json({ coins: coins.slice(0, limit), solUsd });
 });
 
 // ---- GET /api/coins/:mint ----
-router.get('/coins/:mint', (req, res) => {
+router.get('/coins/:mint', async (req, res) => {
   const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
   if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
 
+  const { price: solUsd } = await getSolUsdPrice();
   const trades = coinTradesAsc(row.mint_address);
-  const coin = publicCoin(row, trades);
+  const coin = publicCoin(row, trades, solUsd);
   const wallet = typeof req.query.wallet === 'string' ? req.query.wallet : null;
 
   const result = {
     coin,
+    solUsd,
     stats: {
       price: coin.price,
+      priceUsd: coin.priceUsd,
       marketCapSol: coin.marketCapSol,
+      marketCapUsd: coin.marketCapUsd,
       changePct: coin.changePct,
       high: coin.high,
+      highUsd: coin.highUsd,
       low: coin.low,
+      lowUsd: coin.lowUsd,
       volumeSol: coin.volumeSol,
       totalFeesSol: coin.totalFeesSol,
       txCount: coin.txCount,
       uniqueTraders: coin.uniqueTraders,
       progressPct: coin.progressPct,
     },
-    chart: bonding.chartPoints(row, trades),
+    chart: bonding.chartPoints(row, trades, solUsd),
     trades: trades
       .slice()
       .reverse()
       .slice(0, 100)
-      .map(publicTrade),
+      .map((t) => publicTrade(t, solUsd)),
     // Creator-fee claims for this coin (shown in the transaction history).
     feeClaims: coinFeeClaims(row.mint_address),
     creatorFees: coinFeeTotals(row.mint_address),
     creatorFeePct: CREATOR_FEE_PCT,
     viewerFollowsCreator: wallet ? isFollowing(wallet, row.creator_wallet) : false,
     // Callouts (verified buyers only), newest first, with live PnL.
-    callouts: coinCallouts(row.mint_address),
+    callouts: coinCallouts(row.mint_address, solUsd),
     walletPnl: null,
     walletTrades: [],
   };
 
   if (wallet) {
     const mine = walletTradesAsc(row.mint_address, wallet);
-    result.walletPnl = bonding.computePnl(mine, coin.price);
+    result.walletPnl = bonding.computePnl(mine, coin.price, solUsd);
     result.walletTrades = mine
       .slice()
       .reverse()
-      .map(publicTrade);
+      .map((t) => publicTrade(t, solUsd));
   }
   res.json(result);
 });
 
 // ---- GET /api/portfolio?wallet= ----
-router.get('/portfolio', (req, res) => {
+router.get('/portfolio', async (req, res) => {
   const wallet = req.query.wallet;
   if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
     return badRequest(res, 'Parameter wallet tidak valid.');
   }
 
+  const { price: solUsd } = await getSolUsdPrice();
+  const toUsd = (sol) => (Number.isFinite(solUsd) && solUsd > 0 ? sol * solUsd : null);
   const coins = db.prepare('SELECT * FROM coins').all();
   const positions = [];
   const summary = {
@@ -420,13 +448,16 @@ router.get('/portfolio', (req, res) => {
     const mine = walletTradesAsc(row.mint_address, wallet);
     if (mine.length === 0) continue;
     const price = bonding.currentPrice(row);
-    const pnl = bonding.computePnl(mine, price);
+    const pnl = bonding.computePnl(mine, price, solUsd);
     positions.push({
       mintAddress: row.mint_address,
       name: row.name,
       ticker: row.ticker,
       logoUrl: row.logo_url,
       price,
+      priceUsd: toUsd(price),
+      marketCapSol: bonding.marketCapSol(row),
+      marketCapUsd: bonding.marketCapUsd(row, solUsd),
       ...pnl,
     });
     summary.coinCount += 1;
@@ -442,9 +473,14 @@ router.get('/portfolio', (req, res) => {
   summary.totalPnlPct =
     summary.totalBuySol > 0 ? (summary.totalPnlSol / summary.totalBuySol) * 100 : 0;
   summary.isProfit = summary.totalPnlSol >= 0;
+  summary.totalCostBasisUsd = toUsd(summary.totalCostBasisSol);
+  summary.totalCurrentValueUsd = toUsd(summary.totalCurrentValueSol);
+  summary.totalRealizedPnlUsd = toUsd(summary.totalRealizedPnlSol);
+  summary.totalUnrealizedPnlUsd = toUsd(summary.totalUnrealizedPnlSol);
+  summary.totalPnlUsd = toUsd(summary.totalPnlSol);
   positions.sort((a, b) => b.currentValueSol - a.currentValueSol);
 
-  res.json({ wallet, positions, summary });
+  res.json({ wallet, positions, summary, solUsd });
 });
 
 // ---- Quote helper (shared by prepare + settle) ----
@@ -984,10 +1020,11 @@ router.post('/coins/:mint/fund', async (req, res) => {
 
 // ---- GET /api/coins/:mint/callouts ----
 // Callouts for one coin, newest first, with live PnL vs the current price.
-router.get('/coins/:mint/callouts', (req, res) => {
+router.get('/coins/:mint/callouts', async (req, res) => {
   const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
   if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
-  res.json({ mintAddress: row.mint_address, callouts: coinCallouts(row.mint_address) });
+  const { price: solUsd } = await getSolUsdPrice();
+  res.json({ mintAddress: row.mint_address, solUsd, callouts: coinCallouts(row.mint_address, solUsd) });
 });
 
 // ---- POST /api/coins/:mint/callouts ----
@@ -996,7 +1033,7 @@ router.get('/coins/:mint/callouts', (req, res) => {
 // every callout carries a "pembeli terverifikasi" marker honestly. Entry
 // price (average buy price) and holdings at posting time are computed
 // server-side from real trades; the client cannot supply prices.
-router.post('/coins/:mint/callouts', (req, res) => {
+router.post('/coins/:mint/callouts', async (req, res) => {
   const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
   if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
   const { wallet, text } = req.body || {};
@@ -1026,14 +1063,15 @@ router.post('/coins/:mint/callouts', (req, res) => {
     )
     .run(row.mint_address, wallet, text.trim(), entryPrice, holdings, Date.now());
   const created = db.prepare('SELECT * FROM callouts WHERE id = ?').get(info.lastInsertRowid);
-  res.status(201).json({ callout: publicCallout(created, row) });
+  const { price: solUsd } = await getSolUsdPrice();
+  res.status(201).json({ callout: publicCallout(created, row, solUsd) });
 });
 
 // ---- GET /api/callouts ----
 // Latest callouts across all coins (newest first, max 50).
 //   ?following=<wallet> — only callouts by traders that wallet follows
 //   ?wallet=<wallet> — only callouts by one wallet
-router.get('/callouts', (req, res) => {
+router.get('/callouts', async (req, res) => {
   const following = typeof req.query.following === 'string' ? req.query.following : null;
   const wallet = typeof req.query.wallet === 'string' ? req.query.wallet : null;
   if (following && !BASE58_RE.test(following)) {
@@ -1042,6 +1080,7 @@ router.get('/callouts', (req, res) => {
   if (wallet && !BASE58_RE.test(wallet)) {
     return badRequest(res, 'Parameter wallet tidak valid.');
   }
+  const { price: solUsd } = await getSolUsdPrice();
   let rows;
   if (following) {
     rows = db
@@ -1072,10 +1111,10 @@ router.get('/callouts', (req, res) => {
       }
       const coinRow = coinRows.get(row.mint_address);
       if (!coinRow) return null;
-      return withCoinMeta(publicCallout(row, coinRow), coinRow);
+      return withCoinMeta(publicCallout(row, coinRow, solUsd), coinRow);
     })
     .filter(Boolean);
-  res.json({ callouts: out });
+  res.json({ callouts: out, solUsd });
 });
 
 // ---- POST /api/coins/:mint/claim-fees ----
@@ -1155,18 +1194,19 @@ router.post('/coins/:mint/claim-fees', async (req, res) => {
 // creator fees earned/claimed/unclaimed, followers + following.
 // Query ?viewer=<wallet> adds isFollowing (viewer follows this creator)
 // and isSelf.
-router.get('/creators/:wallet', (req, res) => {
+router.get('/creators/:wallet', async (req, res) => {
   const wallet = req.params.wallet;
   if (!BASE58_RE.test(wallet)) {
     return badRequest(res, 'Alamat dompet tidak valid.');
   }
   const viewer = typeof req.query.viewer === 'string' ? req.query.viewer : null;
 
+  const { price: solUsd } = await getSolUsdPrice();
   const coinRows = db
     .prepare('SELECT * FROM coins WHERE creator_wallet = ? ORDER BY created_at DESC')
     .all(wallet);
   const coins = coinRows.map((row) => {
-    const coin = publicCoin(row, coinTradesAsc(row.mint_address));
+    const coin = publicCoin(row, coinTradesAsc(row.mint_address), solUsd);
     const fees = coinFeeTotals(row.mint_address);
     coin.feesClaimedSol = fees.totalClaimedSol;
     coin.feesUnclaimedSol = fees.unclaimedSol;
@@ -1204,13 +1244,14 @@ router.get('/creators/:wallet', (req, res) => {
       }
       const coinRow = calloutCoinRows.get(row.mint_address);
       if (!coinRow) return null;
-      return withCoinMeta(publicCallout(row, coinRow), coinRow);
+      return withCoinMeta(publicCallout(row, coinRow, solUsd), coinRow);
     })
     .filter(Boolean);
 
   res.json({
     wallet,
     coins,
+    solUsd,
     callouts,
     totalVolumeSol,
     totalFeesEarnedSol,
