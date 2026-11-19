@@ -3,8 +3,8 @@
 // (see src/pool.js) — no custom on-chain program:
 //   GET  /api/coins                 list coins (?following=<wallet> filters
 //                                   to coins by followed creators)
-//   GET  /api/coins/:mint           coin detail (chart, stats, trades, PnL,
-//                                   creator fees + fee claims, burns)
+//   GET  /api/coins/:mint           coin detail (chart, stats, trade-ledger
+//                                   top holders, trades, PnL, fees, burns)
 //   GET  /api/coins/:mint/candles   OHLC candlesticks (?timeframe=1m|5m|15m|1h)
 //   GET  /api/coins/:mint/burns     burn history + totals for a coin
 //   GET  /api/pairs                 available pair assets (SOL + listed coins)
@@ -288,6 +288,26 @@ function walletTradesAsc(mintAddress, wallet) {
       'SELECT * FROM trades WHERE mint_address = ? AND wallet = ? ORDER BY created_at ASC, id ASC'
     )
     .all(mintAddress, wallet);
+}
+
+function topTradeHolders(mintAddress, circulatingSupply) {
+  return db
+    .prepare(
+      `SELECT wallet,
+              SUM(CASE WHEN side = 'buy' THEN token_amount ELSE -token_amount END) AS token_amount
+       FROM trades
+       WHERE mint_address = ?
+       GROUP BY wallet
+       HAVING SUM(CASE WHEN side = 'buy' THEN token_amount ELSE -token_amount END) > 0.000000001
+       ORDER BY token_amount DESC, wallet ASC
+       LIMIT 10`
+    )
+    .all(mintAddress)
+    .map((row) => ({
+      wallet: row.wallet,
+      tokenAmount: row.token_amount,
+      supplySharePct: circulatingSupply > 0 ? (row.token_amount / circulatingSupply) * 100 : 0,
+    }));
 }
 
 function coinBurnsAsc(mintAddress) {
@@ -984,6 +1004,7 @@ router.get('/coins/:mint', async (req, res) => {
       totalBurned: coin.totalBurned,
       circulatingSupply: coin.circulatingSupply,
     },
+    topHolders: topTradeHolders(row.mint_address, coin.circulatingSupply),
     chart: bonding.chartPoints(row, trades, assetUsd, burns),
     trades: trades
       .slice()

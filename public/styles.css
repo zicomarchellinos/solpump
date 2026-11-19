@@ -1,6 +1,4 @@
-/* solpump — tampilan ala pump.fun (berdasarkan pengamatan langsung ke
-   pump.fun, snapshot 2026-11-10): tema gelap, sidebar kiri, aksen hijau
-   muda, font Geist. Nama, brand mark, dan copy tetap milik solpump. */
+/* solpump — tema launchpad terang dengan aksen hijau dan rail navigasi. */
 @font-face {
   font-family: "Geist";
   src: url("/fonts/Geist-Regular.woff2") format("woff2");
@@ -24,27 +22,26 @@
 }
 
 :root {
-  /* Token warna pump.fun (dari CSS resminya). */
-  --bg: #111113;        /* bg-primary */
-  --card: #18191b;      /* bg-secondary */
-  --card2: #212225;     /* bg-tertiary */
-  --card3: #272a2d;     /* bg-muted-secondary */
-  --border: #212225;    /* border-secondary */
-  --border2: #272a2d;   /* border-tertiary */
-  --text: #fafafa;      /* text-primary */
-  --text2: #e4e4e7;     /* text-secondary */
-  --muted: #a1a1aa;     /* text-tertiary */
-  --green: #86efac;     /* accent / bg-interactive */
-  --green-on: #052e16;  /* text-on-accent */
-  --green-dim: #0e2e12; /* sprout-950 */
-  --gain: #5ddf6c;      /* text-success */
-  --loss: #f87171;      /* text-error */
-  --red: #ef4444;
-  --red-dim: #450a0a;
-  --gold: #facc15;
-  --blue: #60a5fa;
-  --radius: 8px;
-  --radius-sm: 6px;
+  --bg: #f5f5f7;
+  --card: #fff;
+  --card2: #f0f1ed;
+  --card3: #e7e9e3;
+  --border: #e2e4df;
+  --border2: #cfd3cc;
+  --text: #0c1500;
+  --text2: #263020;
+  --muted: #687365;
+  --green: #00c805;
+  --green-on: #0c1500;
+  --green-dim: #e4f8e4;
+  --gain: #18883b;
+  --loss: #d94332;
+  --red: #ed563d;
+  --red-dim: #fff0ed;
+  --gold: #b57d00;
+  --blue: #3974bf;
+  --radius: 20px;
+  --radius-sm: 13px;
 }
 
 * { box-sizing: border-box; }
@@ -53,7 +50,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: "Nunito", ui-rounded, "SF Pro Rounded", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 15px;
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
@@ -62,7 +59,7 @@ body {
 h1, h2, h3 { letter-spacing: -0.02em; }
 h1 { font-size: 1.4rem; }
 h2 { font-size: 1.05rem; }
-a { color: var(--green); text-decoration: none; }
+a { color: var(--text); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 .muted { color: var(--muted); }
@@ -611,15 +608,30 @@ th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
 .modal-close:hover { color: var(--text); }
 
 /* Livestream panel. */
-.stream-video-wrap {
+.stream-setup-overlay { z-index: 110; }
+.stream-setup-modal { max-width: 720px; }
+.stream-setup-video-wrap { margin: 12px 0; }
+.stream-video-wrap video.is-mirrored,
+.stream-stage video.is-mirrored { transform: scaleX(-1); }
+.stream-mirror-option { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.stream-mirror-option input { width: auto; margin: 0; accent-color: var(--green); }
+.stream-setup-status { min-height: 1.4em; margin: 8px 0; }
+.stream-setup-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.stream-video-wrap,
+.stream-stage {
   background: #000; border-radius: var(--radius-sm);
   overflow: hidden; aspect-ratio: 16 / 9;
-  display: flex; align-items: center; justify-content: center;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  align-items: center; justify-items: center;
   margin: 8px 0;
 }
-.stream-video-wrap video { width: 100%; height: 100%; object-fit: cover; }
+.stream-video-wrap video,
+.stream-stage video { width: 100%; height: 100%; min-width: 0; object-fit: cover; }
 .stream-placeholder { color: var(--muted); font-size: 0.9rem; text-align: center; padding: 16px; }
 .stream-status { margin: 6px 0; }
+.stream-guest-requests { margin: 10px 0; display: grid; gap: 8px; }
+.stream-guest-request { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.stream-guest-request > span { margin-right: auto; }
 .stream-chat-log {
   max-height: 220px; overflow-y: auto;
   border: 1px solid var(--border2); border-radius: var(--radius-sm);
@@ -694,6 +706,394 @@ th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
   padding: 8px 10px; flex-wrap: wrap;
 }
 .contact-edit { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 220px; }
+
+/* Pons-inspired launchpad skin: bright surfaces, a compact rail, and soft
+   rounded cards, while preserving solpump's existing controls and routes. */
+.topbar {
+  height: 60px;
+  background: rgba(245, 245, 247, 0.94);
+  border-bottom-color: var(--border);
+  backdrop-filter: blur(14px);
+}
+.infobar {
+  background: var(--card);
+  border-bottom-color: var(--border);
+}
+.container { max-width: 1280px; padding-top: 32px; padding-bottom: 48px; }
+.footer { max-width: 1280px; margin: 0 auto; color: var(--muted); }
+.launchpad-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 8px 0 28px;
+}
+.launchpad-heading h1 {
+  margin: 0;
+  font-size: clamp(2rem, 4vw, 2.75rem);
+  line-height: 1.08;
+  letter-spacing: -0.045em;
+}
+.launchpad-eyebrow {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+}
+.launchpad-create { min-height: 44px; padding-inline: 20px; border-radius: 999px; }
+.card {
+  background: var(--card);
+  border-color: var(--border);
+  border-radius: 24px;
+  box-shadow: 0 1px 2px rgba(12, 21, 0, 0.04), 0 8px 24px rgba(12, 21, 0, 0.035);
+}
+.btn {
+  min-height: 40px;
+  height: auto;
+  border-radius: 999px;
+  border-color: var(--border);
+  background: var(--card);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+.btn:hover:not(:disabled) { filter: none; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(12, 21, 0, 0.1); }
+.btn-primary { background: var(--green); border-color: var(--green); color: var(--green-on); }
+.btn-sell { background: var(--red); border-color: var(--red); color: #fff; }
+.pill {
+  min-height: 36px;
+  height: auto;
+  padding: 8px 15px;
+  border-color: var(--border);
+  background: var(--card);
+  color: var(--muted);
+  border-radius: 999px;
+}
+.pill:hover { color: var(--text); border-color: var(--border2); }
+.pill.active { background: var(--text); border-color: var(--text); color: #fff; }
+.toolbar { gap: 12px; margin: 20px 0 14px; }
+.toolbar input, input, textarea, select {
+  border-color: var(--border);
+  border-radius: 13px;
+  background: var(--card);
+  color: var(--text);
+}
+input:focus, textarea:focus, select:focus { border-color: var(--green); outline: 3px solid rgba(0, 200, 5, 0.15); }
+.cat-pills { gap: 8px; margin-bottom: 24px; }
+.coin-grid { display: flex; flex-direction: column; gap: 12px; }
+.coin-card {
+  padding: 18px 22px;
+  border-color: var(--border);
+  border-radius: 24px;
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.coin-card:hover {
+  border-color: rgba(0, 200, 5, 0.45);
+  box-shadow: 0 8px 24px rgba(12, 21, 0, 0.08);
+  transform: translateY(-1px);
+}
+.coin-head { gap: 14px; margin-bottom: 12px; }
+.coin-logo, .coin-avatar { width: 60px; height: 60px; border-radius: 17px; }
+.coin-name { font-size: 1rem; }
+.coin-ticker, .coin-pair, .coin-time, .coin-desc, .coin-foot { color: var(--muted); }
+.coin-price-row { padding-top: 12px; border-top: 1px solid var(--border); }
+.coin-price { font-size: 1rem; }
+.progress { height: 5px; background: var(--card2); }
+.progress > div { background: var(--green); }
+.trend-strip { gap: 12px; padding: 4px 2px 12px; }
+.trend-chip {
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--card);
+  box-shadow: 0 1px 2px rgba(12, 21, 0, 0.04);
+}
+.net-pill { background: var(--green-dim); border-color: rgba(0, 200, 5, 0.2); color: #18752a; }
+.wallet-chip { background: var(--card); border-color: var(--border); }
+.wallet-chip .bal { color: #18752a; }
+.badge { border-radius: 999px; }
+.badge-category, .badge-tax { background: var(--card2); color: var(--text2); }
+.badge-adult { background: var(--red-dim); color: #bd3929; }
+.alert { border-radius: 16px; }
+.modal {
+  border-color: var(--border);
+  border-radius: 24px;
+  box-shadow: 0 20px 60px rgba(12, 21, 0, 0.2);
+}
+.stream-setup-overlay { background: rgba(12, 21, 0, 0.48); }
+
+@media (min-width: 768px) {
+  .sidebar {
+    position: fixed;
+    z-index: 40;
+    left: 0;
+    top: 0;
+    width: 60px;
+    height: 100vh;
+    padding: 12px 6px;
+    overflow: hidden;
+    background: var(--bg);
+    border-right-color: transparent;
+    transition: width 0.28s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.28s ease;
+  }
+  .sidebar:hover, .sidebar:focus-within {
+    width: 190px;
+    background: var(--card);
+    border-right-color: var(--border);
+    box-shadow: 8px 0 32px rgba(12, 21, 0, 0.08);
+  }
+  .sidebar .brand { height: 40px; justify-content: center; padding: 0; }
+  .sidebar .brand .brand-text,
+  .sidebar .nav-label,
+  .sidebar-foot {
+    display: block;
+    width: 0;
+    opacity: 0;
+    overflow: hidden;
+    visibility: hidden;
+    transition: opacity 0.16s ease;
+  }
+  .sidebar:hover .brand { justify-content: flex-start; padding: 0 7px; }
+  .sidebar:hover .brand .brand-text,
+  .sidebar:hover .nav-label,
+  .sidebar:hover .sidebar-foot,
+  .sidebar:focus-within .brand .brand-text,
+  .sidebar:focus-within .nav-label,
+  .sidebar:focus-within .sidebar-foot {
+    width: auto;
+    opacity: 1;
+    visibility: visible;
+  }
+  .sidebar .nav { gap: 4px; }
+  .sidebar .nav a {
+    width: 44px;
+    height: 42px;
+    padding: 0;
+    justify-content: center;
+    border-radius: 13px;
+  }
+  .sidebar:hover .nav a,
+  .sidebar:focus-within .nav a { width: 100%; justify-content: flex-start; padding: 0 12px; }
+  .sidebar .nav-label { white-space: nowrap; }
+  .sidebar-foot {
+    border-top-color: var(--border);
+    padding: 8px 4px 0;
+  }
+  .main-col { margin-left: 60px; }
+  .sidebar-toggle { display: none; }
+  .app-shell.sidebar-collapsed .sidebar { width: 60px; }
+  .app-shell.sidebar-collapsed .sidebar:hover,
+  .app-shell.sidebar-collapsed .sidebar:focus-within { width: 190px; }
+  .app-shell.sidebar-collapsed .sidebar:hover .brand-text,
+  .app-shell.sidebar-collapsed .sidebar:hover .nav-label,
+  .app-shell.sidebar-collapsed .sidebar:hover .sidebar-foot,
+  .app-shell.sidebar-collapsed .sidebar:focus-within .brand-text,
+  .app-shell.sidebar-collapsed .sidebar:focus-within .nav-label,
+  .app-shell.sidebar-collapsed .sidebar:focus-within .sidebar-foot {
+    display: block;
+  }
+}
+
+@media (max-width: 767px) {
+  .sidebar { background: var(--card); }
+  .main-col { margin-left: 0; }
+  .topbar { height: 56px; padding-left: 14px; padding-right: 14px; }
+  .container { padding: 24px 16px 36px; }
+  .launchpad-heading { align-items: flex-start; margin: 4px 0 22px; }
+  .launchpad-create { min-height: 40px; padding-inline: 14px; }
+  .coin-card { padding: 16px; }
+}
+
+/* Coin detail: compact market terminal, with live market data, chart,
+   recent activity and the order form grouped above secondary information. */
+.container.coin-terminal-view {
+  max-width: 1540px;
+  padding-top: 20px;
+}
+.terminal-asset-header {
+  margin-bottom: 10px;
+  padding: 18px 20px;
+  border-radius: 16px;
+}
+.terminal-asset-header .coin-head { margin-bottom: 8px; }
+.terminal-asset-header .proof { margin-top: 10px; }
+.terminal-market-strip {
+  display: grid;
+  grid-template-columns: minmax(210px, 1.5fr) repeat(4, minmax(120px, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin: 0 0 12px;
+  border: 1px solid #29352d;
+  border-radius: 14px;
+  background: #29352d;
+}
+.terminal-market-stat {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 12px 16px;
+  background: #111914;
+  color: #a4b2a7;
+}
+.terminal-market-stat > span,
+.terminal-market-stat > small {
+  font-size: 0.74rem;
+  line-height: 1.25;
+}
+.terminal-market-stat strong {
+  overflow: hidden;
+  color: #e8f0ea;
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-market-stat.terminal-last-price {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+.terminal-last-price > span { grid-column: 1 / -1; }
+.terminal-last-price strong { font-size: 1.3rem; }
+.terminal-market-stat .profit { color: #39ce83; }
+.terminal-market-stat .loss { color: #ff6b74; }
+.terminal-layout {
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 12px;
+}
+.terminal-layout .detail-side { top: 72px; }
+.terminal-layout .card {
+  margin-bottom: 12px;
+  border-radius: 14px;
+}
+.terminal-chart-card,
+.terminal-activity-card,
+.terminal-order-panel {
+  border-color: #29352d;
+  background: #111914;
+  color: #e8f0ea;
+  box-shadow: 0 4px 18px rgba(10, 18, 12, 0.08);
+}
+.terminal-chart-card .muted,
+.terminal-activity-card .muted,
+.terminal-order-panel .muted { color: #98a79b; }
+.terminal-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.terminal-section-head h2 { margin: 0; }
+.terminal-chart-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #aab8ad;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+.terminal-chart-live i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #28c875;
+  box-shadow: 0 0 10px rgba(40, 200, 117, 0.6);
+}
+.terminal-chart-card .btn,
+.terminal-activity-card .btn,
+.terminal-order-panel .btn:not(.btn-buy):not(.btn-sell) {
+  min-height: 34px;
+  border-color: #344239;
+  border-radius: 8px;
+  background: #1a251e;
+  color: #b7c4ba;
+}
+.terminal-chart-card .btn.active,
+.terminal-activity-card .tabs .btn.active,
+.terminal-order-panel .tabs .btn.active {
+  border-color: #2ba86a;
+  background: #173b2a;
+  color: #59df98;
+}
+.terminal-chart-card .chart-wrap svg { height: 350px; }
+.terminal-activity-card .tabs { margin-bottom: 8px; }
+.terminal-activity-card table { font-size: 0.82rem; }
+.terminal-activity-card th { color: #829287; }
+.terminal-activity-card th,
+.terminal-activity-card td { border-bottom-color: #27332b; }
+.terminal-activity-card td { color: #cbd6ce; }
+.terminal-activity-card a { color: #dce8df; }
+.terminal-order-panel h2 { color: #f0f5f1; }
+.terminal-order-panel .badge-live {
+  background: #173b2a;
+  color: #59df98;
+}
+.terminal-order-panel .tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 4px;
+  border: 1px solid #29352d;
+  border-radius: 10px;
+  background: #0c130f;
+}
+.terminal-order-panel .tabs .btn {
+  width: 100%;
+  margin: 0;
+}
+.terminal-order-panel .tabs .btn[data-side="buy"].active {
+  border-color: #258b58;
+  background: #17653d;
+  color: #e4fff0;
+}
+.terminal-order-panel .tabs .btn[data-side="sell"].active {
+  border-color: #a84449;
+  background: #68292e;
+  color: #ffe8e9;
+}
+.terminal-order-panel input,
+.terminal-order-panel select {
+  border-color: #344239;
+  border-radius: 8px;
+  background: #0c130f;
+  color: #eef4ef;
+}
+.terminal-order-panel .btn-buy,
+.terminal-order-panel .btn-sell {
+  border-radius: 9px;
+  font-weight: 800;
+}
+.terminal-order-panel .btn-buy { background: #159957; border-color: #159957; color: #fff; }
+.terminal-order-panel .btn-sell { background: #c8444b; border-color: #c8444b; }
+.terminal-order-panel .quick .btn { border-radius: 7px; }
+.terminal-order-panel .estimate {
+  padding: 8px 10px;
+  border: 1px solid #29352d;
+  border-radius: 8px;
+  background: #0c130f;
+  color: #b5c3b9;
+}
+.terminal-order-panel #tradeResult .alert { color: #142019; }
+.terminal-layout > .detail-main > .card:not(.terminal-chart-card):not(.terminal-activity-card) {
+  border-radius: 14px;
+}
+@media (max-width: 960px) {
+  .terminal-layout { grid-template-columns: 1fr; }
+  .terminal-layout .detail-side { position: static; }
+  .terminal-order-panel { order: -1; }
+}
+@media (max-width: 680px) {
+  .container.coin-terminal-view { padding: 16px 10px 28px; }
+  .terminal-market-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .terminal-market-stat { padding: 10px 12px; }
+  .terminal-market-stat.terminal-last-price { grid-column: 1 / -1; }
+  .terminal-chart-card .chart-wrap svg { height: 270px; }
+  .terminal-asset-header { padding: 14px; }
+}
 
 /* Print: only the receipt prints — the app chrome and the action
    buttons are hidden. */

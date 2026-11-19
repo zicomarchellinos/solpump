@@ -218,6 +218,7 @@ async function main() {
       'feed shows the seeded coin'
     );
     assert(document.querySelector('#searchInput'), 'feed search input renders');
+    assert(document.querySelector('.launchpad-heading h1'), 'feed renders the launchpad heading');
     assert(document.querySelectorAll('[data-sort]').length === 5, 'feed sort pills render (Baru / Market Cap / Volume / Harga / Perubahan)');
     assert(document.querySelector('[data-sort="newest"].active'), 'newest sort pill is active by default');
     assert(document.body.textContent.includes('Market cap'), 'coin card shows market cap');
@@ -508,12 +509,18 @@ async function main() {
     assert(document.body.textContent.includes('Grafik Harga'), 'detail shows price chart heading');
     assert(document.body.textContent.includes('Market Cap'), 'detail shows market cap stat');
     assert(document.body.textContent.includes('SMOKE/SOL'), 'detail shows the TICKER/SOL pair label');
-    // Market cap appears in the chart header too (next to the price).
+    assert(document.querySelector('.terminal-market-strip'), 'detail shows the compact trader market-data strip');
+    assert(
+      document.querySelectorAll('.terminal-market-strip .terminal-market-stat').length === 5,
+      'market strip summarizes price, market cap, volume, traders and transactions'
+    );
+    // Price and market cap are prominent in the terminal market-data strip.
     const chartCard = document.querySelector('#chartWrap').closest('.card');
-    assert(chartCard.textContent.includes('Market Cap'), 'chart header shows market cap next to the price');
+    const marketStrip = document.querySelector('.terminal-market-strip');
+    assert(marketStrip.textContent.includes('Market Cap'), 'market strip shows market cap next to the price');
     if (expPrice) {
-      assert(chartCard.textContent.includes(expPrice), `chart header shows the USD price (${expPrice})`);
-      assert(chartCard.textContent.includes(expMc), `chart header shows the USD market cap (${expMc})`);
+      assert(marketStrip.textContent.includes(expPrice), `market strip shows the USD price (${expPrice})`);
+      assert(marketStrip.textContent.includes(expMc), `market strip shows the USD market cap (${expMc})`);
       // High/low stats and the trade table price column are USD too.
       const expHigh = window.fmtPriceUsd((0.5 / tok2) * solUsd);
       const expLow = window.fmtPriceUsd((55 / 800000000) * solUsd);
@@ -535,6 +542,7 @@ async function main() {
     assert(document.body.textContent.includes('explorer.solana.com') || document.querySelector('a[href*="explorer.solana.com"]'), 'detail links to Solana Explorer');
     // Two-column detail layout (pump.fun style): chart left, trade sidebar right.
     assert(document.querySelector('.detail-layout'), 'detail uses the two-column layout');
+    assert(document.querySelector('.terminal-layout'), 'coin detail uses the trading terminal layout');
     assert(document.querySelector('.detail-side'), 'detail has a sticky trade sidebar');
     assert(
       document.querySelector('.detail-side .trade-box'),
@@ -545,6 +553,12 @@ async function main() {
       'creator fee card lives in the detail sidebar'
     );
     assert(document.querySelector('.trade-box'), 'buy/sell panel renders');
+    assert(document.querySelector('.terminal-order-panel'), 'buy/sell panel uses the terminal order panel');
+    assert(
+      document.querySelector('.terminal-activity-card') &&
+        document.querySelector('.terminal-activity-card #tradesTable'),
+      'recent trades are grouped directly below the chart'
+    );
     assert(document.body.textContent.includes('DEVNET ASLI'), 'trade panel labeled DEVNET ASLI');
     assert(document.body.textContent.includes('dompet pool'), 'trade panel discloses the pool wallet');
     assert(document.body.textContent.includes('creator fee'), 'trade panel discloses the 1% creator fee');
@@ -703,6 +717,17 @@ async function main() {
     assert(
       document.querySelector('#streamCard').textContent.includes('WebRTC'),
       'stream panel states the WebRTC mesh limit'
+    );
+    const holderRow = document.querySelector('#holdersTable tbody tr');
+    assert(holderRow, 'coin detail lists holders with recorded trade balances');
+    assert(
+      holderRow.textContent.includes(window.shortAddr(WALLET_A)) &&
+        holderRow.textContent.includes(window.fmtTokens(tok1 + tok2)),
+      'top holder row shows the wallet and its net token balance'
+    );
+    assert(
+      holderRow.textContent.includes(window.fmtHolderSharePct(((tok1 + tok2) / 1000000000) * 100)),
+      'top holder row shows its share of circulating supply'
     );
     // Callout rewards: the pool card (0.5 SOL funded) + tier chips on
     // the +50% callout (all three tiers eligible).
@@ -957,6 +982,29 @@ async function main() {
         // Same WebCrypto injection as page 1 (jsdom has no SubtleCrypto).
         Object.defineProperty(window, 'crypto', { value: webcrypto, configurable: true });
         window.localStorage.setItem('solpump-wallet', WALLET_A);
+        window.HTMLMediaElement.prototype.play = () => Promise.resolve();
+        const cameraTracks = [];
+        const mediaRequests = [];
+        Object.defineProperty(window, '__testCameraTracks', { value: cameraTracks });
+        Object.defineProperty(window, '__testMediaRequests', { value: mediaRequests });
+        Object.defineProperty(window.navigator, 'mediaDevices', {
+          configurable: true,
+          value: {
+            getUserMedia: async (constraints) => {
+              mediaRequests.push(constraints);
+              if (constraints.audio) {
+                throw new window.DOMException('Could not start audio source', 'NotReadableError');
+              }
+              const track = { kind: 'video', readyState: 'live', stop() { this.readyState = 'ended'; } };
+              cameraTracks.push(track);
+              return {
+                getTracks: () => [track],
+                getAudioTracks: () => [],
+                getVideoTracks: () => [track],
+              };
+            },
+          },
+        });
       },
     });
     const win2 = dom2.window;
@@ -1165,6 +1213,14 @@ async function main() {
       doc2.querySelectorAll('#calloutsCard [data-claim-reward]').length >= 3,
       'the callout author sees claim buttons for the three eligible tiers'
     );
+    doc2.querySelector('[data-side="sell"]').click();
+    await waitFor(() => doc2.querySelector('#sellAllCreatorBtn'), 15000, 'creator sell-all control');
+    assert(
+      doc2.querySelector('#sellAllCreatorBtn').textContent.includes('Jual Semua Token Kreator'),
+      'the creator can start a normal sell of their full token balance'
+    );
+    doc2.querySelector('[data-side="buy"]').click();
+    await waitFor(() => doc2.querySelector('#streamStartBtn'), 5000, 'creator detail re-renders after switching back to buy');
     // Livestream: the creator sees the Go Live button.
     assert(
       doc2.querySelector('#streamStartBtn'),
@@ -1173,6 +1229,33 @@ async function main() {
     assert(
       doc2.querySelector('#streamCard').textContent.includes('WebRTC'),
       'the stream panel states the mesh limit for the creator too'
+    );
+    doc2.querySelector('#streamStartBtn').click();
+    await waitFor(() => doc2.querySelector('#streamSetupModal'), 5000, 'livestream setup popup');
+    assert(doc2.querySelector('#streamSetupVideo'), 'livestream setup shows a camera preview');
+    assert(
+      win2.__testMediaRequests.length >= 2 &&
+        win2.__testMediaRequests[0].audio === true &&
+        win2.__testMediaRequests[1].audio === false,
+      'livestream retries with video-only capture when the audio source fails'
+    );
+    assert(
+      doc2.querySelector('#streamSetupStatus').textContent.includes('video saja'),
+      'livestream explains when the microphone is unavailable'
+    );
+    const mirrorToggle = doc2.querySelector('#streamMirrorToggle');
+    assert(mirrorToggle.checked, 'camera preview is mirrored by default');
+    mirrorToggle.checked = false;
+    mirrorToggle.dispatchEvent(new win2.Event('change', { bubbles: true }));
+    assert(
+      !doc2.querySelector('#streamSetupVideo').classList.contains('is-mirrored'),
+      'camera mirror toggle updates the preview'
+    );
+    doc2.querySelector('#streamSetupCancel').click();
+    await waitFor(() => !doc2.querySelector('#streamSetupModal'), 5000, 'livestream setup popup closes');
+    assert(
+      win2.__testCameraTracks.at(-1).readyState === 'ended',
+      'closing livestream setup releases the camera'
     );
 
     // Routed SOL buys: on the pair coin, the buy form offers SOL

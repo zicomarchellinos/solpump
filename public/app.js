@@ -104,6 +104,13 @@ function fmtPct(x) {
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
+function fmtHolderSharePct(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n) || n <= 0) return '0%';
+  if (n < 0.0001) return '<0,0001%';
+  return `${n.toLocaleString('id-ID', { maximumFractionDigits: 4 })}%`;
+}
+
 function fmtSignedSol(x, asset = 'SOL') {
   const n = Number(x);
   return `${n >= 0 ? '+' : '−'}${fmtSol(Math.abs(n))} ${asset}`;
@@ -978,6 +985,7 @@ function renderLangSwitcher() {
 // ---------- Router ----------
 function route() {
   const hash = location.hash || '#/';
+  document.getElementById('view')?.classList.remove('coin-terminal-view');
   // Leaving a coin page ends any livestream the viewer is watching (or
   // broadcasting) — the stream panel unmounts with the view.
   stopStream();
@@ -1016,8 +1024,7 @@ function categoryLabel(cat) {
 
 async function renderFeed() {
   const view = document.getElementById('view');
-  // Layout ala pump.fun: strip trending di atas, lalu filter pill + grid.
-  // (Tidak ada hero — pump.fun langsung ke konten.)
+  // Launchpad header, trending coins, then filters and the coin list.
   const sortPills = [
     ['newest', translate('sortNewest')],
     ['marketcap', translate('sortMarketCap')],
@@ -1026,6 +1033,13 @@ async function renderFeed() {
     ['change', translate('sortChange')],
   ];
   view.innerHTML = `
+    <div class="launchpad-heading">
+      <div>
+        <p class="launchpad-eyebrow">SOLANA DEVNET</p>
+        <h1>${translate('launchpadTitle')}</h1>
+      </div>
+      <a class="btn btn-primary launchpad-create" href="#/create">${translate('navCreate')}</a>
+    </div>
     <div id="trendStrip"></div>
     <div class="toolbar">
       <input id="searchInput" type="search" placeholder="${translate('searchPlaceholder')}" value="${esc(feedSearch)}">
@@ -2008,6 +2022,7 @@ async function renderReRegister() {
 async function renderCoin(mintAddress) {
   const mySeq = ++coinRenderSeq;
   const view = document.getElementById('view');
+  view.classList.add('coin-terminal-view');
   view.innerHTML = `<p class="muted">${translate('loadingCoin')}</p>`;
   let data;
   try {
@@ -2020,7 +2035,7 @@ async function renderCoin(mintAddress) {
   }
   state.coinCache = data;
   if (mySeq !== coinRenderSeq) return; // a newer coin render started
-  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd, rewardPool, stream, pairCoin, solBuyAvailable, solBuyUnavailableReason } = data;
+  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd, rewardPool, stream, pairCoin, solBuyAvailable, solBuyUnavailableReason, topHolders } = data;
   const chg = stats.changePct >= 0 ? 'profit' : 'loss';
   const isCreator = state.wallet && state.wallet === coin.creatorWallet;
   // Pair asset: SOL for SOL pairs, the pair coin's ticker for coin pairs.
@@ -2045,7 +2060,7 @@ async function renderCoin(mintAddress) {
   }
 
   view.innerHTML = `
-    <div class="card">
+    <div class="card terminal-asset-header">
       <div class="coin-head">
         ${logoHtml(coin, 'coin-logo detail-head-logo')}
         <div>
@@ -2082,15 +2097,27 @@ async function renderCoin(mintAddress) {
       </div>
     </div>
 
-    <div class="detail-layout">
+    <div class="terminal-market-strip">
+      <div class="terminal-market-stat terminal-last-price">
+        <span>${translate('chartTitle')}</span>
+        <strong>${fmtPriceBoth(stats.priceUsd, stats.price)}</strong>
+        <small class="${chg}">${fmtPct(stats.changePct)}</small>
+      </div>
+      <div class="terminal-market-stat"><span>${translate('statMarketCap')}</span><strong>${fmtMarketCap(coin)}</strong></div>
+      <div class="terminal-market-stat"><span>${translate('statVolume')}</span><strong>${fmtSol(stats.volumeSol)} ${esc(pairAsset)}</strong></div>
+      <div class="terminal-market-stat"><span>${translate('statUniqueTraders')}</span><strong>${stats.uniqueTraders}</strong></div>
+      <div class="terminal-market-stat"><span>${translate('statTxCount')}</span><strong>${stats.txCount}</strong></div>
+    </div>
+
+    <div class="detail-layout terminal-layout">
     <div class="detail-main">
-    <div class="card" id="streamCard"></div>
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
-        <h2 style="margin:0">${translate('chartTitle')}</h2>
-        <div style="text-align:right"><span style="font-size:1.2rem;font-weight:800">${fmtPriceBoth(stats.priceUsd, stats.price)}</span>
-        <span class="${chg}"> ${fmtPct(stats.changePct)}</span>
-        <div class="small muted">${translate('statMarketCap')} <b style="color:var(--text)">${fmtMarketCap(coin)}</b></div></div>
+    <div class="card terminal-chart-card">
+      <div class="terminal-section-head">
+        <div>
+          <h2>${translate('chartTitle')}</h2>
+          <span class="small muted">${esc(pairLabel)} · ${translate('statHigh')} ${fmtPriceBoth(stats.highUsd, stats.high)} · ${translate('statLow')} ${fmtPriceBoth(stats.lowUsd, stats.low)}</span>
+        </div>
+        <span class="terminal-chart-live"><i></i> DEVNET</span>
       </div>
       <div class="range-btns" style="margin-top:12px">
         <button class="btn btn-sm ${state.chartType === 'area' ? 'active' : ''}" data-chart-type="area">${translate('chartArea')}</button>
@@ -2114,6 +2141,21 @@ async function renderCoin(mintAddress) {
       <div class="chart-wrap" id="chartWrap"></div>
     </div>
 
+    <div class="card terminal-activity-card">
+      <div class="terminal-section-head">
+        <h2>${translate('tradesTitle')}</h2>
+        <span class="small muted">${stats.txCount} ${translate('statTxCount')}</span>
+      </div>
+      <div class="tabs">
+        ${[['Semua', 'tabAll'], ['Beli', 'tabBuy'], ['Jual', 'tabSell'], ['Punyaku', 'tabMine']]
+          .map(([key, labelKey]) => `<button class="btn btn-sm ${state.tradeTab === key ? 'active' : ''}" data-tab="${key}">${translate(labelKey)}</button>`)
+          .join('')}
+      </div>
+      <div class="table-wrap" id="tradesTable"></div>
+    </div>
+
+    <div class="card" id="streamCard"></div>
+
     <div class="card">
       <div class="stat-grid">
         <div class="stat"><div class="label">${translate('statMarketCap')}</div><div class="value">${fmtMarketCap(coin)}</div></div>
@@ -2131,6 +2173,28 @@ async function renderCoin(mintAddress) {
         <div class="small muted">${translate('curveProgress', { pct: stats.progressPct.toFixed(1) })}</div>
         <div class="progress"><div style="width:${stats.progressPct.toFixed(1)}%"></div></div>
       </div>
+    </div>
+
+    <div class="card" id="holdersCard">
+      <h2 style="margin-top:0">${translate('topHoldersTitle')}</h2>
+      <p class="small muted">${translate('topHoldersNote')}</p>
+      ${(topHolders || []).length
+        ? `<div class="table-wrap">
+            <table id="holdersTable">
+              <thead><tr><th>#</th><th>${translate('topHoldersWallet')}</th><th>${translate('topHoldersBalance')}</th><th>${translate('topHoldersSupplyShare')}</th></tr></thead>
+              <tbody>${topHolders
+                .map(
+                  (holder, index) => `<tr>
+                    <td class="muted">${String(index + 1).padStart(2, '0')}</td>
+                    <td>${creatorLink(holder.wallet)}</td>
+                    <td>${fmtTokens(holder.tokenAmount)}</td>
+                    <td>${fmtHolderSharePct(holder.supplySharePct)}</td>
+                  </tr>`
+                )
+                .join('')}</tbody>
+            </table>
+          </div>`
+        : `<p id="holdersEmpty" class="muted">${translate('topHoldersEmpty')}</p>`}
     </div>
 
     <div class="card" id="burnCard">
@@ -2155,16 +2219,6 @@ async function renderCoin(mintAddress) {
       <div id="devBurnResult" style="margin-top:8px"></div>
     </div>` : ''}
 
-    <div class="card">
-      <h2 style="margin-top:0">${translate('tradesTitle')}</h2>
-      <div class="tabs">
-        ${[['Semua', 'tabAll'], ['Beli', 'tabBuy'], ['Jual', 'tabSell'], ['Punyaku', 'tabMine']]
-          .map(([key, labelKey]) => `<button class="btn btn-sm ${state.tradeTab === key ? 'active' : ''}" data-tab="${key}">${translate(labelKey)}</button>`)
-          .join('')}
-      </div>
-      <div class="table-wrap" id="tradesTable"></div>
-    </div>
-
     <div class="card" id="calloutsCard">
       <h2 style="margin-top:0">${translate('calloutsTitle', { n: (callouts || []).length })}</h2>
       <p class="small muted">${translate('calloutsIntro')}</p>
@@ -2179,7 +2233,7 @@ async function renderCoin(mintAddress) {
     <div class="card" id="rewardCard"></div>
     </div>
     <aside class="detail-side">
-      <div class="card trade-box">
+      <div class="card trade-box terminal-order-panel">
         <h2 style="margin-top:0">${translate('tradeTitle')} <span class="badge badge-live">${translate('badgeDevnetLive')}</span></h2>
         <p class="small muted">${translate('tradeIntro', { asset: esc(pairAsset), pool: '<span id="tradePoolAddr">…</span>' })}</p>
         <p class="small">${translate('tradeFeeNote', { pct: creatorFeePct, asset: esc(pairAsset), creator: creatorLink(coin.creatorWallet) })}</p>
@@ -2536,8 +2590,11 @@ async function renderCoin(mintAddress) {
     if (!card) return;
     const isActiveBroadcaster =
       streamState.mint === mintAddress && streamState.role === 'broadcaster';
+    const isActiveGuest =
+      streamState.mint === mintAddress && streamState.role === 'guest';
     const isActiveViewer = streamState.mint === mintAddress && streamState.role === 'viewer';
-    const live = !!stream || isActiveBroadcaster;
+    const isActivePublisher = isActiveBroadcaster || isActiveGuest;
+    const live = !!stream || isActivePublisher;
     if (!live && !isActiveViewer) {
       const mediaOk =
         typeof navigator !== 'undefined' &&
@@ -2556,53 +2613,40 @@ async function renderCoin(mintAddress) {
           : ''}
         <div id="streamStatus" class="small muted"></div>`;
       const startBtn = document.getElementById('streamStartBtn');
-      if (startBtn) startBtn.addEventListener('click', () => startStream(mintAddress));
+      if (startBtn) startBtn.addEventListener('click', () => openStreamSetup(mintAddress));
       return;
     }
     card.innerHTML = `
       <h2 style="margin-top:0">🔴 ${translate('streamTitle')} <span class="badge badge-live-stream">● ${translate('liveBadge')}</span> <span class="small muted" id="streamViewerCount"></span></h2>
-      <div class="stream-video-wrap">
-        <video id="streamVideo" autoplay playsinline ${isActiveBroadcaster ? 'muted' : ''}></video>
-      </div>
+      <div class="stream-stage" id="streamStage"></div>
       <p class="small muted" id="streamStatus">${translate('streamConnecting')}</p>
-      <div id="streamControls">${isActiveBroadcaster ? `<button class="btn btn-sell" id="streamStopBtn">${translate('streamStopBtn')}</button>` : ''}</div>
+      <div id="streamControls"></div>
       <div class="stream-chat">
         <h3>${translate('streamChatTitle')}</h3>
         <div class="stream-chat-log" id="streamChatLog"><p class="muted small stream-chat-empty">${translate('streamChatEmpty')}</p></div>
         <div id="streamChatAuth"></div>
       </div>
       <p class="small muted">${translate('streamMeshNote')}</p>`;
-    const video = document.getElementById('streamVideo');
-    if (video) {
-      if (isActiveBroadcaster && streamState.localStream) {
-        video.srcObject = streamState.localStream;
-        video.muted = true;
-        video.play().catch(() => {});
-      } else if (isActiveViewer && streamState.remoteStream) {
-        video.srcObject = streamState.remoteStream;
-        video.play().catch(() => {});
-      }
+    if (isActivePublisher && streamState.localStream) {
+      attachStreamVideo('local', streamState.localStream, true);
     }
-    const stopBtn = document.getElementById('streamStopBtn');
-    if (stopBtn) {
-      stopBtn.addEventListener('click', () => {
-        stopStream();
-        route();
-      });
+    for (const [peerId, remoteStream] of streamState.remoteStreams) {
+      attachStreamVideo(peerId, remoteStream, false);
     }
-    if (isActiveBroadcaster) {
-      setStreamStatus('streamLiveNow');
+    if (isActivePublisher || isActiveViewer) {
       refreshStreamControls();
       refreshStreamChatAuth();
       updateStreamViewerCount(streamState.viewerCount);
+    }
+    if (isActiveBroadcaster) {
+      setStreamStatus(streamState.audioEnabled ? 'streamLiveNow' : 'streamAudioOnly');
+    } else if (isActiveGuest) {
+      setStreamStatus(streamState.audioEnabled ? 'streamGuestLive' : 'streamAudioOnly');
     } else if (isActiveViewer) {
       setStreamStatus(streamState.ended ? 'streamEnded' : 'streamWatching');
-      refreshStreamChatAuth();
-      updateStreamViewerCount(streamState.viewerCount);
     } else {
       // Live but not connected yet (fresh page load): join as a viewer.
       joinStreamAsViewer(mintAddress);
-      refreshStreamChatAuth();
       updateStreamViewerCount((stream && stream.viewerCount) || 0);
     }
   }
@@ -2832,6 +2876,9 @@ async function renderCoin(mintAddress) {
           <div class="estimate" id="sellEstimate"></div>
         </div>
         <button class="btn btn-sell" id="sellBtn">${translate('sellBtnLabel', { ticker: esc(coin.ticker) })}</button>
+        ${isCreator
+          ? `<button class="btn btn-ghost sell-all-creator-btn" id="sellAllCreatorBtn" ${liveHoldings > 0 ? '' : 'disabled'}>${translate('sellAllCreatorBtn')}</button>`
+          : ''}
         <p class="small muted" style="margin-top:8px">${translate('sellNote', { asset: esc(pairAsset) })}</p>`;
       const input = document.getElementById('sellTokens');
       const update = () => {
@@ -2861,6 +2908,15 @@ async function renderCoin(mintAddress) {
         if (!(tokens > 0)) return toast(translate('errEnterTokens'));
         await submitTrade('sell', { tokenAmount: tokens });
       });
+      const sellAllBtn = document.getElementById('sellAllCreatorBtn');
+      if (sellAllBtn) {
+        sellAllBtn.addEventListener('click', async () => {
+          const tokens = Number(state.onchainBalances[coin.mintAddress] || 0);
+          if (!(tokens > 0)) return toast(translate('errEnterTokens'));
+          if (!window.confirm(translate('sellAllCreatorConfirm', { amount: fmtTokens(tokens), ticker: coin.ticker }))) return;
+          await submitTrade('sell', { tokenAmount: tokens }, sellAllBtn);
+        });
+      }
     }
     if (pnl && pnl.totalTrades > 0) {
       const pnlUsd = Number.isFinite(pnl.totalPnlUsd)
@@ -2884,17 +2940,24 @@ async function renderCoin(mintAddress) {
   // -> server verifies the leg on-chain, completes the pool leg, records.
   // The user's leg is a SOL transfer for SOL pairs, a pair-token transfer
   // for coin pairs (buildPairBuyTransaction).
-  async function submitTrade(side, amounts) {
+  async function submitTrade(side, amounts, actionButton = null) {
     const resEl = document.getElementById('tradeResult');
-    const btn = document.getElementById(side === 'buy' ? 'buyBtn' : 'sellBtn');
+    const buttons = [
+      ...new Set([
+        document.getElementById(side === 'buy' ? 'buyBtn' : 'sellBtn'),
+        actionButton,
+        side === 'sell' ? document.getElementById('sellAllCreatorBtn') : null,
+      ].filter(Boolean)),
+    ];
     const setBusy = (msg) => {
-      if (btn) btn.disabled = true;
+      buttons.forEach((btn) => { btn.disabled = true; });
       resEl.innerHTML = `<p class="muted">${esc(msg)}</p>`;
     };
     const fail = (msg) => {
-      if (btn) btn.disabled = false;
+      buttons.forEach((btn) => { btn.disabled = false; });
       resEl.innerHTML = `<div class="alert alert-error">${msg}</div>`;
     };
+    buttons.forEach((btn) => { btn.disabled = true; });
     try {
       if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
       const phantom = (await waitForPhantom(3000)) || getPhantom();
@@ -3459,14 +3522,21 @@ async function renderCoin(mintAddress) {
 // in-memory only.
 const streamState = {
   mint: null,
-  role: null, // 'broadcaster' | 'viewer' | null
+  role: null, // 'broadcaster' | 'guest' | 'viewer' | null
   ws: null,
   viewerId: null,
   localStream: null, // broadcaster's camera/mic
-  remoteStream: null, // viewer's received stream
-  peers: new Map(), // broadcaster: viewerId -> RTCPeerConnection
-  viewerPeer: null, // viewer: the single peer to the broadcaster
+  previewStream: null, // camera/mic while the go-live setup popup is open
+  mirrorPreview: true,
+  setupKeydown: null,
+  remoteStreams: new Map(), // publisher ID -> received MediaStream
+  peers: new Map(), // publisher: peer ID -> RTCPeerConnection
+  viewerPeers: new Map(), // viewer/guest: publisher ID -> RTCPeerConnection
+  pendingGuestStream: null,
+  guestRequests: new Map(),
+  pendingGuestRequest: false,
   authed: false,
+  audioEnabled: true,
   viewerCount: 0,
   ended: false,
 };
@@ -3482,6 +3552,7 @@ function streamWsUrl(mint) {
 // Safe to call when nothing is active; route() calls it on every
 // navigation so a stream never survives leaving the coin page.
 function stopStream() {
+  closeStreamSetup();
   if (streamState.ws) {
     try {
       if (streamState.ws.readyState === WebSocket.OPEN) {
@@ -3499,9 +3570,9 @@ function stopStream() {
       /* already closed */
     }
   }
-  if (streamState.viewerPeer) {
+  for (const pc of streamState.viewerPeers.values()) {
     try {
-      streamState.viewerPeer.close();
+      pc.close();
     } catch {
       /* already closed */
     }
@@ -3509,17 +3580,40 @@ function stopStream() {
   if (streamState.localStream) {
     streamState.localStream.getTracks().forEach((t) => t.stop());
   }
+  if (streamState.previewStream) {
+    streamState.previewStream.getTracks().forEach((t) => t.stop());
+  }
+  if (streamState.pendingGuestStream) {
+    streamState.pendingGuestStream.getTracks().forEach((t) => t.stop());
+  }
   streamState.mint = null;
   streamState.role = null;
   streamState.ws = null;
   streamState.viewerId = null;
   streamState.localStream = null;
-  streamState.remoteStream = null;
+  streamState.remoteStreams = new Map();
   streamState.peers = new Map();
-  streamState.viewerPeer = null;
+  streamState.viewerPeers = new Map();
+  streamState.pendingGuestStream = null;
+  streamState.guestRequests = new Map();
+  streamState.pendingGuestRequest = false;
   streamState.authed = false;
+  streamState.audioEnabled = true;
   streamState.viewerCount = 0;
   streamState.ended = false;
+}
+
+function closeStreamSetup(stopPreview = true) {
+  const modal = document.getElementById('streamSetupModal');
+  if (modal) modal.remove();
+  if (streamState.setupKeydown) {
+    document.removeEventListener('keydown', streamState.setupKeydown);
+    streamState.setupKeydown = null;
+  }
+  if (stopPreview && streamState.previewStream) {
+    streamState.previewStream.getTracks().forEach((t) => t.stop());
+    streamState.previewStream = null;
+  }
 }
 
 function streamSend(obj) {
@@ -3572,7 +3666,7 @@ function handleStreamMessage(msg) {
       streamState.authed = !!msg.chatAuthed;
       updateStreamViewerCount(msg.viewerCount || 0);
       if (streamState.role === 'broadcaster') {
-        setStreamStatus('streamLiveNow');
+        setStreamStatus(streamState.audioEnabled ? 'streamLiveNow' : 'streamAudioOnly');
         // The panel was rendered as "not live" before the join confirmed
         // (no video/chat elements) — re-render the coin page so it shows
         // the live broadcaster view; renderStreamPanel re-attaches the
@@ -3584,6 +3678,8 @@ function handleStreamMessage(msg) {
         }
         // Waiting viewers who joined before the stream started.
         (msg.viewers || []).forEach((viewerId) => createViewerPeer(viewerId));
+      } else if (streamState.role === 'guest') {
+        setStreamStatus(streamState.audioEnabled ? 'streamGuestLive' : 'streamAudioOnly');
       } else if (msg.live) {
         setStreamStatus('streamConnecting');
       } else {
@@ -3594,11 +3690,15 @@ function handleStreamMessage(msg) {
     }
     case 'viewer-joined':
       updateStreamViewerCount(msg.viewerCount || 0);
-      if (streamState.role === 'broadcaster') createViewerPeer(msg.viewerId);
+      if (streamState.role === 'broadcaster' || streamState.role === 'guest') {
+        createViewerPeer(msg.viewerId);
+      }
       break;
     case 'viewer-left':
       updateStreamViewerCount(msg.viewerCount || 0);
-      if (streamState.role === 'broadcaster') closeViewerPeer(msg.viewerId);
+      if (streamState.role === 'broadcaster' || streamState.role === 'guest') {
+        closeViewerPeer(msg.viewerId);
+      }
       break;
     case 'viewer-count':
       updateStreamViewerCount(msg.viewerCount || 0);
@@ -3607,30 +3707,79 @@ function handleStreamMessage(msg) {
       updateStreamViewerCount(msg.viewerCount || 0);
       setStreamStatus('streamConnecting');
       break;
+    case 'guest-request':
+      if (streamState.role === 'broadcaster') {
+        streamState.guestRequests.set(msg.viewerId, msg);
+        refreshStreamControls();
+      }
+      break;
+    case 'guest-requested':
+      streamState.pendingGuestRequest = true;
+      refreshStreamControls();
+      setStreamStatus('streamGuestRequestSent');
+      break;
+    case 'guest-approved':
+      streamState.role = 'guest';
+      streamState.pendingGuestRequest = false;
+      streamState.localStream = streamState.pendingGuestStream;
+      streamState.pendingGuestStream = null;
+      (msg.viewers || []).forEach((viewerId) => createViewerPeer(viewerId));
+      renderCoin(streamState.mint);
+      break;
+    case 'guest-denied':
+      if (streamState.pendingGuestStream) {
+        streamState.pendingGuestStream.getTracks().forEach((track) => track.stop());
+        streamState.pendingGuestStream = null;
+      }
+      streamState.pendingGuestRequest = false;
+      refreshStreamControls();
+      setStreamStatus('streamGuestDenied');
+      break;
+    case 'guest-joined':
+      if (streamState.role === 'broadcaster') {
+        streamState.guestRequests.delete(msg.guestId);
+        createViewerPeer(msg.guestId);
+      }
+      renderCoin(streamState.mint);
+      break;
+    case 'guest-left':
+      updateStreamViewerCount(msg.viewerCount || 0);
+      closeViewerPeer(msg.guestId);
+      closeIncomingPublisher(msg.guestId);
+      streamState.remoteStreams.delete(msg.guestId);
+      removeStreamVideo(msg.guestId);
+      refreshStreamControls();
+      break;
     case 'stream-ended': {
       streamState.ended = true;
-      if (streamState.viewerPeer) {
-        try {
-          streamState.viewerPeer.close();
-        } catch {
-          /* already closed */
-        }
-        streamState.viewerPeer = null;
+      if (streamState.pendingGuestStream) {
+        streamState.pendingGuestStream.getTracks().forEach((track) => track.stop());
+        streamState.pendingGuestStream = null;
+        streamState.pendingGuestRequest = false;
       }
-      streamState.remoteStream = null;
+      if (streamState.role === 'guest' && streamState.localStream) {
+        streamState.localStream.getTracks().forEach((track) => track.stop());
+        streamState.localStream = null;
+        streamState.role = 'viewer';
+      }
+      for (const pc of streamState.viewerPeers.values()) pc.close();
+      streamState.viewerPeers.clear();
+      for (const pc of streamState.peers.values()) pc.close();
+      streamState.peers.clear();
+      streamState.remoteStreams.clear();
+      const stage = document.getElementById('streamStage');
+      if (stage) stage.replaceChildren();
       setStreamStatus('streamEnded');
-      const video = document.getElementById('streamVideo');
-      if (video) video.srcObject = null;
       break;
     }
     case 'offer':
-      // Viewer: the broadcaster's offer — answer it.
-      if (streamState.role !== 'viewer') break;
-      answerStreamOffer(msg.sdp);
+      // Audience and approved co-hosts answer publisher offers.
+      if (streamState.role !== 'viewer' && streamState.role !== 'guest') break;
+      answerStreamOffer(msg.sdp, msg.from, msg.publisherId);
       break;
     case 'answer':
-      // Broadcaster: a viewer's answer to our offer.
-      if (streamState.role !== 'broadcaster') break;
+      // Publishers accept answers from their audience and co-hosts.
+      if (streamState.role !== 'broadcaster' && streamState.role !== 'guest') break;
       {
         const pc = streamState.peers.get(msg.from);
         if (pc && pc.signalingState !== 'closed') {
@@ -3639,10 +3788,9 @@ function handleStreamMessage(msg) {
       }
       break;
     case 'ice': {
-      const pc =
-        streamState.role === 'broadcaster'
-          ? streamState.peers.get(msg.from)
-          : streamState.viewerPeer;
+      const pc = streamState.role === 'broadcaster' || streamState.role === 'guest'
+        ? streamState.peers.get(msg.from)
+        : streamState.viewerPeers.get(msg.from);
       if (pc && msg.candidate) {
         pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(() => {});
       }
@@ -3654,9 +3802,16 @@ function handleStreamMessage(msg) {
     case 'authed':
       streamState.authed = true;
       refreshStreamChatAuth();
+      refreshStreamControls();
       toast(translate('streamChatEnabled'));
       break;
     case 'error':
+      if (streamState.pendingGuestStream) {
+        streamState.pendingGuestStream.getTracks().forEach((track) => track.stop());
+        streamState.pendingGuestStream = null;
+        streamState.pendingGuestRequest = false;
+        refreshStreamControls();
+      }
       setStreamStatus('streamError');
       toast(translate('streamErrorToast', { msg: msg.error || '' }));
       break;
@@ -3682,6 +3837,10 @@ function openStreamSocket(mint, onOpen) {
     // "stream ended" state instead of silently hanging.
     if (streamState.ws === ws && streamState.role) {
       streamState.ended = true;
+      if (streamState.pendingGuestStream) {
+        streamState.pendingGuestStream.getTracks().forEach((track) => track.stop());
+        streamState.pendingGuestStream = null;
+      }
       setStreamStatus('streamEnded');
     }
   };
@@ -3703,6 +3862,12 @@ async function createViewerPeer(viewerId) {
       streamSend({ type: 'ice', to: viewerId, candidate: e.candidate.toJSON() });
     }
   };
+  pc.ontrack = (e) => {
+    const remoteStream = e.streams[0];
+    if (!remoteStream) return;
+    streamState.remoteStreams.set(viewerId, remoteStream);
+    attachStreamVideo(viewerId, remoteStream, false);
+  };
   try {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -3722,45 +3887,112 @@ function closeViewerPeer(viewerId) {
     }
     streamState.peers.delete(viewerId);
   }
+  streamState.remoteStreams.delete(viewerId);
+  removeStreamVideo(viewerId);
 }
 
-// Viewer: answer the broadcaster's offer, then render the remote stream.
-async function answerStreamOffer(sdp) {
-  try {
-    if (streamState.viewerPeer) {
-      try {
-        streamState.viewerPeer.close();
-      } catch {
-        /* already closed */
-      }
+function closeIncomingPublisher(publisherId) {
+  const pc = streamState.viewerPeers.get(publisherId);
+  if (pc) {
+    try {
+      pc.close();
+    } catch {
+      /* already closed */
     }
+    streamState.viewerPeers.delete(publisherId);
+  }
+}
+
+function attachStreamVideo(peerId, mediaStream, muted) {
+  const stage = document.getElementById('streamStage');
+  if (!stage) return;
+  const key = String(peerId);
+  let video = stage.querySelector(`[data-stream-peer="${key}"]`);
+  if (!video) {
+    video = document.createElement('video');
+    video.dataset.streamPeer = key;
+    video.autoplay = true;
+    video.playsInline = true;
+    stage.appendChild(video);
+  }
+  video.srcObject = mediaStream;
+  video.muted = !!muted;
+  video.classList.toggle('is-mirrored', !!muted && streamState.mirrorPreview);
+  video.play().catch(() => {});
+}
+
+function removeStreamVideo(peerId) {
+  const stage = document.getElementById('streamStage');
+  const video = stage && stage.querySelector(`[data-stream-peer="${String(peerId)}"]`);
+  if (video) video.remove();
+}
+
+async function getStreamMedia() {
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  } catch (err) {
+    const message = err && typeof err.message === 'string' ? err.message : '';
+    const audioSourceUnavailable =
+      (err && ['NotReadableError', 'NotFoundError', 'OverconstrainedError'].includes(err.name)) ||
+      /audio source|microphone|audio input/i.test(message);
+    if (!audioSourceUnavailable) throw err;
+    try {
+      return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    } catch (fallbackErr) {
+      throw new Error(
+        `${friendlyError(fallbackErr)} (audio capture also failed: ${friendlyError(err)})`
+      );
+    }
+  }
+}
+
+function streamHasAudio(mediaStream) {
+  if (typeof mediaStream.getAudioTracks === 'function') {
+    return mediaStream.getAudioTracks().length > 0;
+  }
+  return mediaStream.getTracks().some((track) => track.kind === 'audio');
+}
+
+// Viewers and approved co-hosts answer publisher offers. Co-hosts include
+// their own camera/mic in the answer to the creator's peer connection.
+async function answerStreamOffer(sdp, publisherId, publisherConnId) {
+  try {
+    const peerId = publisherId || 'broadcaster';
+    closeIncomingPublisher(peerId);
     const pc = new RTCPeerConnection(STREAM_STUN);
-    streamState.viewerPeer = pc;
+    streamState.viewerPeers.set(peerId, pc);
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        streamSend({ type: 'ice', to: 'broadcaster', candidate: e.candidate.toJSON() });
+        streamSend({ type: 'ice', to: peerId, candidate: e.candidate.toJSON() });
       }
     };
     pc.ontrack = (e) => {
-      streamState.remoteStream = e.streams[0] || null;
-      const video = document.getElementById('streamVideo');
-      if (video && streamState.remoteStream) {
-        video.srcObject = streamState.remoteStream;
-        video.play().catch(() => {});
-      }
-      setStreamStatus('streamWatching');
+      const remoteStream = e.streams[0];
+      if (!remoteStream) return;
+      streamState.remoteStreams.set(peerId, remoteStream);
+      attachStreamVideo(peerId, remoteStream, false);
+      if (streamState.role === 'viewer') setStreamStatus('streamWatching');
     };
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    if (streamState.role === 'guest' && streamState.localStream) {
+      streamState.localStream.getTracks().forEach((track) => {
+        pc.addTrack(track, streamState.localStream);
+      });
+    }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    streamSend({ type: 'answer', sdp: pc.localDescription });
+    streamSend({
+      type: 'answer',
+      to: peerId === 'broadcaster' ? 'broadcaster' : (publisherConnId || peerId),
+      sdp: pc.localDescription,
+    });
   } catch {
     setStreamStatus('streamError');
   }
 }
 
-// Creator goes live: camera + mic -> signaling join (signature-proven).
-async function startStream(mint) {
+// Creator opens the camera preview before confirming the livestream.
+async function openStreamSetup(mint) {
   if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
     toast(translate('streamNoMedia'));
     return;
@@ -3769,19 +4001,72 @@ async function startStream(mint) {
     toast(translate('errConnectFirst'));
     return;
   }
-  setStreamStatus('streamStarting');
   try {
-    const localStream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-    streamState.localStream = localStream;
-    const video = document.getElementById('streamVideo');
-    if (video) {
-      video.srcObject = localStream;
-      video.muted = true;
-      video.play().catch(() => {});
+    const localStream = await getStreamMedia();
+    if (!document.getElementById('streamCard')) {
+      localStream.getTracks().forEach((t) => t.stop());
+      return;
     }
+    closeStreamSetup();
+    streamState.previewStream = localStream;
+    streamState.audioEnabled = streamHasAudio(localStream);
+    streamState.mirrorPreview = true;
+    const modal = document.createElement('div');
+    modal.id = 'streamSetupModal';
+    modal.className = 'modal-overlay stream-setup-overlay';
+    modal.innerHTML = `
+      <section class="modal stream-setup-modal" role="dialog" aria-modal="true" aria-labelledby="streamSetupTitle">
+        <button class="modal-close" id="streamSetupClose" aria-label="${translate('streamSetupCancel')}">×</button>
+        <h2 id="streamSetupTitle">${translate('streamSetupTitle')}</h2>
+        <div class="stream-video-wrap stream-setup-video-wrap">
+          <video id="streamSetupVideo" class="is-mirrored" autoplay muted playsinline></video>
+        </div>
+        <label class="stream-mirror-option"><input id="streamMirrorToggle" type="checkbox" checked> ${translate('streamMirrorCamera')}</label>
+        <p class="small muted stream-setup-status" id="streamSetupStatus">${streamState.audioEnabled ? '' : translate('streamAudioOnly')}</p>
+        <div class="stream-setup-actions">
+          <button class="btn" id="streamSetupCancel">${translate('streamSetupCancel')}</button>
+          <button class="btn btn-primary" id="streamSetupStart">${translate('streamGoLiveBtn')}</button>
+        </div>
+      </section>`;
+    document.body.appendChild(modal);
+    const video = document.getElementById('streamSetupVideo');
+    video.srcObject = localStream;
+    video.play().catch(() => {});
+    const mirrorToggle = document.getElementById('streamMirrorToggle');
+    mirrorToggle.addEventListener('change', () => {
+      streamState.mirrorPreview = mirrorToggle.checked;
+      video.classList.toggle('is-mirrored', streamState.mirrorPreview);
+    });
+    const cancel = () => {
+      if (document.getElementById('streamSetupStart')?.disabled) return;
+      closeStreamSetup();
+    };
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) cancel();
+    });
+    document.getElementById('streamSetupClose').addEventListener('click', cancel);
+    document.getElementById('streamSetupCancel').addEventListener('click', cancel);
+    streamState.setupKeydown = (event) => {
+      if (event.key === 'Escape' && !document.getElementById('streamSetupStart').disabled) cancel();
+    };
+    document.addEventListener('keydown', streamState.setupKeydown);
+    document.getElementById('streamSetupStart').addEventListener('click', (event) => {
+      event.currentTarget.disabled = true;
+      document.getElementById('streamSetupCancel').disabled = true;
+      document.getElementById('streamSetupClose').disabled = true;
+      document.getElementById('streamSetupStatus').textContent = translate('streamStarting');
+      startStream(mint);
+    });
+  } catch (err) {
+    toast(translate('streamStartFailed', { msg: friendlyError(err) }));
+  }
+}
+
+// Creator goes live: the preview stream -> signature-proven signaling join.
+async function startStream(mint) {
+  const localStream = streamState.previewStream;
+  if (!localStream) return;
+  try {
     const phantom = (await waitForPhantom(3000)) || getPhantom();
     if (!phantom) throw new Error(translate('errPhantomShort'));
     if (typeof phantom.signMessage !== 'function') {
@@ -3790,6 +4075,11 @@ async function startStream(mint) {
     const message = streamStartMessage({ wallet: state.wallet, mint });
     toast(translate('toastSignStreamStart'));
     const signature = await signWalletMessage(phantom, message);
+    if (streamState.previewStream !== localStream) return;
+    streamState.previewStream = null;
+    streamState.localStream = localStream;
+    streamState.audioEnabled = streamHasAudio(localStream);
+    closeStreamSetup(false);
     streamState.mint = mint;
     streamState.role = 'broadcaster';
     streamState.ended = false;
@@ -3805,10 +4095,11 @@ async function startStream(mint) {
     // The panel flips to the broadcaster view (stop button, live chat)
     // when the server confirms the join — see refreshStreamControls().
   } catch (err) {
-    if (streamState.localStream) {
-      streamState.localStream.getTracks().forEach((t) => t.stop());
+    if (streamState.localStream === localStream) {
+      localStream.getTracks().forEach((t) => t.stop());
       streamState.localStream = null;
     }
+    closeStreamSetup();
     setStreamStatus('streamError');
     toast(translate('streamStartFailed', { msg: friendlyError(err) }));
   }
@@ -3864,7 +4155,17 @@ function refreshStreamControls() {
   const box = document.getElementById('streamControls');
   if (!box) return;
   if (streamState.role === 'broadcaster' && !streamState.ended) {
-    box.innerHTML = `<button class="btn btn-sell" id="streamStopBtn">${translate('streamStopBtn')}</button>`;
+    const requests = [...streamState.guestRequests.entries()];
+    box.innerHTML = `
+      <button class="btn btn-sell" id="streamStopBtn">${translate('streamStopBtn')}</button>
+      ${requests.length ? `<div class="stream-guest-requests"><strong>${translate('streamGuestRequests')}</strong>
+        ${requests.map(([viewerId, request]) => `
+          <div class="stream-guest-request">
+            <span>${esc(request.profile?.username || shortAddr(request.wallet))}</span>
+            <button class="btn btn-sm btn-primary" data-guest-accept="${esc(viewerId)}">${translate('streamGuestAccept')}</button>
+            <button class="btn btn-sm" data-guest-deny="${esc(viewerId)}">${translate('streamGuestDeny')}</button>
+          </div>`).join('')}
+      </div>` : ''}`;
     const btn = document.getElementById('streamStopBtn');
     if (btn) {
       btn.addEventListener('click', () => {
@@ -3872,6 +4173,59 @@ function refreshStreamControls() {
         route();
       });
     }
+    box.querySelectorAll('[data-guest-accept]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const viewerId = button.dataset.guestAccept;
+        streamState.guestRequests.delete(viewerId);
+        streamSend({ type: 'guest-decision', viewerId, accept: true });
+        refreshStreamControls();
+      });
+    });
+    box.querySelectorAll('[data-guest-deny]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const viewerId = button.dataset.guestDeny;
+        streamState.guestRequests.delete(viewerId);
+        streamSend({ type: 'guest-decision', viewerId, accept: false });
+        refreshStreamControls();
+      });
+    });
+  } else if (streamState.role === 'viewer' && !streamState.ended) {
+    const mediaOk = navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function';
+    box.innerHTML = `
+      <button class="btn btn-primary" id="streamJoinStageBtn"
+        ${!streamState.authed || !mediaOk || streamState.pendingGuestRequest ? 'disabled' : ''}>
+        ${streamState.pendingGuestRequest ? translate('streamGuestRequestSent') : translate('streamJoinStage')}
+      </button>
+      ${!streamState.authed ? `<p class="small muted">${translate('streamGuestAuthNote')}</p>` : ''}
+      ${!mediaOk ? `<p class="small muted">${translate('streamNoMedia')}</p>` : ''}`;
+    const joinBtn = document.getElementById('streamJoinStageBtn');
+    if (joinBtn) joinBtn.addEventListener('click', requestStreamGuest);
+  } else if (streamState.role === 'guest' && !streamState.ended) {
+    box.innerHTML = `<button class="btn" id="streamLeaveStageBtn">${translate('streamLeaveStage')}</button>`;
+    const leaveBtn = document.getElementById('streamLeaveStageBtn');
+    if (leaveBtn) {
+      leaveBtn.addEventListener('click', () => {
+        stopStream();
+        route();
+      });
+    }
+  }
+}
+
+async function requestStreamGuest() {
+  if (!streamState.authed || streamState.role !== 'viewer' || streamState.pendingGuestRequest) return;
+  try {
+    const localStream = await getStreamMedia();
+    if (streamState.role !== 'viewer' || !streamState.authed || !streamState.ws) {
+      localStream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    streamState.audioEnabled = streamHasAudio(localStream);
+    if (!streamState.audioEnabled) toast(translate('streamAudioOnly'));
+    streamState.pendingGuestStream = localStream;
+    streamSend({ type: 'guest-request' });
+  } catch (err) {
+    toast(translate('streamGuestRequestFailed', { msg: friendlyError(err) }));
   }
 }
 

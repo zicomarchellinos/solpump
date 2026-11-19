@@ -2366,6 +2366,9 @@ async function main() {
       'viewer-joined to broadcaster'
     );
     assert(vJoined.viewerCount === 2, 'broadcaster gets viewer-joined with count 2');
+    viewer2.send({ type: 'guest-request' });
+    const guestAuthErr = await viewer2.waitFor((m) => m.type === 'error' && /aktifkan chat/i.test(m.error), 'unauthenticated guest request rejected');
+    assert(guestAuthErr, 'only a wallet-authenticated viewer can request to join the stage');
     // Offer/answer/ICE relay (fake SDP objects — real SDP from
     // RTCPeerConnection is an object { type, sdp }, and the server
     // requires an object; the signaling path, not WebRTC itself).
@@ -2401,6 +2404,77 @@ async function main() {
       chatMsg.wallet === chatWallet.address && chatMsg.text === 'hello stream',
       'authed chat broadcasts with the wallet + text'
     );
+    // An authenticated viewer requests to co-host; only the creator can
+    // approve, after which the guest can publish directly to the audience.
+    const guestWallet = makeTestWallet();
+    const guestAuthMsg = streamJoinMessage({ wallet: guestWallet.address, mint: mintDev });
+    viewer2.send({
+      type: 'auth',
+      wallet: guestWallet.address,
+      message: guestAuthMsg,
+      signature: guestWallet.sign(guestAuthMsg),
+    });
+    await viewer2.waitFor((m) => m.type === 'authed', 'co-host viewer authenticated');
+    viewer2.send({ type: 'guest-request' });
+    await viewer2.waitFor((m) => m.type === 'guest-requested', 'co-host request submitted');
+    const guestRequest = await bcast.waitFor((m) => m.type === 'guest-request', 'co-host request reaches creator');
+    assert(
+      guestRequest.viewerId === v2Joined.viewerId && guestRequest.wallet === guestWallet.address,
+      'creator receives the authenticated viewer identity with the co-host request'
+    );
+    bcast.send({ type: 'guest-decision', viewerId: v2Joined.viewerId, accept: true });
+    const guestApproved = await viewer2.waitFor((m) => m.type === 'guest-approved', 'creator approves co-host');
+    assert(
+      guestApproved.guestId === v2Joined.viewerId && guestApproved.viewers.includes(v1Joined.viewerId),
+      'approved co-host receives its ID and current audience peers'
+    );
+    const guestJoined = await bcast.waitFor((m) => m.type === 'guest-joined', 'creator notified of co-host');
+    assert(guestJoined.guestId === v2Joined.viewerId, 'creator receives the approved co-host event');
+    const audienceGuestJoined = await viewer1.waitFor((m) => m.type === 'guest-joined', 'audience notified of co-host');
+    assert(audienceGuestJoined.guestId === v2Joined.viewerId, 'audience receives the co-host event');
+    bcast.send({
+      type: 'offer',
+      to: v2Joined.viewerId,
+      sdp: { type: 'offer', sdp: 'creator-offer-sdp' },
+    });
+    const creatorOffer = await viewer2.waitFor((m) => m.type === 'offer' && m.from === 'broadcaster', 'creator offer reaches co-host');
+    assert(creatorOffer.publisherId && creatorOffer.sdp.sdp === 'creator-offer-sdp', 'co-host receives creator signaling identity');
+    viewer2.send({
+      type: 'answer',
+      to: 'broadcaster',
+      sdp: { type: 'answer', sdp: 'creator-answer-sdp' },
+    });
+    const creatorAnswer = await bcast.waitFor((m) => m.type === 'answer' && m.from === v2Joined.viewerId, 'co-host answer reaches creator');
+    assert(creatorAnswer.sdp.sdp === 'creator-answer-sdp', 'co-host response reaches the creator');
+    bcast.send({ type: 'ice', to: v2Joined.viewerId, candidate: 'creator-ice-to-guest' });
+    const creatorIce = await viewer2.waitFor((m) => m.type === 'ice' && m.from === 'broadcaster', 'creator ICE reaches co-host');
+    assert(creatorIce.candidate === 'creator-ice-to-guest', 'creator ICE candidates reach the co-host');
+    viewer2.send({ type: 'ice', to: 'broadcaster', candidate: 'guest-ice-to-creator' });
+    const guestCreatorIce = await bcast.waitFor((m) => m.type === 'ice' && m.from === v2Joined.viewerId, 'co-host ICE reaches creator');
+    assert(guestCreatorIce.candidate === 'guest-ice-to-creator', 'co-host ICE candidates reach the creator');
+    viewer2.send({
+      type: 'offer',
+      to: v1Joined.viewerId,
+      sdp: { type: 'offer', sdp: 'guest-offer-sdp' },
+    });
+    const guestOffer = await viewer1.waitFor((m) => m.type === 'offer' && m.from === v2Joined.viewerId, 'co-host offer relayed to audience');
+    assert(guestOffer.sdp.sdp === 'guest-offer-sdp', 'co-host media signaling reaches the audience');
+    viewer1.send({
+      type: 'answer',
+      to: v2Joined.viewerId,
+      sdp: { type: 'answer', sdp: 'guest-answer-sdp' },
+    });
+    const guestAnswer = await viewer2.waitFor((m) => m.type === 'answer', 'audience answer relayed to co-host');
+    assert(
+      guestAnswer.from === v1Joined.viewerId && guestAnswer.sdp.sdp === 'guest-answer-sdp',
+      'audience response reaches the correct co-host connection'
+    );
+    viewer2.send({ type: 'ice', to: v1Joined.viewerId, candidate: 'guest-ice-to-viewer' });
+    const guestIce = await viewer1.waitFor((m) => m.type === 'ice' && m.from === v2Joined.viewerId, 'co-host ICE relayed to audience');
+    assert(guestIce.candidate === 'guest-ice-to-viewer', 'co-host ICE candidates reach the audience');
+    viewer1.send({ type: 'ice', to: v2Joined.viewerId, candidate: 'viewer-ice-to-guest' });
+    const viewerIce = await viewer2.waitFor((m) => m.type === 'ice' && m.from === v1Joined.viewerId, 'audience ICE relayed to co-host');
+    assert(viewerIce.candidate === 'viewer-ice-to-guest', 'audience ICE candidates reach the co-host');
     // The live stream shows on the streams endpoint + coin detail.
     const streams = await get('/api/streams');
     assert(
