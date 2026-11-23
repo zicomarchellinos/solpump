@@ -1,62 +1,105 @@
 <!DOCTYPE html>
-<html lang="id">
+<html lang="id" data-theme="light">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>solpump — Buat Coin di Solana Devnet</title>
   <meta name="description" content="Buat coin kripto ala pump.fun di Solana devnet. Minting SPL asli lewat Phantom, trading devnet asli lewat dompet pool dengan pelacakan untung-rugi.">
+  <meta name="theme-color" content="#00c805" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#86efac" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2386efac'/%3E%3Ctext x='16' y='22' font-family='Arial' font-size='18' font-weight='bold' text-anchor='middle' fill='%23052e16'%3ES%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
+  <!-- Preload fonts -->
+  <link rel="preload" href="/fonts/Geist-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/Geist-Medium.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/Geist-Bold.woff2" as="font" type="font/woff2" crossorigin>
 </head>
 <body>
-  <!-- App shell ala pump.fun: sidebar kiri (desktop) + kolom utama dengan
-       header atas. Di layar kecil, sidebar jadi drawer overlay yang dibuka
-       dengan tombol di header. -->
+  <!-- Skip to main content for accessibility -->
+  <a href="#main-content" class="skip-link" data-i18n="skipToContent">Skip to main content</a>
+
+  <!-- App shell: sidebar (desktop rail) + main column with header -->
   <div class="app-shell" id="appShell">
-    <aside class="sidebar" id="sidebar">
-      <a class="brand" href="#/"><span class="brand-mark">S</span><span class="brand-text">sol<span>pump</span></span></a>
-      <nav class="nav">
-        <a href="#/" data-nav="feed"><span class="nav-ic">⌂</span><span class="nav-label" data-i18n="navHome">Beranda</span></a>
-        <a href="#/create" data-nav="create"><span class="nav-ic">+</span><span class="nav-label" data-i18n="navCreate">Buat Coin</span></a>
-        <a href="#/portfolio" data-nav="portfolio"><span class="nav-ic">◈</span><span class="nav-label" data-i18n="navPortfolio">Portofolio Saya</span></a>
+    <aside class="sidebar" id="sidebar" role="navigation" aria-label="Main navigation">
+      <a class="brand" href="#/" aria-label="solpump Home">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <span class="brand-text">sol<span>pump</span></span>
+      </a>
+      <nav class="nav" role="menubar">
+        <a href="#/" data-nav="feed" role="menuitem" aria-label="Home">
+          <span class="nav-ic" aria-hidden="true">⌂</span>
+          <span class="nav-label" data-i18n="navHome">Beranda</span>
+        </a>
+        <a href="#/create" data-nav="create" role="menuitem" aria-label="Create Coin">
+          <span class="nav-ic" aria-hidden="true">+</span>
+          <span class="nav-label" data-i18n="navCreate">Buat Coin</span>
+        </a>
+        <a href="#/portfolio" data-nav="portfolio" role="menuitem" aria-label="My Portfolio">
+          <span class="nav-ic" aria-hidden="true">◈</span>
+          <span class="nav-label" data-i18n="navPortfolio">Portofolio Saya</span>
+        </a>
       </nav>
       <div class="sidebar-foot">
-        <span class="net-pill">DEVNET</span>
+        <span class="net-pill" aria-label="Devnet">DEVNET</span>
         <p class="small muted" data-i18n="sidebarDevnetNote">Solana Devnet — token testnet, tanpa nilai uang.</p>
         <p class="small"><a href="https://faucet.solana.com" target="_blank" rel="noopener" data-i18n="sidebarFaucet">Ambil SOL devnet gratis ↗</a></p>
       </div>
     </aside>
-    <div class="sidebar-scrim" id="sidebarScrim" hidden></div>
+
+    <!-- Mobile drawer scrim -->
+    <div class="sidebar-scrim" id="sidebarScrim" hidden aria-hidden="true"></div>
 
     <div class="main-col">
-      <header class="topbar">
-        <button class="btn btn-sm sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">«</button>
-        <a class="brand topbar-brand" href="#/"><span class="brand-mark">S</span><span class="brand-text">sol<span>pump</span></span></a>
+      <header class="topbar" role="banner">
+        <button class="btn btn-sm sidebar-toggle" id="sidebarToggle" aria-label="Toggle menu" aria-expanded="false" aria-controls="sidebar">
+          <span aria-hidden="true">☰</span>
+          <span class="sr-only" data-i18n="sidebarOpenMenu">Open menu</span>
+        </button>
+        <a class="brand topbar-brand" href="#/" aria-label="solpump Home">
+          <span class="brand-mark" aria-hidden="true">S</span>
+          <span class="brand-text">sol<span>pump</span></span>
+        </a>
         <div class="topbar-spacer"></div>
-        <div class="lang-switcher" id="langBox" role="group" aria-label="Language"></div>
+
+        <!-- Language switcher -->
+        <div class="lang-switcher" id="langBox" role="group" aria-label="Language selection">
+          <!-- Populated by JS -->
+        </div>
+
+        <!-- Theme toggle -->
+        <button class="btn btn-ghost btn-icon tooltip" id="themeToggle" data-tooltip="" aria-label="Toggle theme" aria-pressed="false">
+          <span class="theme-icon-light" aria-hidden="true">☀</span>
+          <span class="theme-icon-dark" aria-hidden="true">🌙</span>
+        </button>
+
+        <!-- Wallet connection -->
         <div class="wallet-box" id="walletBox">
-          <button class="btn btn-primary" id="connectBtn">Hubungkan Phantom</button>
+          <button class="btn btn-primary" id="connectBtn" data-i18n="headerConnect">Hubungkan Phantom</button>
         </div>
       </header>
 
-      <div class="infobar">
-        <span class="net-pill">DEVNET</span>
+      <div class="infobar" role="status" aria-live="polite">
+        <span class="net-pill" aria-label="Devnet">DEVNET</span>
         <span class="muted small" data-i18n="infobarText">Trading asli di devnet — SOL dan token beneran berpindah on-chain.</span>
       </div>
 
-      <main class="container" id="view">
+      <main id="view" class="container" role="main" id="main-content">
         <p class="muted" data-i18n="loadingGeneric">Memuat…</p>
       </main>
 
-      <footer class="footer">
+      <footer class="footer" role="contentinfo">
         <p data-i18n-html="footerAbout"><strong>solpump</strong> berjalan di <a href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Solana Devnet</a> — token yang di-mint adalah token SPL asli di devnet (tanpa nilai uang sungguhan). Trading memakai SOL devnet asli yang berpindah on-chain lewat <strong>dompet pool kustodian</strong> di <span id="poolAddress">…</span> — server yang memegang kunci pool dan menyelesaikan sisi kedua setiap trade. Devnet hanya untuk percobaan; token di sini tidak punya nilai uang.</p>
         <p class="muted" data-i18n-html="footerFaucet">Butuh SOL devnet? Ambil gratis di <a href="https://faucet.solana.com" target="_blank" rel="noopener">faucet.solana.com</a>.</p>
       </footer>
     </div>
   </div>
 
-  <div class="toast" id="toast" hidden></div>
+  <!-- Toast container (managed by JS) -->
+  <div class="toast-container" id="toastContainer" aria-live="polite" aria-atomic="true"></div>
 
+  <!-- Modal overlay (created dynamically by JS) -->
+
+  <!-- Scripts -->
   <!-- Solana libraries: one bundle built by build.js (see README). -->
   <script src="/vendor-solana.js"></script>
   <!-- QR code generator (qrcode-generator, MIT) vendored locally — no CDN. -->

@@ -16,6 +16,76 @@
 
 const EXPLORER = 'https://explorer.solana.com';
 
+// ---------- Theme Management ----------
+const THEME_KEY = 'solpump-theme';
+const THEME_MEDIA_QUERY = '(prefers-color-scheme: dark)';
+
+function getStoredTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function getSystemTheme() {
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia(THEME_MEDIA_QUERY).matches ? 'dark' : 'light';
+  }
+  return 'light';
+}
+
+function getEffectiveTheme() {
+  const stored = getStoredTheme();
+  if (stored === 'light' || stored === 'dark') return stored;
+  return getSystemTheme();
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const toggle = document.getElementById('themeToggle');
+  if (toggle) {
+    toggle.setAttribute('aria-pressed', theme === 'dark');
+    toggle.setAttribute('data-tooltip', translate(theme === 'dark' ? 'themeLight' : 'themeDark'));
+  }
+  // Update meta theme-color
+  const metaTheme = document.querySelector('meta[name="theme-color"]');
+  if (metaTheme) {
+    metaTheme.setAttribute('content', theme === 'dark' ? '#86efac' : '#00c805');
+  }
+}
+
+function initTheme() {
+  const theme = getEffectiveTheme();
+  applyTheme(theme);
+
+  // Listen for system theme changes
+  if (typeof window.matchMedia === 'function') {
+    const mq = window.matchMedia(THEME_MEDIA_QUERY);
+    mq.addEventListener?.('change', (e) => {
+      const stored = getStoredTheme();
+      if (!stored) {
+        applyTheme(e.matches ? 'dark' : 'light');
+      }
+    });
+  }
+
+  // Theme toggle button
+  const toggle = document.getElementById('themeToggle');
+  if (toggle) {
+    toggle.addEventListener('click', () => {
+      const current = getStoredTheme() || getSystemTheme();
+      const next = current === 'dark' ? 'light' : 'dark';
+      try {
+        localStorage.setItem(THEME_KEY, next);
+      } catch {
+        /* storage unavailable */
+      }
+      applyTheme(next);
+    });
+  }
+}
+
 // ---------- State ----------
 // Coin-detail render sequence: renderCoin is async, and a second render
 // (fast navigation, a double hashchange) can start while the first is
@@ -39,6 +109,9 @@ const state = {
   feedFollowingOnly: false, // feed filter: only coins by followed creators
   isAdmin: false, // is the connected wallet in ADMIN_WALLETS? (server check)
   adminCheckedWallet: null, // wallet the cached isAdmin applies to
+  // UI state
+  sidebarOpen: false,
+  onboardingShown: false,
 };
 
 // A mint that succeeded on-chain but whose registration failed: kept so the
@@ -235,13 +308,65 @@ function fmtAgo(ts) {
   return fmtDate(ts);
 }
 
-function toast(msg) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.hidden = false;
-  setTimeout(() => {
-    el.hidden = true;
-  }, 3500);
+// ---------- Toast System (new) ----------
+let toastId = 0;
+const toastContainer = document.getElementById('toastContainer');
+
+function toast(msg, type = 'info', duration = 3500) {
+  if (!toastContainer) return;
+
+  const id = ++toastId;
+  const toastEl = document.createElement('div');
+  toastEl.className = `toast toast-${type}`;
+  toastEl.setAttribute('role', 'alert');
+  toastEl.setAttribute('aria-live', 'polite');
+  toastEl.dataset.toastId = id;
+
+  // Icon based on type
+  const icons = {
+    success: '✓',
+    danger: '✕',
+    warning: '⚠',
+    info: 'ℹ'
+  };
+
+  toastEl.innerHTML = `
+    <span class="toast-icon" aria-hidden="true">${icons[type] || icons.info}</span>
+    <span class="toast-message">${esc(msg)}</span>
+    <button class="toast-dismiss" aria-label="${translate('toastDismiss')}" aria-hidden="true">✕</button>
+  `;
+
+  toastContainer.appendChild(toastEl);
+
+  // Trigger animation
+  requestAnimationFrame(() => {
+    toastEl.classList.add('show');
+  });
+
+  // Dismiss button
+  toastEl.querySelector('.toast-dismiss').addEventListener('click', () => {
+    dismissToast(toastEl);
+  });
+
+  // Auto dismiss
+  if (duration > 0) {
+    setTimeout(() => dismissToast(toastEl), duration);
+  }
+
+  return id;
+}
+
+function dismissToast(toastEl) {
+  if (!toastEl || toastEl.classList.contains('hiding')) return;
+  toastEl.classList.add('hiding');
+  toastEl.addEventListener('animationend', () => {
+    toastEl.remove();
+  }, { once: true });
+}
+
+function dismissAllToasts() {
+  if (!toastContainer) return;
+  toastContainer.querySelectorAll('.toast').forEach(dismissToast);
 }
 
 // Server errors come back in Indonesian; translateError() maps the common
@@ -434,8 +559,12 @@ function applySidebarState() {
   if (!shell || !toggle) return;
   const mobile = isMobileSidebar();
   const drawerOpen = shell.classList.contains('sidebar-open');
+  state.sidebarOpen = drawerOpen;
   shell.classList.toggle('sidebar-collapsed', !mobile && isSidebarCollapsed());
-  if (scrim) scrim.hidden = !mobile || !drawerOpen;
+  if (scrim) {
+    scrim.hidden = !mobile || !drawerOpen;
+    scrim.setAttribute('aria-hidden', !drawerOpen);
+  }
   // Icon + tooltip follow the mode: chevrons collapse/expand on desktop,
   // hamburger/X open/close the drawer on mobile.
   let icon;
@@ -443,14 +572,17 @@ function applySidebarState() {
   if (mobile) {
     icon = drawerOpen ? '✕' : '☰';
     labelKey = drawerOpen ? 'sidebarCloseMenu' : 'sidebarOpenMenu';
+    toggle.setAttribute('aria-expanded', drawerOpen);
   } else if (isSidebarCollapsed()) {
     icon = '»';
     labelKey = 'sidebarExpand';
+    toggle.setAttribute('aria-expanded', 'false');
   } else {
     icon = '«';
     labelKey = 'sidebarCollapse';
+    toggle.setAttribute('aria-expanded', 'true');
   }
-  toggle.textContent = icon;
+  toggle.innerHTML = `<span aria-hidden="true">${icon}</span><span class="sr-only">${translate(labelKey)}</span>`;
   toggle.title = translate(labelKey);
   toggle.setAttribute('aria-label', translate(labelKey));
 }
@@ -476,6 +608,9 @@ function closeSidebarDrawer() {
   if (!shell || !shell.classList.contains('sidebar-open')) return;
   shell.classList.remove('sidebar-open');
   applySidebarState();
+  // Return focus to toggle button
+  const toggle = document.getElementById('sidebarToggle');
+  if (toggle) toggle.focus();
 }
 
 function wireSidebar() {
@@ -490,6 +625,521 @@ function wireSidebar() {
   // Keep the toggle icon in sync when the viewport crosses the breakpoint.
   window.addEventListener('resize', applySidebarState);
   applySidebarState();
+
+  // Keyboard support: Escape closes drawer on mobile
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isMobileSidebar() && state.sidebarOpen) {
+      closeSidebarDrawer();
+    }
+  });
+
+  // Touch swipe support for mobile drawer
+  let touchStartX = 0;
+  let touchStartY = 0;
+  const shell = document.getElementById('appShell');
+
+  document.addEventListener('touchstart', (e) => {
+    if (!isMobileSidebar()) return;
+    touchStartX = e.touches[0].clientX;
+    touchStartY = e.touches[0].clientY;
+  }, { passive: true });
+
+  document.addEventListener('touchend', (e) => {
+    if (!isMobileSidebar() || !state.sidebarOpen) return;
+    const touchEndX = e.changedTouches[0].clientX;
+    const touchEndY = e.changedTouches[0].clientY;
+    const deltaX = touchEndX - touchStartX;
+    const deltaY = touchEndY - touchStartY;
+
+    // Swipe right to open (from left edge), swipe left to close
+    if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 50) {
+      if (deltaX < -50 && touchStartX < 100) {
+        // Swipe left from near left edge - close drawer
+        closeSidebarDrawer();
+      }
+    }
+  }, { passive: true });
+
+  // Pull-to-refresh for feed on mobile
+  let pullStartY = 0;
+  let pullCurrentY = 0;
+  let isPulling = false;
+  const pullThreshold = 80;
+  const pullIndicator = document.createElement('div');
+  pullIndicator.className = 'pull-to-refresh-indicator';
+  pullIndicator.innerHTML = `
+    <div class="pull-icon" aria-hidden="true">↓</div>
+    <span class="pull-text">${translate('pullToRefresh')}</span>
+  `;
+  pullIndicator.style.cssText = `
+    position: fixed;
+    top: -60px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 20px;
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-full);
+    box-shadow: var(--shadow-md);
+    z-index: var(--z-toast);
+    opacity: 0;
+    transition: top 0.2s ease, opacity 0.2s ease;
+    pointer-events: none;
+    font-size: var(--text-sm);
+    color: var(--color-text-tertiary);
+  `;
+  document.body.appendChild(pullIndicator);
+
+  document.addEventListener('touchstart', (e) => {
+    if (!isMobileSidebar()) return;
+    const scrollTop = window.scrollY || document.documentElement.scrollTop;
+    if (scrollTop === 0 && location.hash === '#/' || location.hash === '') {
+      pullStartY = e.touches[0].clientY;
+      isPulling = true;
+    }
+  }, { passive: true });
+
+  document.addEventListener('touchmove', (e) => {
+    if (!isPulling) return;
+    pullCurrentY = e.touches[0].clientY;
+    const deltaY = pullCurrentY - pullStartY;
+    if (deltaY > 0) {
+      e.preventDefault();
+      const progress = Math.min(deltaY / pullThreshold, 1);
+      pullIndicator.style.top = `${-60 + deltaY * 0.5}px`;
+      pullIndicator.style.opacity = progress;
+      pullIndicator.querySelector('.pull-icon').style.transform = `rotate(${progress * 180}deg)`;
+      if (progress === 1) {
+        pullIndicator.querySelector('.pull-text').textContent = translate('releaseToRefresh');
+      }
+    }
+  }, { passive: false });
+
+  document.addEventListener('touchend', () => {
+    if (!isPulling) return;
+    isPulling = false;
+    const deltaY = pullCurrentY - pullStartY;
+    if (deltaY >= pullThreshold) {
+      pullIndicator.querySelector('.pull-text').textContent = translate('refreshing');
+      pullIndicator.querySelector('.pull-icon').style.animation = 'spin 1s linear infinite';
+      // Trigger feed reload
+      loadCoins().finally(() => {
+        pullIndicator.style.top = '-60px';
+        pullIndicator.style.opacity = '0';
+        pullIndicator.querySelector('.pull-icon').style.animation = '';
+        pullIndicator.querySelector('.pull-text').textContent = translate('pullToRefresh');
+      });
+    } else {
+      pullIndicator.style.top = '-60px';
+      pullIndicator.style.opacity = '0';
+    }
+  }, { passive: true });
+}
+
+// ---------- Keyboard Shortcuts & Command Palette ----------
+const KEYBOARD_SHORTCUTS = [
+  { keys: ['/'], action: 'focusSearch', description: 'focusSearchDesc' },
+  { keys: ['k', 'meta'], action: 'openCommandPalette', description: 'commandPaletteDesc' },
+  { keys: ['?', 'shift'], action: 'showShortcutsHelp', description: 'shortcutsHelpDesc' },
+  { keys: ['t', 'meta'], action: 'toggleTheme', description: 'toggleThemeDesc' },
+  { keys: ['m', 'meta'], action: 'toggleSidebar', description: 'toggleSidebarDesc' },
+  { keys: ['Escape'], action: 'closeModals', description: 'closeModalsDesc' },
+  { keys: ['1', 'meta'], action: 'navFeed', description: 'navFeedDesc' },
+  { keys: ['2', 'meta'], action: 'navCreate', description: 'navCreateDesc' },
+  { keys: ['3', 'meta'], action: 'navPortfolio', description: 'navPortfolioDesc' },
+];
+
+let commandPaletteOpen = false;
+let shortcutsHelpOpen = false;
+
+function initKeyboardShortcuts() {
+  document.addEventListener('keydown', handleGlobalKeydown);
+}
+
+function handleGlobalKeydown(e) {
+  // Don't trigger shortcuts when typing in inputs
+  const active = document.activeElement;
+  const isInput = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT' || active.isContentEditable);
+  if (isInput && e.key !== 'Escape') return;
+
+  // Escape closes modals, dropdowns, drawers
+  if (e.key === 'Escape') {
+    closeAllOverlays();
+    return;
+  }
+
+  // Check shortcuts
+  for (const shortcut of KEYBOARD_SHORTCUTS) {
+    const [key, modifier] = shortcut.keys;
+    const matchesKey = e.key.toLowerCase() === key.toLowerCase();
+    const matchesModifier = !modifier || (modifier === 'meta' && (e.metaKey || e.ctrlKey)) || (modifier === 'shift' && e.shiftKey);
+
+    if (matchesKey && matchesModifier) {
+      e.preventDefault();
+      executeShortcut(shortcut.action);
+      return;
+    }
+  }
+}
+
+function executeShortcut(action) {
+  switch (action) {
+    case 'focusSearch':
+      const searchInput = document.getElementById('searchInput');
+      if (searchInput) searchInput.focus();
+      break;
+    case 'openCommandPalette':
+      toggleCommandPalette();
+      break;
+    case 'showShortcutsHelp':
+      toggleShortcutsHelp();
+      break;
+    case 'toggleTheme':
+      toggleTheme();
+      break;
+    case 'toggleSidebar':
+      toggleSidebar();
+      break;
+    case 'closeModals':
+      closeAllOverlays();
+      break;
+    case 'navFeed':
+      location.hash = '#/';
+      break;
+    case 'navCreate':
+      location.hash = '#/create';
+      break;
+    case 'navPortfolio':
+      location.hash = '#/portfolio';
+      break;
+  }
+}
+
+function closeAllOverlays() {
+  // Close mobile sidebar
+  if (state.sidebarOpen) closeSidebarDrawer();
+
+  // Close modals
+  const modalOverlay = document.getElementById('modalOverlay');
+  if (modalOverlay && !modalOverlay.hidden) hideModal();
+
+  // Close command palette
+  if (commandPaletteOpen) toggleCommandPalette();
+
+  // Close shortcuts help
+  if (shortcutsHelpOpen) toggleShortcutsHelp();
+
+  // Close dropdowns
+  document.querySelectorAll('.dropdown.open').forEach(d => d.classList.remove('open'));
+}
+
+function toggleCommandPalette() {
+  if (commandPaletteOpen) {
+    hideCommandPalette();
+  } else {
+    showCommandPalette();
+  }
+}
+
+function showCommandPalette() {
+  if (commandPaletteOpen) return;
+  commandPaletteOpen = true;
+
+  const commands = [
+    { keys: ['⌘', 'K'], label: translate('cmdSearch'), action: 'focusSearch' },
+    { keys: ['⌘', '1'], label: translate('cmdFeed'), action: 'navFeed' },
+    { keys: ['⌘', '2'], label: translate('cmdCreate'), action: 'navCreate' },
+    { keys: ['⌘', '3'], label: translate('cmdPortfolio'), action: 'navPortfolio' },
+    { keys: ['⌘', 'T'], label: translate('cmdToggleTheme'), action: 'toggleTheme' },
+    { keys: ['⌘', 'M'], label: translate('cmdToggleSidebar'), action: 'toggleSidebar' },
+    { keys: ['⌘', '/'], label: translate('cmdShortcuts'), action: 'showShortcutsHelp' },
+    { keys: ['Esc'], label: translate('cmdClose'), action: 'closeModals' },
+  ];
+
+  const isMac = navigator.platform.includes('Mac');
+  const mod = isMac ? '⌘' : 'Ctrl';
+
+  const html = `
+    <div class="command-palette" role="dialog" aria-modal="true" aria-label="${translate('commandPaletteTitle')}">
+      <div class="command-palette-input-wrapper">
+        <span class="command-palette-icon" aria-hidden="true">⌘</span>
+        <input type="text" id="commandPaletteInput" placeholder="${translate('commandPalettePlaceholder')}" autocomplete="off" spellcheck="false">
+        <span class="command-palette-hint">${translate('commandPaletteHint')}</span>
+      </div>
+      <div class="command-palette-list" role="listbox">
+        ${commands.map(cmd => `
+          <button class="command-palette-item" data-action="${cmd.action}" role="option">
+            <span class="command-palette-label">${esc(cmd.label)}</span>
+            <span class="command-palette-keys">${cmd.keys.map(k => k === '⌘' ? mod : k).join(' + ')}</span>
+          </button>
+        `).join('')}
+      </div>
+    </div>
+  `;
+
+  showModal(html);
+
+  const input = document.getElementById('commandPaletteInput');
+  const items = document.querySelectorAll('.command-palette-item');
+  let selectedIndex = 0;
+
+  function updateSelection() {
+    items.forEach((item, i) => {
+      item.classList.toggle('selected', i === selectedIndex);
+      if (i === selectedIndex) item.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  input.addEventListener('input', () => {
+    const query = input.value.toLowerCase();
+    items.forEach(item => {
+      const label = item.querySelector('.command-palette-label').textContent.toLowerCase();
+      const keys = item.querySelector('.command-palette-keys').textContent.toLowerCase();
+      item.style.display = label.includes(query) || keys.includes(query) ? '' : 'none';
+    });
+    selectedIndex = 0;
+    updateSelection();
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      selectedIndex = Math.min(selectedIndex + 1, items.length - 1);
+      updateSelection();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      selectedIndex = Math.max(selectedIndex - 1, 0);
+      updateSelection();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const visibleItems = Array.from(items).filter(i => i.style.display !== 'none');
+      if (visibleItems[selectedIndex]) {
+        executeShortcut(visibleItems[selectedIndex].dataset.action);
+        hideCommandPalette();
+      }
+    } else if (e.key === 'Escape') {
+      hideCommandPalette();
+    }
+  });
+
+  items.forEach((item, i) => {
+    item.addEventListener('click', () => {
+      executeShortcut(item.dataset.action);
+      hideCommandPalette();
+    });
+    item.addEventListener('mouseenter', () => {
+      selectedIndex = i;
+      updateSelection();
+    });
+  });
+
+  input.focus();
+  updateSelection();
+}
+
+function hideCommandPalette() {
+  if (!commandPaletteOpen) return;
+  commandPaletteOpen = false;
+  hideModal();
+}
+
+function toggleShortcutsHelp() {
+  if (shortcutsHelpOpen) {
+    hideShortcutsHelp();
+  } else {
+    showShortcutsHelp();
+  }
+}
+
+function showShortcutsHelp() {
+  if (shortcutsHelpOpen) return;
+  shortcutsHelpOpen = true;
+
+  const isMac = navigator.platform.includes('Mac');
+  const mod = isMac ? '⌘' : 'Ctrl';
+
+  const shortcuts = [
+    { keys: [mod, 'K'], desc: translate('shortcutCommandPalette') },
+    { keys: ['/'], desc: translate('shortcutFocusSearch') },
+    { keys: [mod, '1'], desc: translate('shortcutFeed') },
+    { keys: [mod, '2'], desc: translate('shortcutCreate') },
+    { keys: [mod, '3'], desc: translate('shortcutPortfolio') },
+    { keys: [mod, 'T'], desc: translate('shortcutToggleTheme') },
+    { keys: [mod, 'M'], desc: translate('shortcutToggleSidebar') },
+    { keys: ['Esc'], desc: translate('shortcutCloseModals') },
+    { keys: ['?'], desc: translate('shortcutShowHelp') },
+  ];
+
+  const html = `
+    <div class="shortcuts-help">
+      <h3 style="margin-top:0;margin-bottom:16px">${translate('shortcutsTitle')}</h3>
+      <div class="shortcuts-list">
+        ${shortcuts.map(s => `
+          <div class="shortcut-item">
+            <kbd class="shortcut-keys">${s.keys.map(k => `<span>${k}</span>`).join('<span>+</span>')}</kbd>
+            <span class="shortcut-desc">${s.desc}</span>
+          </div>
+        `).join('')}
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:24px">
+        <button class="btn btn-primary" id="shortcutsCloseBtn">${translate('closeBtn')}</button>
+      </div>
+    </div>
+  `;
+
+  showModal(html);
+  document.getElementById('shortcutsCloseBtn').addEventListener('click', hideShortcutsHelp);
+
+  // Focus trap
+  const modal = document.querySelector('.modal');
+  if (modal) trapFocus(modal);
+}
+
+function hideShortcutsHelp() {
+  if (!shortcutsHelpOpen) return;
+  shortcutsHelpOpen = false;
+  hideModal();
+}
+
+function toggleTheme() {
+  const current = getStoredTheme() || getSystemTheme();
+  const next = current === 'dark' ? 'light' : 'dark';
+  try {
+    localStorage.setItem(THEME_KEY, next);
+  } catch {
+    /* storage unavailable */
+  }
+  applyTheme(next);
+  toast(translate(next === 'dark' ? 'toastThemeDark' : 'toastThemeLight'));
+}
+
+// Focus trap utility for modals
+let lastFocusedElement = null;
+function trapFocus(element) {
+  lastFocusedElement = document.activeElement;
+  const focusableElements = element.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  const firstElement = focusableElements[0];
+  const lastElement = focusableElements[focusableElements.length - 1];
+
+  element.addEventListener('keydown', function trap(e) {
+    if (e.key !== 'Tab') return;
+    if (e.shiftKey) {
+      if (document.activeElement === firstElement) {
+        e.preventDefault();
+        lastElement.focus();
+      }
+    } else {
+      if (document.activeElement === lastElement) {
+        e.preventDefault();
+        firstElement.focus();
+      }
+    }
+  });
+
+  firstElement?.focus();
+}
+
+function releaseFocus() {
+  lastFocusedElement?.focus();
+  lastFocusedElement = null;
+}
+
+// Override hideModal to release focus
+const originalHideModal = hideModal;
+function hideModal() {
+  releaseFocus();
+  originalHideModal();
+}
+
+// ---------- Onboarding ----------
+const ONBOARDING_KEY = 'solpump-onboarding-complete';
+const ONBOARDING_STEPS = [
+  { key: 'welcome', titleKey: 'onboardingWelcomeTitle', bodyKey: 'onboardingWelcomeBody', illustration: '🚀' },
+  { key: 'wallet', titleKey: 'onboardingWalletTitle', bodyKey: 'onboardingWalletBody', illustration: '👛' },
+  { key: 'create', titleKey: 'onboardingCreateTitle', bodyKey: 'onboardingCreateBody', illustration: '✨' },
+  { key: 'trade', titleKey: 'onboardingTradeTitle', bodyKey: 'onboardingTradeBody', illustration: '📈' },
+  { key: 'devnet', titleKey: 'onboardingDevnetTitle', bodyKey: 'onboardingDevnetBody', illustration: '🧪' },
+];
+
+function isOnboardingComplete() {
+  try {
+    return localStorage.getItem(ONBOARDING_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function showOnboarding() {
+  if (isOnboardingComplete()) return;
+  state.onboardingShown = true;
+
+  let currentStep = 0;
+
+  function renderStep() {
+    const step = ONBOARDING_STEPS[currentStep];
+    const isLast = currentStep === ONBOARDING_STEPS.length - 1;
+
+    showModal(`
+      <div class="onboarding-modal" style="text-align:center;max-width:480px">
+        <div class="onboarding-illustration" style="font-size:4rem;margin-bottom:24px">${step.illustration}</div>
+        <h2 style="margin:0 0 12px">${translate(step.titleKey)}</h2>
+        <p style="color:var(--color-text-tertiary);margin-bottom:32px">${translate(step.bodyKey)}</p>
+        <div class="onboarding-progress" style="display:flex;gap:4px;justify-content:center;margin-bottom:24px">
+          ${ONBOARDING_STEPS.map((_, i) => `
+            <div class="onboarding-dot" style="width:8px;height:8px;border-radius:50%;background:${i <= currentStep ? 'var(--color-brand-primary)' : 'var(--color-border-default)'};transition:all 0.2s"></div>
+          `).join('')}
+        </div>
+        <div class="row" style="justify-content:center">
+          ${currentStep > 0 ? `<button class="btn btn-ghost" id="onboardingPrev">${translate('onboardingPrev')}</button>` : ''}
+          <button class="btn btn-primary" id="onboardingNext">${translate(isLast ? 'onboardingFinish' : 'onboardingNext')}</button>
+          ${currentStep === 0 ? `<button class="btn btn-ghost" id="onboardingSkip">${translate('onboardingSkip')}</button>` : ''}
+        </div>
+      </div>
+    `);
+
+    if (currentStep > 0) {
+      document.getElementById('onboardingPrev').addEventListener('click', () => {
+        currentStep--;
+        renderStep();
+      });
+    }
+    document.getElementById('onboardingNext').addEventListener('click', () => {
+      if (isLast) {
+        completeOnboarding();
+      } else {
+        currentStep++;
+        renderStep();
+      }
+    });
+    if (currentStep === 0) {
+      document.getElementById('onboardingSkip').addEventListener('click', completeOnboarding);
+    }
+  }
+
+  function completeOnboarding() {
+    try {
+      localStorage.setItem(ONBOARDING_KEY, 'true');
+    } catch {
+      /* storage unavailable */
+    }
+    state.onboardingShown = false;
+    hideModal();
+  }
+
+  renderStep();
+}
+
+// Initialize onboarding check
+function initOnboarding() {
+  // Show onboarding after a short delay on first visit
+  if (!isOnboardingComplete() && !state.onboardingShown) {
+    setTimeout(showOnboarding, 1000);
+  }
 }
 
 // Canonical follow message — must match src/signverify.js on the server.
@@ -976,6 +1626,7 @@ function renderLangSwitcher() {
       if (getLang() === b.dataset.lang) return;
       setLang(b.dataset.lang);
       fillPoolAddress();
+      applyTheme(getEffectiveTheme()); // Update theme toggle tooltip
       renderHeader();
       route();
     });
@@ -1153,6 +1804,21 @@ async function renderFeed() {
   async function loadCoins() {
     const list = document.getElementById('coinList');
     if (!list) return;
+    // Show skeleton loaders immediately
+    list.innerHTML = `
+      <div class="coin-grid">
+        ${Array(6).fill(0).map(() => `
+          <div class="card skeleton-card">
+            <div class="skeleton skeleton-avatar"></div>
+            <div style="margin-top:12px">
+              <div class="skeleton skeleton-title" style="width:60%"></div>
+              <div class="skeleton skeleton-text" style="width:80%;margin-top:8px"></div>
+              <div class="skeleton skeleton-text" style="width:40%;margin-top:8px"></div>
+            </div>
+            <div class="skeleton skeleton-text" style="width:100%;height:8px;margin-top:16px;border-radius:4px"></div>
+          </div>
+        `).join('')}
+      </div>`;
     // When the Following filter is active, show callouts from followed
     // traders above the coin list.
     const calloutsBox = document.getElementById('followingCallouts');
@@ -5637,6 +6303,9 @@ function fillPoolAddress() {
 loadPoolAddress().then(fillPoolAddress);
 wirePhantom();
 wireSidebar();
+initKeyboardShortcuts();
+initTheme();
+initOnboarding();
 window.addEventListener('load', wirePhantom);
 
 renderHeader();

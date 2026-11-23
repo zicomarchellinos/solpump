@@ -759,6 +759,62 @@ const STRINGS = {
     toastSignAdmin: 'Tanda tangani aksi admin di Phantom…',
     // Common
     closeBtn: 'Tutup',
+
+    // Theme
+    themeLight: 'Tema Terang',
+    themeDark: 'Tema Gelap',
+    toastThemeLight: 'Tema diubah ke Terang',
+    toastThemeDark: 'Tema diubah ke Gelap',
+
+    // Keyboard shortcuts
+    shortcutCommandPalette: 'Buka palet perintah',
+    shortcutFocusSearch: 'Fokus ke pencarian',
+    shortcutFeed: 'Buka beranda',
+    shortcutCreate: 'Buka buat coin',
+    shortcutPortfolio: 'Buka portofolio',
+    shortcutToggleTheme: 'Toggle tema',
+    shortcutToggleSidebar: 'Toggle sidebar',
+    shortcutCloseModals: 'Tutup modal',
+    shortcutShowHelp: 'Tampilkan bantuan pintasan',
+    shortcutsTitle: 'Pintasan Keyboard',
+    commandPaletteTitle: 'Palet Perintah',
+    commandPalettePlaceholder: 'Ketik perintah atau cari…',
+    commandPaletteHint: '⌘K untuk buka, Esc untuk tutup',
+    cmdSearch: 'Cari coin',
+    cmdFeed: 'Beranda',
+    cmdCreate: 'Buat Coin',
+    cmdPortfolio: 'Portofolio',
+    cmdToggleTheme: 'Toggle Tema',
+    cmdToggleSidebar: 'Toggle Sidebar',
+    cmdShortcuts: 'Bantuan Pintasan',
+    cmdClose: 'Tutup',
+
+    // Onboarding
+    onboardingWelcomeTitle: 'Selamat Datang di solpump',
+    onboardingWelcomeBody: 'Buat coin kripto ala pump.fun di Solana devnet. Minting SPL asli lewat Phantom, trading devnet asli lewat dompet pool.',
+    onboardingWalletTitle: 'Hubungkan Phantom',
+    onboardingWalletBody: 'Instal Phantom, atur ke Devnet, ambil SOL gratis dari faucet, lalu hubungkan dompetmu untuk memulai.',
+    onboardingCreateTitle: 'Buat Coin Pertamamu',
+    onboardingCreateBody: 'Isi nama, ticker, deskripsi, dan logo. Coin akan di-mint di devnet dan 800M token masuk ke pool untuk trading.',
+    onboardingTradeTitle: 'Trading Nyata di Devnet',
+    onboardingTradeBody: 'Beli/jual token dengan SOL devnet asli. Harga dari bonding curve, fee kreator 1%, PnL real-time.',
+    onboardingDevnetTitle: 'Ingat: Ini Devnet',
+    onboardingDevnetBody: 'Semua token dan SOL di sini adalah testnet gratis — tidak punya nilai uang sungguhan. Coba saja, tanpa risiko!',
+    onboardingPrev: 'Sebelumnya',
+    onboardingNext: 'Selanjutnya',
+    onboardingFinish: 'Mulai',
+    onboardingSkip: 'Lewati',
+
+    // Toast
+    toastDismiss: 'Tutup notifikasi',
+
+    // Accessibility
+    skipToContent: 'Langsung ke konten utama',
+
+    // Pull to refresh
+    pullToRefresh: 'Tarik untuk refresh',
+    releaseToRefresh: 'Lepaskan untuk refresh',
+    refreshing: 'Merefresh…',
   },
 
   en: {
@@ -1503,6 +1559,62 @@ const STRINGS = {
     toastSignAdmin: 'Sign the admin action in Phantom…',
     // Common
     closeBtn: 'Close',
+
+    // Theme
+    themeLight: 'Light Theme',
+    themeDark: 'Dark Theme',
+    toastThemeLight: 'Theme changed to Light',
+    toastThemeDark: 'Theme changed to Dark',
+
+    // Keyboard shortcuts
+    shortcutCommandPalette: 'Open command palette',
+    shortcutFocusSearch: 'Focus search',
+    shortcutFeed: 'Open feed',
+    shortcutCreate: 'Open create coin',
+    shortcutPortfolio: 'Open portfolio',
+    shortcutToggleTheme: 'Toggle theme',
+    shortcutToggleSidebar: 'Toggle sidebar',
+    shortcutCloseModals: 'Close modals',
+    shortcutShowHelp: 'Show shortcuts help',
+    shortcutsTitle: 'Keyboard Shortcuts',
+    commandPaletteTitle: 'Command Palette',
+    commandPalettePlaceholder: 'Type a command or search…',
+    commandPaletteHint: '⌘K to open, Esc to close',
+    cmdSearch: 'Search coins',
+    cmdFeed: 'Feed',
+    cmdCreate: 'Create Coin',
+    cmdPortfolio: 'Portfolio',
+    cmdToggleTheme: 'Toggle Theme',
+    cmdToggleSidebar: 'Toggle Sidebar',
+    cmdShortcuts: 'Shortcuts Help',
+    cmdClose: 'Close',
+
+    // Onboarding
+    onboardingWelcomeTitle: 'Welcome to solpump',
+    onboardingWelcomeBody: 'Create pump.fun-style crypto coins on Solana devnet. Real SPL minting via Phantom, real devnet trading through the pool wallet, with profit/loss tracking.',
+    onboardingWalletTitle: 'Connect Phantom',
+    onboardingWalletBody: 'Install Phantom, switch to Devnet, get free SOL from the faucet, then connect your wallet to get started.',
+    onboardingCreateTitle: 'Create Your First Coin',
+    onboardingCreateBody: 'Fill in name, ticker, description, and logo. Your coin will be minted on devnet and 800M tokens go to the pool for trading.',
+    onboardingTradeTitle: 'Real Devnet Trading',
+    onboardingTradeBody: 'Buy/sell tokens with real devnet SOL. Price from bonding curve, 1% creator fee, real-time PnL.',
+    onboardingDevnetTitle: 'Remember: This is Devnet',
+    onboardingDevnetBody: 'All tokens and SOL here are free testnet — no real monetary value. Experiment risk-free!',
+    onboardingPrev: 'Previous',
+    onboardingNext: 'Next',
+    onboardingFinish: 'Get Started',
+    onboardingSkip: 'Skip',
+
+    // Toast
+    toastDismiss: 'Dismiss notification',
+
+    // Accessibility
+    skipToContent: 'Skip to main content',
+
+    // Pull to refresh
+    pullToRefresh: 'Pull to refresh',
+    releaseToRefresh: 'Release to refresh',
+    refreshing: 'Refreshing…',
   },
 
   zh: {
@@ -2247,6 +2359,62 @@ const STRINGS = {
     toastSignAdmin: '请在 Phantom 中签署管理员操作…',
     // Common
     closeBtn: '关闭',
+
+    // Theme
+    themeLight: '浅色主题',
+    themeDark: '深色主题',
+    toastThemeLight: '已切换至浅色主题',
+    toastThemeDark: '已切换至深色主题',
+
+    // Keyboard shortcuts
+    shortcutCommandPalette: '打开命令面板',
+    shortcutFocusSearch: '聚焦搜索框',
+    shortcutFeed: '打开首页',
+    shortcutCreate: '打开创建代币',
+    shortcutPortfolio: '打开投资组合',
+    shortcutToggleTheme: '切换主题',
+    shortcutToggleSidebar: '切换侧边栏',
+    shortcutCloseModals: '关闭弹窗',
+    shortcutShowHelp: '显示快捷键帮助',
+    shortcutsTitle: '键盘快捷键',
+    commandPaletteTitle: '命令面板',
+    commandPalettePlaceholder: '输入命令或搜索…',
+    commandPaletteHint: '⌘K 打开，Esc 关闭',
+    cmdSearch: '搜索代币',
+    cmdFeed: '首页',
+    cmdCreate: '创建代币',
+    cmdPortfolio: '投资组合',
+    cmdToggleTheme: '切换主题',
+    cmdToggleSidebar: '切换侧边栏',
+    cmdShortcuts: '快捷键帮助',
+    cmdClose: '关闭',
+
+    // Onboarding
+    onboardingWelcomeTitle: '欢迎来到 solpump',
+    onboardingWelcomeBody: '在 Solana 开发网创建 pump.fun 风格的加密代币。通过 Phantom 进行真实的 SPL 铸造，通过资金池钱包进行真实的开发网交易，并追踪盈亏。',
+    onboardingWalletTitle: '连接 Phantom',
+    onboardingWalletBody: '安装 Phantom，切换到开发网，从水龙头领取免费 SOL，然后连接钱包开始。',
+    onboardingCreateTitle: '创建你的第一个代币',
+    onboardingCreateBody: '填写名称、代码、简介和 Logo。你的代币将在开发网铸造，8 亿枚代币进入资金池以便交易。',
+    onboardingTradeTitle: '真实的开发网交易',
+    onboardingTradeBody: '用真实的开发网 SOL 买卖代币。价格来自联合曲线，1% 创作者费，实时盈亏。',
+    onboardingDevnetTitle: '请记住：这是开发网',
+    onboardingDevnetBody: '这里的所有代币和 SOL 都是免费的测试网资产 — 没有任何实际货币价值。请放心实验！',
+    onboardingPrev: '上一步',
+    onboardingNext: '下一步',
+    onboardingFinish: '开始使用',
+    onboardingSkip: '跳过',
+
+    // Toast
+    toastDismiss: '关闭通知',
+
+    // Accessibility
+    skipToContent: '跳转到主要内容',
+
+    // Pull to refresh
+    pullToRefresh: '下拉刷新',
+    releaseToRefresh: '释放刷新',
+    refreshing: '正在刷新…',
   },
 };
 
