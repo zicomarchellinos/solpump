@@ -406,6 +406,9 @@ function publicCoin(row, trades, ctx) {
     pairAsset,
     pairLabel: pairs.pairLabel(row.ticker, pairAsset),
     pairAssetUsd: assetUsd,
+    // Referral / trader fee (set at creation, immutable).
+    referralWallet: row.referral_wallet || null,
+    referralFeeBps: row.referral_fee_bps || 0,
     ...stats,
   };
 }
@@ -422,6 +425,7 @@ function publicTrade(row, assetUsd = null) {
     price: row.price,
     priceUsd,
     feeSol: row.fee_sol || 0,
+    referralFeeSol: row.referral_fee_sol || 0,
     userTxSignature: row.user_tx_signature || null,
     poolTxSignature: row.pool_tx_signature || null,
     createdAt: row.created_at,
@@ -492,6 +496,30 @@ function coinFeeTotals(mintAddress) {
       .prepare('SELECT COALESCE(SUM(amount_sol), 0) AS s FROM fee_claims WHERE mint_address = ?')
       .get(mintAddress).s || 0;
   return { totalEarnedSol: earned, totalClaimedSol: claimed, unclaimedSol: Math.max(0, earned - claimed) };
+}
+
+// Referral fee totals for one coin: earned (sum of referral_fee_sol on all
+// trades), claimed (sum of payouts to the referral trader), and unclaimed.
+function referralFeeTotals(mintAddress) {
+  const row = db.prepare('SELECT referral_wallet, referral_fee_bps FROM coins WHERE mint_address = ?').get(mintAddress);
+  if (!row || !row.referral_wallet) {
+    return { referralWallet: null, referralFeeBps: 0, totalEarnedSol: 0, totalClaimedSol: 0, unclaimedSol: 0 };
+  }
+  const earned =
+    db
+      .prepare('SELECT COALESCE(SUM(referral_fee_sol), 0) AS s FROM trades WHERE mint_address = ?')
+      .get(mintAddress).s || 0;
+  const claimed =
+    db
+      .prepare('SELECT COALESCE(SUM(amount_sol), 0) AS s FROM referral_fee_claims WHERE mint_address = ?')
+      .get(mintAddress).s || 0;
+  return {
+    referralWallet: row.referral_wallet,
+    referralFeeBps: row.referral_fee_bps || 0,
+    totalEarnedSol: earned,
+    totalClaimedSol: claimed,
+    unclaimedSol: Math.max(0, earned - claimed),
+  };
 }
 
 // Reward pool totals for one coin: funded (creator deposits), claimed
@@ -753,8 +781,13 @@ function recordFailedTrade({ mintAddress, wallet, side, solAmount, tokenAmount, 
   ).run(mintAddress, wallet, side, solAmount, tokenAmount, userTxSignature, error, Date.now());
 }
 
-function recordTradeAndReserves({ mintAddress, wallet, side, solAmount, tokenAmount, price, feeSol, userTxSignature, poolTxSignature, row }) {
+function recordTradeAndReserves({ mintAddress, wallet, side, solAmount, tokenAmount, price, feeSol, referralFeeBps, userTxSignature, poolTxSignature, row }) {
   const now = Date.now();
+  // Referral trader earns referralFeeBps of the trade volume (paid out of
+  // the creator's fee). Creator keeps feeSol - referralFeeSol.
+  const referralFeeSol = referralFeeBps && referralFeeBps > 0
+    ? bonding.creatorFeeSol(solAmount, referralFeeBps)
+    : 0;
   const apply = db.transaction(() => {
     const newSol = side === 'buy' ? row.sol_reserve + solAmount : row.sol_reserve - solAmount;
     const newTokens =
@@ -768,13 +801,25 @@ function recordTradeAndReserves({ mintAddress, wallet, side, solAmount, tokenAmo
       .prepare(
         `INSERT INTO trades
            (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
-            user_tx_signature, pool_tx_signature, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            referral_fee_sol, user_tx_signature, pool_tx_signature, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(mintAddress, wallet, side, solAmount, tokenAmount, price, feeSol || 0, userTxSignature, poolTxSignature, now);
+      .run(
+        mintAddress,
+        wallet,
+        side,
+        solAmount,
+        tokenAmount,
+        price,
+        feeSol || 0,
+        referralFeeSol,
+        userTxSignature,
+        poolTxSignature,
+        now
+      );
     return info.lastInsertRowid;
   });
-  return { tradeId: apply(), now };
+  return { tradeId: apply(), now, referralFeeSol };
 }
 
 // Record a two-hop routed buy (SOL -> pair coin -> target coin) as TWO
@@ -809,12 +854,21 @@ function recordRoutedBuy({
   tokenAmount,
   feePairSol,
   feeTargetSol,
+  referralFeeBps,
   userTxSignature,
   poolTxSignature,
 }) {
   const now = Date.now();
+  // Referral trader earns referralFeeBps of the target leg's volume (paid
+  // out of the target coin's creator fee).
+  const referralFeeSol = referralFeeBps && referralFeeBps > 0
+    ? bonding.creatorFeeSol(pairAmount, referralFeeBps)
+    : 0;
   const apply = db.transaction(() => {
-    // Leg 1: pair coin reserves + trade.
+    // Leg 1: pair coin reserves + trade (pair coin's own referral, if any).
+    const pairReferralFeeSol = pairRow.referral_fee_bps && pairRow.referral_fee_bps > 0
+      ? bonding.creatorFeeSol(solAmount, pairRow.referral_fee_bps)
+      : 0;
     db.prepare('UPDATE coins SET sol_reserve = ?, token_reserve = ? WHERE mint_address = ?').run(
       pairRow.sol_reserve + solAmount,
       pairRow.token_reserve - pairAmount,
@@ -824,8 +878,8 @@ function recordRoutedBuy({
       .prepare(
         `INSERT INTO trades
            (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
-            user_tx_signature, pool_tx_signature, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            referral_fee_sol, user_tx_signature, pool_tx_signature, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         pairRow.mint_address,
@@ -835,6 +889,7 @@ function recordRoutedBuy({
         pairAmount,
         solAmount / pairAmount,
         feePairSol || 0,
+        pairReferralFeeSol,
         // NULL user signature: the routing leg has no on-chain tx of its
         // own (the pair tokens never leave the pool) — the buyer's real
         // SOL transfer is recorded on leg 2. Sharing the signature here
@@ -853,8 +908,8 @@ function recordRoutedBuy({
       .prepare(
         `INSERT INTO trades
            (mint_address, wallet, side, sol_amount, token_amount, price, fee_sol,
-            user_tx_signature, pool_tx_signature, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            referral_fee_sol, user_tx_signature, pool_tx_signature, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         targetRow.mint_address,
@@ -864,11 +919,12 @@ function recordRoutedBuy({
         tokenAmount,
         pairAmount / tokenAmount,
         feeTargetSol || 0,
+        referralFeeSol,
         userTxSignature,
         poolTxSignature,
         now
       );
-    return { pairTradeId: pairInfo.lastInsertRowid, targetTradeId: targetInfo.lastInsertRowid };
+    return { pairTradeId: pairInfo.lastInsertRowid, targetTradeId: targetInfo.lastInsertRowid, referralFeeSol };
   });
   return { ...apply(), now };
 }
@@ -1014,6 +1070,8 @@ router.get('/coins/:mint', async (req, res) => {
     // Creator-fee claims for this coin (shown in the transaction history).
     feeClaims: coinFeeClaims(row.mint_address),
     creatorFees: coinFeeTotals(row.mint_address),
+    // Referral-fee totals for this coin (shown to the referral trader).
+    referralFees: referralFeeTotals(row.mint_address),
     // This coin's own tax rate (set at creation, immutable) — the trade
     // panel and fee card show it instead of a flat 1%.
     creatorFeePct: (row.fee_bps ?? bonding.CREATOR_FEE_BPS) / 100,
@@ -2170,7 +2228,7 @@ router.post('/trades/buy', async (req, res) => {
           pairAmount,
           fresh.fee_bps ?? bonding.CREATOR_FEE_BPS
         );
-        const { pairTradeId, targetTradeId, now } = recordRoutedBuy({
+        const { pairTradeId, targetTradeId, now, referralFeeSol } = recordRoutedBuy({
           pairRow: freshPair,
           targetRow: fresh,
           buyerWallet: wallet,
@@ -2180,6 +2238,7 @@ router.post('/trades/buy', async (req, res) => {
           tokenAmount: exactTokens,
           feePairSol,
           feeTargetSol,
+          referralFeeBps: fresh.referral_fee_bps || 0,
           userTxSignature,
           poolTxSignature: poolSignature,
         });
@@ -2195,12 +2254,13 @@ router.post('/trades/buy', async (req, res) => {
           price: solAmount / exactTokens,
           feePairSol,
           feeTargetSol,
+          referralFeeSol: result.referralFeeSol,
           poolSignature,
         };
       }
       const price = solAmount / exactTokens;
       const feeSol = bonding.creatorFeeSol(solAmount, fresh.fee_bps ?? bonding.CREATOR_FEE_BPS);
-      const { tradeId, now } = recordTradeAndReserves({
+      const { tradeId, now, referralFeeSol } = recordTradeAndReserves({
         mintAddress,
         wallet,
         side: 'buy',
@@ -2208,11 +2268,22 @@ router.post('/trades/buy', async (req, res) => {
         tokenAmount: exactTokens,
         price,
         feeSol,
+        referralFeeBps: fresh.referral_fee_bps || 0,
         userTxSignature,
         poolTxSignature: poolSignature,
         row: fresh,
       });
-      return { status: 200, tradeId, now, solAmount, tokenAmount: exactTokens, price, feeSol, poolSignature };
+      return {
+        status: 200,
+        tradeId,
+        now,
+        solAmount,
+        tokenAmount: exactTokens,
+        price,
+        feeSol,
+        referralFeeSol,
+        poolSignature,
+      };
     });
 
     if (result.status !== 200) {
@@ -2404,7 +2475,7 @@ router.post('/trades/sell', async (req, res) => {
       // separately and PnL uses the net proceeds.
       const exactTokens = Number(tokenRaw) / 1e6;
       const price = solAmount / exactTokens;
-      const { tradeId, now } = recordTradeAndReserves({
+      const { tradeId, now, referralFeeSol } = recordTradeAndReserves({
         mintAddress,
         wallet,
         side: 'sell',
@@ -2412,11 +2483,23 @@ router.post('/trades/sell', async (req, res) => {
         tokenAmount: exactTokens,
         price,
         feeSol,
+        referralFeeBps: fresh.referral_fee_bps || 0,
         userTxSignature,
         poolTxSignature: poolSignature,
         row: fresh,
       });
-      return { status: 200, tradeId, now, solAmount, netSolAmount: exactSol, tokenAmount: exactTokens, price, feeSol, poolSignature };
+      return {
+        status: 200,
+        tradeId,
+        now,
+        solAmount,
+        netSolAmount: exactSol,
+        tokenAmount: exactTokens,
+        price,
+        feeSol,
+        referralFeeSol,
+        poolSignature,
+      };
     });
 
     if (result.status !== 200) {
@@ -2708,6 +2791,8 @@ router.post('/coins/register', async (req, res) => {
     category,
     feeBps,
     isAdult,
+    referralWallet,
+    referralFeeBps,
   } = req.body || {};
 
   if (typeof mintAddress !== 'string' || !BASE58_RE.test(mintAddress)) {
@@ -2764,6 +2849,41 @@ router.post('/coins/register', async (req, res) => {
     }
   }
 
+  // Referral / trader fee: an optional trader wallet that earns a share of
+  // this coin's trading fees. referralFeeBps is the share (0–1000 bps).
+  // Cannot refer yourself.
+  let referralWalletValue = null;
+  let referralFeeBpsValue = 0;
+  if (referralWallet !== undefined && referralWallet !== null && referralWallet !== '') {
+    if (typeof referralWallet !== 'string' || !BASE58_RE.test(referralWallet)) {
+      return badRequest(res, 'Alamat dompet rujukan tidak valid.');
+    }
+    if (referralWallet === creatorWallet) {
+      return badRequest(res, 'Kreator tidak bisa merujuk diri sendiri.');
+    }
+    referralWalletValue = referralWallet;
+    referralFeeBpsValue =
+      referralFeeBps === undefined || referralFeeBps === null || referralFeeBps === ''
+        ? 0
+        : Number(referralFeeBps);
+    if (
+      !Number.isInteger(referralFeeBpsValue) ||
+      referralFeeBpsValue < 0 ||
+      referralFeeBpsValue > bonding.MAX_FEE_BPS
+    ) {
+      return badRequest(
+        res,
+        `Fee rujukan harus 0–${bonding.MAX_FEE_BPS / 100}% (0–${bonding.MAX_FEE_BPS} bps).`,
+      );
+    }
+    if (referralFeeBpsValue >= feeBpsValue) {
+      return badRequest(
+        res,
+        'Fee rujukan harus lebih kecil dari pajak kreator (kreator tetap mendapat sisa fee).',
+      );
+    }
+  }
+
   const existing = db
     .prepare('SELECT mint_address FROM coins WHERE mint_address = ?')
     .get(mintAddress);
@@ -2807,8 +2927,8 @@ router.post('/coins/register', async (req, res) => {
     `INSERT INTO coins
        (mint_address, name, ticker, description, logo_url, creator_wallet, tx_signature,
         funding_tx_signature, trading_enabled, sol_reserve, token_reserve, pair_mint,
-        category, fee_bps, is_adult, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        category, fee_bps, is_adult, referral_wallet, referral_fee_bps, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     mintAddress,
     name.trim(),
@@ -2825,6 +2945,8 @@ router.post('/coins/register', async (req, res) => {
     categoryValue,
     feeBpsValue,
     isAdultValue ? 1 : 0,
+    referralWalletValue,
+    referralFeeBpsValue,
     now
   );
 
@@ -2868,6 +2990,8 @@ router.post('/coins/re-register', async (req, res) => {
     category,
     feeBps,
     isAdult,
+    referralWallet,
+    referralFeeBps,
     message,
     signature,
   } = req.body || {};
@@ -2907,6 +3031,38 @@ router.post('/coins/re-register', async (req, res) => {
     const pairCheck = pairs.validatePairChoice(pairMintValue, mintAddress, loadCoinMap());
     if (!pairCheck.ok) {
       return badRequest(res, pairCheck.reason);
+    }
+  }
+  // Referral / trader fee validation (same rules as coin creation).
+  let referralWalletValue = null;
+  let referralFeeBpsValue = 0;
+  if (referralWallet !== undefined && referralWallet !== null && referralWallet !== '') {
+    if (typeof referralWallet !== 'string' || !BASE58_RE.test(referralWallet)) {
+      return badRequest(res, 'Alamat dompet rujukan tidak valid.');
+    }
+    if (referralWallet === creatorWallet) {
+      return badRequest(res, 'Kreator tidak bisa merujuk diri sendiri.');
+    }
+    referralWalletValue = referralWallet;
+    referralFeeBpsValue =
+      referralFeeBps === undefined || referralFeeBps === null || referralFeeBps === ''
+        ? 0
+        : Number(referralFeeBps);
+    if (
+      !Number.isInteger(referralFeeBpsValue) ||
+      referralFeeBpsValue < 0 ||
+      referralFeeBpsValue > bonding.MAX_FEE_BPS
+    ) {
+      return badRequest(
+        res,
+        `Fee rujukan harus 0–${bonding.MAX_FEE_BPS / 100}% (0–${bonding.MAX_FEE_BPS} bps).`,
+      );
+    }
+    if (referralFeeBpsValue >= feeBpsValue) {
+      return badRequest(
+        res,
+        'Fee rujukan harus lebih kecil dari pajak kreator (kreator tetap mendapat sisa fee).',
+      );
     }
   }
 
@@ -2978,8 +3134,8 @@ router.post('/coins/re-register', async (req, res) => {
         `INSERT INTO coins
            (mint_address, name, ticker, description, logo_url, creator_wallet, tx_signature,
             funding_tx_signature, trading_enabled, sol_reserve, token_reserve, pair_mint,
-            category, fee_bps, is_adult, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            category, fee_bps, is_adult, referral_wallet, referral_fee_bps, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         mintAddress,
         name.trim(),
@@ -2996,6 +3152,8 @@ router.post('/coins/re-register', async (req, res) => {
         categoryValue,
         feeBpsValue,
         isAdultValue ? 1 : 0,
+        referralWalletValue,
+        referralFeeBpsValue,
         now
       );
       return { status: 201, solReserve, tokenReserve };
@@ -3277,6 +3435,107 @@ router.post('/coins/:mint/claim-fees', async (req, res) => {
   }
 });
 
+// ---- POST /api/coins/:mint/claim-referral-fees ----
+// The referral trader claims their accrued share of trading fees as a real
+// devnet transfer from the pool wallet. Body: { wallet } — must match the
+// coin's referral_wallet. Payout goes to the referral wallet only.
+router.post('/coins/:mint/claim-referral-fees', async (req, res) => {
+  const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+  if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+  if (!row.referral_wallet) {
+    return badRequest(res, 'Coin ini tidak memiliki dompet rujukan.');
+  }
+  const { wallet } = req.body || {};
+  if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
+    return badRequest(res, 'Alamat dompet tidak valid.');
+  }
+  if (wallet !== row.referral_wallet) {
+    return res.status(403).json({ error: 'Hanya dompet rujukan coin ini yang bisa mengklaim fee rujukan.' });
+  }
+  const totals = referralFeeTotals(row.mint_address);
+  if (totals.unclaimedSol <= 0) {
+    return badRequest(res, 'Tidak ada fee rujukan untuk diklaim.');
+  }
+  const pairAsset = pairs.pairAssetOf(row, loadCoinMap());
+  if (!pairAsset.available) {
+    return badRequest(
+      res,
+      'Klaim tidak dapat dilakukan: coin pasangan untuk coin ini tidak ditemukan di registry.',
+    );
+  }
+
+  try {
+    const result = await withTradeLock(async () => {
+      const fresh = referralFeeTotals(row.mint_address);
+      if (fresh.unclaimedSol <= 0) {
+        return { status: 400, error: 'Tidak ada fee rujukan untuk diklaim.' };
+      }
+      if (pairAsset.type === 'SOL') {
+        const lamports = Math.floor(fresh.unclaimedSol * LAMPORTS_PER_SOL);
+        if (lamports <= 0) {
+          return { status: 400, error: 'Fee rujukan yang belum diklaim terlalu kecil untuk ditransfer.' };
+        }
+        const poolSolLamports = await pool.getPoolSolBalance();
+        if (poolSolLamports < lamports + pool.FEE_BUFFER_LAMPORTS) {
+          return {
+            status: 400,
+            error: `Pool kekurangan SOL untuk membayar klaim rujukan ini.`,
+          };
+        }
+        const signature = await pool.sendSol(fresh.referralWallet, lamports);
+        const amountSol = lamports / LAMPORTS_PER_SOL;
+        db.prepare(
+          `INSERT INTO referral_fee_claims
+             (mint_address, referral_wallet, amount_sol, asset_symbol, tx_signature, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(row.mint_address, fresh.referralWallet, amountSol, 'SOL', signature, Date.now());
+        return { status: 200, claimId: db.prepare('SELECT last_insert_rowid() AS id').get().id, amountSol, signature, assetSymbol: 'SOL' };
+      }
+      const amountRaw = BigInt(Math.floor(fresh.unclaimedSol * 1e6));
+      if (amountRaw <= 0n) {
+        return { status: 400, error: 'Fee rujukan yang belum diklaim terlalu kecil untuk ditransfer.' };
+      }
+      const poolPair = await pool.getPoolTokenBalance(pairAsset.mint);
+      if (poolPair < fresh.unclaimedSol) {
+        return {
+          status: 400,
+          error: `Pool kekurangan ${pairAsset.symbol} untuk membayar klaim rujukan ini.`,
+        };
+      }
+      const poolSolLamports = await pool.getPoolSolBalance();
+      if (poolSolLamports < pool.FEE_BUFFER_LAMPORTS) {
+        return { status: 400, error: 'Pool kekurangan SOL untuk biaya transaksi klaim rujukan ini.' };
+      }
+      const signature = await pool.sendTokens(pairAsset.mint, fresh.referralWallet, amountRaw);
+      const amountSol = Number(amountRaw) / 1e6;
+      db.prepare(
+        `INSERT INTO referral_fee_claims
+           (mint_address, referral_wallet, amount_sol, asset_symbol, tx_signature, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(row.mint_address, fresh.referralWallet, amountSol, pairAsset.symbol, signature, Date.now());
+      return { status: 200, claimId: db.prepare('SELECT last_insert_rowid() AS id').get().id, amountSol, signature, assetSymbol: pairAsset.symbol };
+    });
+
+    if (result.status !== 200) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.json({
+      claim: {
+        id: result.claimId,
+        mintAddress: row.mint_address,
+        referralWallet: row.referral_wallet,
+        amountSol: result.amountSol,
+        assetSymbol: result.assetSymbol,
+        txSignature: result.signature,
+        createdAt: Date.now(),
+      },
+      referralFees: referralFeeTotals(row.mint_address),
+    });
+  } catch (err) {
+    res.status(502).json({ error: `Gagal mengklaim fee rujukan: ${err.message}` });
+  }
+});
+
 // ---- POST /api/coins/:mint/buyback ----
 // Creator-only buyback: spend the coin's unclaimed creator-fee balance to
 // buy the coin back from the bonding curve. Body:
@@ -3450,6 +3709,7 @@ router.post('/coins/:mint/buyback', async (req, res) => {
       ),
       coin: publicCoin(updated, trades, ctx),
       creatorFees: coinFeeTotals(req.params.mint),
+      referralFees: referralFeeTotals(req.params.mint),
     });
   } catch (err) {
     res.status(502).json({ error: `Gagal menjalankan buyback: ${err.message}` });

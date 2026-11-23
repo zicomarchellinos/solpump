@@ -1984,6 +1984,22 @@ async function renderCreate() {
         </select>
         <div class="hint">${translate('taxHint')}</div>
       </div>
+      <div class="field">
+        <label for="coinReferralWallet">${translate('referralLabel')}</label>
+        <input id="coinReferralWallet" type="text" placeholder="Alamat dompet trader rujukan…" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <div class="hint">${translate('referralHint')}</div>
+      </div>
+      <div class="field">
+        <label for="coinReferralFee">${translate('referralFeeLabel')}</label>
+        <select id="coinReferralFee">
+          <option value="0">0% ${translate('taxDefaultSuffix')}</option>
+          <option value="10">0.1%</option>
+          <option value="20">0.2%</option>
+          <option value="50">0.5%</option>
+          <option value="100">1%</option>
+        </select>
+        <div class="hint">${translate('referralFeeHint')}</div>
+      </div>
       <label class="check-row">
         <input type="checkbox" id="coinAdult">
         <span>${translate('adultCheckboxLabel')}</span>
@@ -2203,6 +2219,8 @@ async function renderCreate() {
           category: pending.category || undefined,
           feeBps: pending.feeBps ?? undefined,
           isAdult: pending.isAdult || undefined,
+          referralWallet: pending.referralWallet || undefined,
+          referralFeeBps: pending.referralFeeBps || undefined,
           image: pending.image || undefined,
         });
         savePendingMint(null);
@@ -2282,6 +2300,8 @@ async function renderCreate() {
     const description = document.getElementById('coinDesc').value.trim();
     const category = document.getElementById('coinCategory').value || 'Lainnya';
     const feeBps = Number(document.getElementById('coinTax').value || 100);
+    const referralWallet = document.getElementById('coinReferralWallet')?.value.trim() || null;
+    const referralFeeBps = Number(document.getElementById('coinReferralFee')?.value || 0);
     const isAdult = document.getElementById('coinAdult').checked;
     const errEl = document.getElementById('mintError');
     const stepsEl = document.getElementById('mintSteps');
@@ -2437,6 +2457,8 @@ async function renderCreate() {
               category,
               feeBps,
               isAdult,
+              referralWallet,
+              referralFeeBps,
               image: logo,
               error: translate('pendingErrFundingCancelled'),
             });
@@ -2462,6 +2484,8 @@ async function renderCreate() {
           category,
           feeBps,
           isAdult,
+          referralWallet,
+          referralFeeBps,
           image: logo,
         });
       } catch (regErr) {
@@ -2479,6 +2503,8 @@ async function renderCreate() {
           category,
           feeBps,
           isAdult,
+          referralWallet,
+          referralFeeBps,
           image: logo,
           error: regErr.message,
         });
@@ -2566,6 +2592,22 @@ async function renderReRegister() {
           <option value="1000">10%</option>
         </select>
         <div class="hint">${translate('taxHint')}</div>
+      </div>
+      <div class="field">
+        <label for="rrReferralWallet">${translate('referralLabel')}</label>
+        <input id="rrReferralWallet" type="text" placeholder="Alamat dompet trader rujukan…" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <div class="hint">${translate('referralHint')}</div>
+      </div>
+      <div class="field">
+        <label for="rrReferralFee">${translate('referralFeeLabel')}</label>
+        <select id="rrReferralFee">
+          <option value="0">0% ${translate('taxDefaultSuffix')}</option>
+          <option value="10">0.1%</option>
+          <option value="20">0.2%</option>
+          <option value="50">0.5%</option>
+          <option value="100">1%</option>
+        </select>
+        <div class="hint">${translate('referralFeeHint')}</div>
       </div>
       <label class="check-row">
         <input type="checkbox" id="rrAdult">
@@ -2666,6 +2708,8 @@ async function renderReRegister() {
         category: document.getElementById('rrCategory').value,
         feeBps: Number(document.getElementById('rrTax').value || 100),
         isAdult: document.getElementById('rrAdult').checked,
+        referralWallet: document.getElementById('rrReferralWallet')?.value.trim() || undefined,
+        referralFeeBps: Number(document.getElementById('rrReferralFee')?.value || 0),
         image: logoData || undefined,
         message,
         signature,
@@ -2701,7 +2745,7 @@ async function renderCoin(mintAddress) {
   }
   state.coinCache = data;
   if (mySeq !== coinRenderSeq) return; // a newer coin render started
-  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd, rewardPool, stream, pairCoin, solBuyAvailable, solBuyUnavailableReason, topHolders } = data;
+  const { coin, stats, chart, trades, feeClaims, creatorFees, creatorFeePct, referralFees, viewerFollowsCreator, callouts, burns, burnStats, walletPnl, walletTrades, solUsd, rewardPool, stream, pairCoin, solBuyAvailable, solBuyUnavailableReason, topHolders } = data;
   const chg = stats.changePct >= 0 ? 'profit' : 'loss';
   const isCreator = state.wallet && state.wallet === coin.creatorWallet;
   // Pair asset: SOL for SOL pairs, the pair coin's ticker for coin pairs.
@@ -2944,6 +2988,26 @@ async function renderCoin(mintAddress) {
               </div>
             </div>`
           : `<p class="small muted" style="margin-top:12px">${translate('feeNonCreatorNote', { asset: esc(pairAsset), creator: creatorLink(coin.creatorWallet) })}</p>`}
+        ${coin.referralWallet
+          ? `<div style="margin-top:16px">
+              <h3 style="margin:0 0 4px">${translate('referralTrader')}</div>
+              <div class="stat-grid" style="grid-template-columns:1fr 1fr">
+                <div class="stat"><div class="label">${translate('referralEarned')}</div><div class="value">${fmtSol(referralFees.totalEarnedSol)} ${esc(pairAsset)}</div></div>
+                <div class="stat"><div class="label">${translate('referralClaimed')}</div><div class="value">${fmtSol(referralFees.totalClaimedSol)} ${esc(pairAsset)}</div></div>
+                <div class="stat"><div class="label">${translate('referralUnclaimed')}</div><div class="value">${fmtSol(referralFees.unclaimedSol)} ${esc(pairAsset)}</div></div>
+                <div class="stat"><div class="label">${translate('referralFeeLabel')}</div><div class="value">${(coin.referralFeeBps / 100).toFixed(2)}%</div></div>
+              </div>
+              ${state.wallet === coin.referralWallet
+                ? `<div style="margin-top:8px">
+                    <button class="btn btn-primary" id="claimReferralBtn" ${referralFees.unclaimedSol > 0 ? '' : 'disabled'}>${translate('referralClaimBtn')}</button>
+                    <div id="referralClaimResult" style="margin-top:8px"></div>
+                    <p class="small muted">${translate('toastSignReferralClaim')}</p>
+                  </div>`
+                : `<p class="small muted" style="margin-top:8px">${translate('errReferralNotAuthorized')}</p>`
+              }
+            </div>`
+          : ''
+        }
       </div>
     </aside>
     </div>`;
@@ -2983,6 +3047,28 @@ async function renderCoin(mintAddress) {
       } catch (err) {
         resEl.innerHTML = `<div class="alert alert-error">${esc(translate('claimFailed', { msg: friendlyError(err) }))}</div>`;
         claimBtn.disabled = false;
+      }
+    });
+  }
+
+  // Referral trader claims accrued referral fees from the pool wallet.
+  const claimReferralBtn = document.getElementById('claimReferralBtn');
+  if (claimReferralBtn) {
+    claimReferralBtn.addEventListener('click', async () => {
+      const resEl = document.getElementById('referralClaimResult');
+      claimReferralBtn.disabled = true;
+      resEl.innerHTML = `<p class="muted">${translate('claimSending')}</p>`;
+      try {
+        const res = await apiPost(`/api/coins/${coin.mintAddress}/claim-referral-fees`, {
+          wallet: state.wallet,
+        });
+        resEl.innerHTML = `<div class="alert alert-success">${translate('referralClaimSuccess', { amount: fmtSol(res.claim.amountSol), asset: esc(res.claim.assetSymbol || pairAsset) })}</div>`;
+        await refreshBalance();
+        renderHeader();
+        setTimeout(() => renderCoin(mintAddress), 1200);
+      } catch (err) {
+        resEl.innerHTML = `<div class="alert alert-error">${esc(translate('referralClaimFailed', { msg: friendlyError(err) }))}</div>`;
+        claimReferralBtn.disabled = false;
       }
     });
   }
