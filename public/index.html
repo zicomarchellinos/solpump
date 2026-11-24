@@ -16,7 +16,7 @@
 </head>
 <body>
   <!-- Skip to main content for accessibility -->
-  <a href="#main-content" class="skip-link" data-i18n="skipToContent">Skip to main content</a>
+  <a href="#view" class="skip-link" data-i18n="skipToContent">Skip to main content</a>
 
   <!-- App shell: sidebar (desktop rail) + main column with header -->
   <div class="app-shell" id="appShell">
@@ -30,6 +30,17 @@
           <span class="nav-ic" aria-hidden="true">⌂</span>
           <span class="nav-label" data-i18n="navHome">Beranda</span>
         </a>
+        <div class="nav-group" data-nav-group="live">
+          <button class="nav-group-toggle" type="button" aria-expanded="false" aria-controls="liveSubmenu">
+            <span class="nav-ic" aria-hidden="true">●</span>
+            <span class="nav-label" data-i18n="navLiveStreaming">LiveStreaming</span>
+            <span class="nav-chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="nav-submenu" id="liveSubmenu">
+            <a href="#/live-streaming" data-nav="live-streaming" role="menuitem" data-i18n="navLiveWatching">Live Streaming</a>
+            <a href="#/live-streaming-creator" data-nav="live-streaming-creator" role="menuitem" data-i18n="navLiveCreator">LiveStreaming Creator</a>
+          </div>
+        </div>
         <a href="#/create" data-nav="create" role="menuitem" aria-label="Create Coin">
           <span class="nav-ic" aria-hidden="true">+</span>
           <span class="nav-label" data-i18n="navCreate">Buat Coin</span>
@@ -83,7 +94,7 @@
         <span class="muted small" data-i18n="infobarText">Trading asli di devnet — SOL dan token beneran berpindah on-chain.</span>
       </div>
 
-      <main id="view" class="container" role="main" id="main-content">
+      <main id="view" class="container" role="main" tabindex="-1">
         <p class="muted" data-i18n="loadingGeneric">Memuat…</p>
       </main>
 

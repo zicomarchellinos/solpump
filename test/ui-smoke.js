@@ -178,7 +178,9 @@ async function main() {
     // Pump.fun-style app shell: sidebar with brand + nav, top header.
     assert(document.querySelector('.sidebar'), 'sidebar renders');
     assert(document.querySelector('.sidebar .brand').textContent.includes('solpump'), 'sidebar shows the solpump brand');
-    assert(document.querySelectorAll('.nav a').length === 3, 'sidebar nav has Beranda / Buat Coin / Portofolio');
+    assert(document.querySelectorAll('.nav a').length === 5, 'sidebar nav has Beranda / Live Streaming / Creator / Buat Coin / Portofolio');
+    const liveMenu = document.querySelector('.nav-group[data-nav-group="live"]');
+    assert(liveMenu && liveMenu.querySelector('.nav-group-toggle .nav-label').textContent === 'LiveStreaming', 'sidebar groups livestream pages under LiveStreaming');
     assert(document.querySelector('.topbar'), 'top header renders');
     assert(document.body.textContent.includes('DEVNET'), 'DEVNET pill is visible');
 
@@ -188,6 +190,10 @@ async function main() {
       15000,
       'coin card in feed'
     );
+    assert(liveMenu.querySelector('[data-nav="live-streaming"]').textContent === 'Token Sedang Live', 'livestream submenu identifies tokens that are currently live');
+    assert(liveMenu.querySelector('[data-nav="live-streaming-creator"]').textContent === 'LiveStreaming Creator', 'livestream submenu links to the creator studio');
+    liveMenu.querySelector('.nav-group-toggle').click();
+    assert(liveMenu.classList.contains('open'), 'clicking LiveStreaming opens its submenu');
     // Trending strip (pump.fun style): the seeded coin appears as a chip.
     await waitFor(
       () => document.querySelector('.trend-chip'),
@@ -1014,6 +1020,35 @@ async function main() {
     });
     await waitFor(() => doc2.querySelector('.coin-card'), 15000, 'feed in page 2');
 
+    win2.location.hash = '#/live-streaming-creator';
+    win2.dispatchEvent(new win2.HashChangeEvent('hashchange'));
+    await waitFor(() => doc2.querySelector('#streamStartBtn'), 15000, 'creator livestream controls');
+    assert(doc2.querySelector('.live-creator-layout .live-creator-coins'), 'creator livestream page lists the creator coins');
+    assert(doc2.querySelector('.live-creator-layout .live-stream-main'), 'creator livestream page has a streaming stage');
+    assert(doc2.querySelector('.live-creator-layout .live-stream-chat #streamChatLog'), 'creator livestream page places a live chat box beside the stream');
+    const streamMediaDevices = win2.navigator.mediaDevices;
+    Object.defineProperty(win2.navigator, 'mediaDevices', { configurable: true, value: undefined });
+    doc2.querySelector('#streamStartBtn').click();
+    assert(
+      doc2.querySelector('#streamStatus').textContent.includes('Akses kamera/mikrofon tidak tersedia'),
+      'Go Live shows a persistent status when camera access is unavailable'
+    );
+    Object.defineProperty(win2.navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => {
+          throw new win2.DOMException('Permission denied', 'NotAllowedError');
+        },
+      },
+    });
+    doc2.querySelector('#streamStartBtn').click();
+    await waitFor(
+      () => doc2.querySelector('#streamStatus').textContent.includes('Izin kamera/mikrofon ditolak'),
+      5000,
+      'camera permission guidance'
+    );
+    Object.defineProperty(win2.navigator, 'mediaDevices', { configurable: true, value: streamMediaDevices });
+
     // Portfolio with a wallet: deposit section (address + copy + QR),
     // per-holding transfer button, transfer history card.
     win2.location.hash = '#/portfolio';
@@ -1257,6 +1292,54 @@ async function main() {
       win2.__testCameraTracks.at(-1).readyState === 'ended',
       'closing livestream setup releases the camera'
     );
+
+    win2.solana = {
+      isPhantom: true,
+      signMessage: async () => ({ signature: new Uint8Array(64) }),
+    };
+    const originalWebSocket = win2.WebSocket;
+    const streamSockets = [];
+    class TestWebSocket {
+      static OPEN = 1;
+      constructor() {
+        this.readyState = TestWebSocket.OPEN;
+        this.sent = [];
+        streamSockets.push(this);
+        setTimeout(() => this.onopen?.(), 0);
+      }
+      send(data) {
+        this.sent.push(JSON.parse(data));
+      }
+      close() {
+        this.readyState = 3;
+      }
+    }
+    win2.WebSocket = TestWebSocket;
+    doc2.querySelector('#streamStartBtn').click();
+    await waitFor(() => doc2.querySelector('#streamSetupModal'), 5000, 'livestream setup before start');
+    doc2.querySelector('#streamSetupStart').click();
+    await waitFor(
+      () => streamSockets[0]?.sent.some((message) => message.type === 'join'),
+      5000,
+      'broadcaster signaling join'
+    );
+    assert(
+      doc2.querySelector('#streamSetupModal') && doc2.querySelector('#streamSetupVideo').srcObject,
+      'camera preview stays visible while livestream signaling connects'
+    );
+    streamSockets[0].onmessage({
+      data: JSON.stringify({ type: 'joined', viewerCount: 0, chatAuthed: true, viewers: [] }),
+    });
+    await waitFor(
+      () => !doc2.querySelector('#streamSetupModal') && doc2.querySelector('#streamStage [data-stream-peer="local"]'),
+      5000,
+      'local camera attaches after livestream connects'
+    );
+    assert(
+      doc2.querySelector('#streamStage [data-stream-peer="local"]').srcObject,
+      'the connected livestream stage displays the local camera'
+    );
+    win2.WebSocket = originalWebSocket;
 
     // Routed SOL buys: on the pair coin, the buy form offers SOL
     // (default) or the pair asset; on the deep-chain coin the SOL

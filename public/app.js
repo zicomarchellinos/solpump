@@ -558,8 +558,12 @@ function applySidebarState() {
   const scrim = document.getElementById('sidebarScrim');
   if (!shell || !toggle) return;
   const mobile = isMobileSidebar();
+  if (!mobile) {
+    shell.classList.remove('sidebar-open');
+  }
   const drawerOpen = shell.classList.contains('sidebar-open');
   state.sidebarOpen = drawerOpen;
+  document.body.classList.toggle('sidebar-drawer-open', mobile && drawerOpen);
   shell.classList.toggle('sidebar-collapsed', !mobile && isSidebarCollapsed());
   if (scrim) {
     scrim.hidden = !mobile || !drawerOpen;
@@ -616,6 +620,15 @@ function closeSidebarDrawer() {
 function wireSidebar() {
   const toggle = document.getElementById('sidebarToggle');
   if (toggle) toggle.addEventListener('click', toggleSidebar);
+  const liveGroup = document.querySelector('.nav-group[data-nav-group="live"]');
+  const liveToggle = liveGroup?.querySelector('.nav-group-toggle');
+  if (liveToggle) {
+    liveToggle.addEventListener('click', () => {
+      const expanded = liveToggle.getAttribute('aria-expanded') === 'true';
+      liveToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+      liveGroup?.classList.toggle('open', !expanded);
+    });
+  }
   const scrim = document.getElementById('sidebarScrim');
   if (scrim) scrim.addEventListener('click', closeSidebarDrawer);
   // Tapping a nav link closes the mobile drawer (harmless on desktop).
@@ -656,6 +669,9 @@ function wireSidebar() {
       if (deltaX < -50 && touchStartX < 100) {
         // Swipe left from near left edge - close drawer
         closeSidebarDrawer();
+      } else if (deltaX > 50 && touchStartX < 24) {
+        shell.classList.add('sidebar-open');
+        applySidebarState();
       }
     }
   }, { passive: true });
@@ -1556,6 +1572,14 @@ function renderHeader() {
       href === hash || (href === '#/' && (hash === '' || hash === '#/'))
     );
   });
+  const liveRoute = hash === '#/live-streaming' || hash.startsWith('#/live-streaming/');
+  const creatorRoute = hash === '#/live-streaming-creator';
+  const liveGroup = document.querySelector('.nav-group[data-nav-group="live"]');
+  if (liveGroup) {
+    liveGroup.classList.toggle('open', liveRoute || creatorRoute);
+    const liveToggle = liveGroup.querySelector('.nav-group-toggle');
+    liveToggle?.setAttribute('aria-expanded', liveRoute || creatorRoute ? 'true' : 'false');
+  }
   // Admin nav link (cached state renders immediately; the server check
   // refreshes it once per connected wallet).
   renderAdminNavLink();
@@ -1646,6 +1670,9 @@ function route() {
   if (hash === '#/re-register') return renderReRegister();
   if (hash === '#/portfolio') return renderPortfolio();
   if (hash === '#/admin') return renderAdmin();
+  if (hash === '#/live-streaming-creator') return renderLiveStreamingCreator();
+  const live = hash.match(/^#\/live-streaming(?:\/([1-9A-HJ-NP-Za-km-z]{32,44}))?$/);
+  if (live) return renderLiveStreaming(live[1] || null);
   const m = hash.match(/^#\/coin\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (m) return renderCoin(m[1]);
   const c = hash.match(/^#\/creator\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
@@ -2863,8 +2890,6 @@ async function renderCoin(mintAddress) {
       </div>
       <div class="table-wrap" id="tradesTable"></div>
     </div>
-
-    <div class="card" id="streamCard"></div>
 
     <div class="card">
       <div class="stat-grid">
@@ -4274,7 +4299,9 @@ async function renderCoin(mintAddress) {
 // in-memory only.
 const streamState = {
   mint: null,
+  creatorMint: null,
   role: null, // 'broadcaster' | 'guest' | 'viewer' | null
+  joined: false,
   ws: null,
   viewerId: null,
   localStream: null, // broadcaster's camera/mic
@@ -4340,6 +4367,7 @@ function stopStream() {
   }
   streamState.mint = null;
   streamState.role = null;
+  streamState.joined = false;
   streamState.ws = null;
   streamState.viewerId = null;
   streamState.localStream = null;
@@ -4414,10 +4442,16 @@ function appendStreamChat(msg) {
 function handleStreamMessage(msg) {
   switch (msg.type) {
     case 'joined': {
+      streamState.joined = true;
       streamState.viewerId = msg.viewerId || null;
       streamState.authed = !!msg.chatAuthed;
       updateStreamViewerCount(msg.viewerCount || 0);
       if (streamState.role === 'broadcaster') {
+        if (streamState.previewStream) {
+          streamState.localStream = streamState.previewStream;
+          streamState.previewStream = null;
+          closeStreamSetup(false);
+        }
         setStreamStatus(streamState.audioEnabled ? 'streamLiveNow' : 'streamAudioOnly');
         // The panel was rendered as "not live" before the join confirmed
         // (no video/chat elements) — re-render the coin page so it shows
@@ -4426,7 +4460,11 @@ function handleStreamMessage(msg) {
         if (!document.getElementById('streamChatLog') && streamState.mint) {
           renderCoin(streamState.mint);
         } else {
+          if (streamState.localStream) {
+            attachStreamVideo('local', streamState.localStream, true);
+          }
           refreshStreamControls();
+          refreshStreamChatAuth();
         }
         // Waiting viewers who joined before the stream started.
         (msg.viewers || []).forEach((viewerId) => createViewerPeer(viewerId));
@@ -4564,7 +4602,8 @@ function handleStreamMessage(msg) {
         streamState.pendingGuestRequest = false;
         refreshStreamControls();
       }
-      setStreamStatus('streamError');
+      if (streamState.role === 'broadcaster' && !streamState.joined) stopStream();
+      setStreamStatus('streamErrorToast', { msg: msg.error || '' });
       toast(translate('streamErrorToast', { msg: msg.error || '' }));
       break;
     default:
@@ -4588,6 +4627,13 @@ function openStreamSocket(mint, onOpen) {
     // network drop, or the broadcaster leaving). Keep the panel's
     // "stream ended" state instead of silently hanging.
     if (streamState.ws === ws && streamState.role) {
+      const starting = streamState.role === 'broadcaster' && !streamState.joined;
+      if (starting) {
+        stopStream();
+        setStreamStatus('streamError');
+        toast(translate('streamError'));
+        return;
+      }
       streamState.ended = true;
       if (streamState.pendingGuestStream) {
         streamState.pendingGuestStream.getTracks().forEach((track) => track.stop());
@@ -4746,6 +4792,7 @@ async function answerStreamOffer(sdp, publisherId, publisherConnId) {
 // Creator opens the camera preview before confirming the livestream.
 async function openStreamSetup(mint) {
   if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    setStreamStatus('streamNoMedia');
     toast(translate('streamNoMedia'));
     return;
   }
@@ -4806,11 +4853,15 @@ async function openStreamSetup(mint) {
       event.currentTarget.disabled = true;
       document.getElementById('streamSetupCancel').disabled = true;
       document.getElementById('streamSetupClose').disabled = true;
-      document.getElementById('streamSetupStatus').textContent = translate('streamStarting');
+      document.getElementById('streamSetupStatus').textContent = translate('streamConnecting');
       startStream(mint);
     });
   } catch (err) {
-    toast(translate('streamStartFailed', { msg: friendlyError(err) }));
+    const message = ['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(err?.name)
+      ? translate('streamCameraPermissionDenied')
+      : friendlyError(err);
+    setStreamStatus('streamStartFailed', { msg: message });
+    toast(translate('streamStartFailed', { msg: message }));
   }
 }
 
@@ -4828,12 +4879,10 @@ async function startStream(mint) {
     toast(translate('toastSignStreamStart'));
     const signature = await signWalletMessage(phantom, message);
     if (streamState.previewStream !== localStream) return;
-    streamState.previewStream = null;
-    streamState.localStream = localStream;
     streamState.audioEnabled = streamHasAudio(localStream);
-    closeStreamSetup(false);
     streamState.mint = mint;
     streamState.role = 'broadcaster';
+    streamState.joined = false;
     streamState.ended = false;
     openStreamSocket(mint, () => {
       streamSend({
@@ -4847,13 +4896,10 @@ async function startStream(mint) {
     // The panel flips to the broadcaster view (stop button, live chat)
     // when the server confirms the join — see refreshStreamControls().
   } catch (err) {
-    if (streamState.localStream === localStream) {
-      localStream.getTracks().forEach((t) => t.stop());
-      streamState.localStream = null;
-    }
-    closeStreamSetup();
-    setStreamStatus('streamError');
-    toast(translate('streamStartFailed', { msg: friendlyError(err) }));
+    const message = friendlyError(err);
+    stopStream();
+    setStreamStatus('streamStartFailed', { msg: message });
+    toast(translate('streamStartFailed', { msg: message }));
   }
 }
 
@@ -5804,6 +5850,156 @@ async function renderCandleChartEl(wrap, mintAddress, timeframe) {
   svg.addEventListener('mouseleave', () => {
     tip.style.display = 'none';
   });
+}
+
+// ---------- Livestream pages ----------
+async function renderLiveStreaming(selectedMint) {
+  const view = document.getElementById('view');
+  view.innerHTML = `
+    <div class="live-page-heading">
+      <div>
+        <p class="launchpad-eyebrow">SOLANA DEVNET</p>
+        <h1>${translate('navLiveStreaming')}</h1>
+      </div>
+    </div>
+    <p class="muted">${translate('livePageLoading')}</p>`;
+  try {
+    const [streamData, coinData] = await Promise.all([
+      apiGet('/api/streams'),
+      apiGet('/api/coins?limit=100'),
+    ]);
+    const streams = streamData.streams || [];
+    if (!streams.length) {
+      view.innerHTML = `
+        <div class="live-page-heading"><div><p class="launchpad-eyebrow">SOLANA DEVNET</p><h1>${translate('navLiveStreaming')}</h1></div></div>
+        <div class="card empty"><h2>${translate('liveNoStreamsTitle')}</h2><p>${translate('liveNoStreamsBody')}</p></div>`;
+      return;
+    }
+    const coinByMint = new Map((coinData.coins || []).map((coin) => [coin.mintAddress, coin]));
+    const mint = selectedMint && streams.some((s) => s.mintAddress === selectedMint)
+      ? selectedMint
+      : streams[0].mintAddress;
+    const selected = streams.find((s) => s.mintAddress === mint);
+    const coin = coinByMint.get(mint);
+    view.innerHTML = `
+      <div class="live-page-heading">
+        <div><p class="launchpad-eyebrow">SOLANA DEVNET</p><h1>${translate('navLiveStreaming')}</h1></div>
+        <span class="badge badge-live-stream">● ${translate('liveBadge')} ${streams.length}</span>
+      </div>
+      <div class="live-stream-layout">
+        <aside class="live-stream-list card">
+          <h2>${translate('liveCurrentStreams')}</h2>
+          ${streams.map((stream) => {
+            const item = coinByMint.get(stream.mintAddress);
+            return `
+              <a class="live-stream-item ${stream.mintAddress === mint ? 'active' : ''}" href="#/live-streaming/${esc(stream.mintAddress)}">
+                ${item ? logoHtml(item) : '<span class="coin-avatar">S</span>'}
+                <span class="live-stream-item-copy">
+                  <strong>${esc(item ? item.name : shortAddr(stream.mintAddress))}</strong>
+                  <span class="muted">${esc(item ? `$${item.ticker}` : shortAddr(stream.mintAddress))}</span>
+                </span>
+                <span class="live-viewer-count">${stream.viewerCount || 0} ●</span>
+              </a>`;
+          }).join('')}
+        </aside>
+        <section class="live-stream-main card">
+          <div class="live-stream-title">
+            ${coin ? logoHtml(coin) : '<span class="coin-avatar">S</span>'}
+            <div><h2>${esc(coin ? coin.name : shortAddr(mint))}</h2><p class="muted">${esc(coin ? `$${coin.ticker}` : shortAddr(mint))}</p></div>
+            <span class="badge badge-live-stream">● ${translate('liveBadge')} <span id="streamViewerCount">${selected.viewerCount || 0}</span></span>
+          </div>
+          <div id="streamCard" class="live-stream-card">
+            <div class="stream-stage" id="streamStage"></div>
+            <p class="small muted" id="streamStatus">${translate('streamConnecting')}</p>
+            <div id="streamControls"></div>
+          </div>
+        </section>
+        <aside class="live-stream-chat card">
+          <h2>${translate('streamChatTitle')}</h2>
+          <div class="stream-chat">
+            <div class="stream-chat-log" id="streamChatLog"><p class="muted small stream-chat-empty">${translate('streamChatEmpty')}</p></div>
+            <div id="streamChatAuth"></div>
+          </div>
+          <p class="small muted">${translate('streamMeshNote')}</p>
+        </aside>
+      </div>`;
+    joinStreamAsViewer(mint);
+  } catch (err) {
+    view.innerHTML = `<div class="alert alert-error">${esc(translate('liveLoadError', { msg: err.message }))}</div>`;
+  }
+}
+
+async function renderLiveStreamingCreator() {
+  const view = document.getElementById('view');
+  if (!state.wallet) {
+    view.innerHTML = `
+      <div class="live-page-heading"><div><p class="launchpad-eyebrow">CREATOR STUDIO</p><h1>${translate('navLiveCreator')}</h1></div></div>
+      <div class="card empty"><h2>${translate('liveCreatorConnectTitle')}</h2><p>${translate('liveCreatorConnectBody')}</p></div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="live-page-heading"><div><p class="launchpad-eyebrow">CREATOR STUDIO</p><h1>${translate('navLiveCreator')}</h1></div></div>
+    <p class="muted">${translate('livePageLoading')}</p>`;
+  try {
+    const data = await apiGet(`/api/coins?creator=${encodeURIComponent(state.wallet)}&limit=100`);
+    const coins = data.coins || [];
+    if (!coins.length) {
+      view.innerHTML = `
+        <div class="live-page-heading"><div><p class="launchpad-eyebrow">CREATOR STUDIO</p><h1>${translate('navLiveCreator')}</h1></div></div>
+        <div class="card empty"><h2>${translate('liveCreatorNoCoinsTitle')}</h2><p>${translate('liveCreatorNoCoinsBody')}</p></div>`;
+      return;
+    }
+    const selected = coins.find((coin) => streamState.creatorMint === coin.mintAddress)
+      || coins.find((coin) => streamState.mint === coin.mintAddress)
+      || coins[0];
+    view.innerHTML = `
+      <div class="live-page-heading">
+        <div><p class="launchpad-eyebrow">CREATOR STUDIO</p><h1>${translate('navLiveCreator')}</h1></div>
+      </div>
+      <div class="live-creator-layout">
+        <aside class="live-creator-coins card">
+          <h2>${translate('liveCreatorYourCoins')}</h2>
+          ${coins.map((coin) => `
+            <button class="live-creator-coin ${coin.mintAddress === selected.mintAddress ? 'active' : ''}" data-live-mint="${esc(coin.mintAddress)}">
+              ${logoHtml(coin)}
+              <span><strong>${esc(coin.name)}</strong><span class="muted">$${esc(coin.ticker)}</span></span>
+            </button>`).join('')}
+        </aside>
+        <section class="live-stream-main card">
+          <div class="live-stream-title">
+            ${logoHtml(selected)}
+            <div><h2>${esc(selected.name)}</h2><p class="muted">$${esc(selected.ticker)}</p></div>
+          </div>
+          <div id="streamCard" class="live-stream-card">
+            <div class="stream-stage" id="streamStage"></div>
+            <p class="small muted" id="streamStatus">${translate('streamNotLive')}</p>
+            <div id="streamControls">
+              <button class="btn btn-primary" id="streamStartBtn">${translate('streamGoLiveBtn')}</button>
+              <p class="small muted">${translate('streamCreatorNote')}</p>
+            </div>
+          </div>
+        </section>
+        <aside class="live-stream-chat card">
+          <h2>${translate('streamChatTitle')}</h2>
+          <div class="stream-chat">
+            <div class="stream-chat-log" id="streamChatLog"><p class="muted small stream-chat-empty">${translate('streamChatEmpty')}</p></div>
+            <div id="streamChatAuth"></div>
+          </div>
+        </aside>
+      </div>`;
+    let activeMint = selected.mintAddress;
+    document.querySelectorAll('[data-live-mint]').forEach((button) => {
+      button.addEventListener('click', () => {
+        if (streamState.role === 'broadcaster') return;
+        activeMint = button.dataset.liveMint;
+        streamState.creatorMint = activeMint;
+        renderLiveStreamingCreator();
+      });
+    });
+    document.getElementById('streamStartBtn')?.addEventListener('click', () => openStreamSetup(activeMint));
+  } catch (err) {
+    view.innerHTML = `<div class="alert alert-error">${esc(translate('liveLoadError', { msg: err.message }))}</div>`;
+  }
 }
 
 // ---------- Portfolio ----------
