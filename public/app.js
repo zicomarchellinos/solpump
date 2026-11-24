@@ -4447,19 +4447,26 @@ function handleStreamMessage(msg) {
       streamState.authed = !!msg.chatAuthed;
       updateStreamViewerCount(msg.viewerCount || 0);
       if (streamState.role === 'broadcaster') {
+        const needsCoinRender = !document.getElementById('streamChatLog');
         if (streamState.previewStream) {
           streamState.localStream = streamState.previewStream;
           streamState.previewStream = null;
-          closeStreamSetup(false);
         }
         setStreamStatus(streamState.audioEnabled ? 'streamLiveNow' : 'streamAudioOnly');
         // The panel was rendered as "not live" before the join confirmed
         // (no video/chat elements) — re-render the coin page so it shows
         // the live broadcaster view; renderStreamPanel re-attaches the
         // local stream to the new video element.
-        if (!document.getElementById('streamChatLog') && streamState.mint) {
-          renderCoin(streamState.mint);
+        if (needsCoinRender && streamState.mint) {
+          renderCoin(streamState.mint).then(
+            () => closeStreamSetup(false),
+            (err) => {
+              closeStreamSetup(false);
+              setStreamStatus('streamErrorToast', { msg: friendlyError(err) });
+            }
+          );
         } else {
+          closeStreamSetup(false);
           if (streamState.localStream) {
             attachStreamVideo('local', streamState.localStream, true);
           }
