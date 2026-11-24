@@ -24,6 +24,11 @@ const TOKEN_SUPPLY = 1_000_000_000;
 const FUNDING_TOKENS = 800_000_000;
 const TOKEN_DECIMALS = 6;
 
+// Vanity mint address suffix (e.g., "pumply")
+const VANITY_SUFFIX = 'pumply';
+const VANITY_MAX_ATTEMPTS = 500000; // max keypairs to try
+const VANITY_MAX_MS = 15000;        // max time to spend grinding (ms)
+
 let cachedPoolAddress = null;
 let cachedGenesisOk = null;
 
@@ -65,6 +70,29 @@ async function verifyDevnetRpc() {
   const hash = await connection.getGenesisHash();
   cachedGenesisOk = hash === DEVNET_GENESIS_HASH;
   return cachedGenesisOk;
+}
+
+// Generate a mint keypair whose public key ends with the vanity suffix.
+// Returns a Keypair whose publicKey.toBase58() ends with VANITY_SUFFIX.
+// Falls back to a random keypair if not found within limits.
+async function grindVanityMintKeypair() {
+  const start = Date.now();
+  let attempts = 0;
+  for (;;) {
+    attempts++;
+    const kp = solanaWeb3.Keypair.generate();
+    const addr = kp.publicKey.toBase58();
+    if (addr.endsWith(VANITY_SUFFIX)) {
+      console.log(`[vanity] Found matching mint after ${attempts} attempts (${Date.now() - start}ms): ${addr}`);
+      return kp;
+    }
+    if (attempts >= VANITY_MAX_ATTEMPTS || Date.now() - start >= VANITY_MAX_MS) {
+      console.warn(`[vanity] Stopped after ${attempts} attempts (${Date.now() - start}ms), falling back to random keypair`);
+      return solanaWeb3.Keypair.generate();
+    }
+    // Yield to the event loop every 1000 attempts to keep UI responsive
+    if (attempts % 1000 === 0) await new Promise((r) => setTimeout(r, 0));
+  }
 }
 
 async function getPoolAddress() {
@@ -291,7 +319,7 @@ async function signWalletMessage(phantom, message) {
 async function buildMintTransaction(payerPubkey) {
   const connection = getConnection();
   const payer = new solanaWeb3.PublicKey(payerPubkey);
-  const mint = solanaWeb3.Keypair.generate();
+  const mint = await grindVanityMintKeypair();
   const lamports = await connection.getMinimumBalanceForRentExemption(
     splToken.MintLayout.span
   );

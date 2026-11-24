@@ -156,17 +156,41 @@
   --shadow-focus: 0 0 0 3px rgba(0, 200, 5, 0.2);
 
   /* ============================================
-     TRANSITIONS & ANIMATIONS
-     ============================================ */
-  --transition-fast: 100ms ease;
-  --transition-normal: 200ms ease;
-  --transition-slow: 300ms ease;
-  --transition-slower: 400ms ease;
+       TRANSITIONS & ANIMATIONS
+       ============================================ */
+    --transition-fast: 100ms ease;
+    --transition-normal: 200ms ease;
+    --transition-slow: 300ms ease;
+    --transition-slower: 400ms ease;
+    --transition-slowest: 600ms ease;
 
-  --ease-in: cubic-bezier(0.4, 0, 1, 1);
-  --ease-out: cubic-bezier(0, 0, 0.2, 1);
-  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
-  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ease-in: cubic-bezier(0.4, 0, 1, 1);
+    --ease-out: cubic-bezier(0, 0, 0.2, 1);
+    --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ease-spring-gentle: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    --ease-expo-out: cubic-bezier(0.19, 1, 0.22, 1);
+    --ease-quart-out: cubic-bezier(0.25, 1, 0.5, 1);
+
+    /* Animation durations */
+    --anim-duration-instant: 50ms;
+    --anim-duration-fast: 150ms;
+    --anim-duration-normal: 250ms;
+    --anim-duration-slow: 350ms;
+    --anim-duration-slower: 500ms;
+    --anim-duration-entrance: 600ms;
+    --anim-duration-exit: 200ms;
+
+    /* Stagger delays */
+    --stagger-base: 40ms;
+    --stagger-tight: 20ms;
+    --stagger-loose: 80ms;
+
+    /* Motion tokens */
+    --motion-distance-sm: 4px;
+    --motion-distance-md: 8px;
+    --motion-distance-lg: 16px;
+    --motion-distance-xl: 32px;
 
   /* ============================================
      Z-INDEX SCALE
@@ -221,13 +245,44 @@
   --icon-size-xl: 28px;
 
   /* ============================================
-     BREAKPOINTS (for reference in JS)
-     ============================================ */
-  --bp-sm: 480px;
-  --bp-md: 768px;
-  --bp-lg: 1024px;
-  --bp-xl: 1280px;
-  --bp-2xl: 1536px;
+       GLASSMORPHISM / FROSTED GLASS
+       ============================================ */
+    --glass-bg: rgba(255, 255, 255, 0.06);
+    --glass-bg-strong: rgba(255, 255, 255, 0.1);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    --glass-border-strong: rgba(255, 255, 255, 0.18);
+    --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.37);
+    --glass-blur: blur(20px);
+    --glass-blur-sm: blur(12px);
+    --glass-blur-lg: blur(40px);
+
+    /* ============================================
+       FLUID TYPOGRAPHY & RESPONSIVE
+       ============================================ */
+    --fluid-min-width: 320px;
+    --fluid-max-width: 1920px;
+    --fluid-type-min: 1rem;
+    --fluid-type-max: 1.25rem;
+
+    /* ============================================
+       GRADIENTS (2026 modern)
+       ============================================ */
+    --gradient-brand: linear-gradient(135deg, var(--color-brand-primary) 0%, #00e67a 50%, #00ccff 100%);
+    --gradient-brand-subtle: linear-gradient(135deg, var(--color-brand-subtle) 0%, rgba(0, 230, 122, 0.15) 100%);
+    --gradient-glass: linear-gradient(135deg, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0.02) 100%);
+    --gradient-dark: linear-gradient(180deg, #0a0a0a 0%, #111111 50%, #0a0a0a 100%);
+    --gradient-card: linear-gradient(145deg, var(--color-bg-secondary) 0%, var(--color-bg-tertiary) 100%);
+    --gradient-glow: radial-gradient(ellipse at center, var(--color-brand-subtle) 0%, transparent 70%);
+
+    /* ============================================
+       BREAKPOINTS (for reference in JS)
+       ============================================ */
+    --bp-sm: 480px;
+    --bp-md: 768px;
+    --bp-lg: 1024px;
+    --bp-xl: 1280px;
+    --bp-2xl: 1536px;
+    --bp-3xl: 1920px;
 }
 
 /* ============================================
@@ -296,6 +351,24 @@
     --shadow-2xl: 0 24px 48px rgba(0, 0, 0, 0.6), 0 12px 24px rgba(0, 0, 0, 0.4);
     --shadow-inner: inset 0 2px 4px rgba(0, 0, 0, 0.3);
     --shadow-focus: 0 0 0 3px rgba(134, 239, 172, 0.25);
+
+    /* Glassmorphism auto-dark */
+    --glass-bg: rgba(255, 255, 255, 0.04);
+    --glass-bg-strong: rgba(255, 255, 255, 0.08);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --glass-border-strong: rgba(255, 255, 255, 0.14);
+    --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    --glass-blur: blur(20px);
+    --glass-blur-sm: blur(12px);
+    --glass-blur-lg: blur(40px);
+
+    /* Gradients auto-dark */
+    --gradient-brand: linear-gradient(135deg, #86efac 0%, #a3f5c8 50%, #6ce593 100%);
+    --gradient-brand-subtle: linear-gradient(135deg, #0c2a14 0%, rgba(108, 229, 147, 0.1) 100%);
+    --gradient-glass: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.01) 100%);
+    --gradient-dark: linear-gradient(180deg, #111113 0%, #18191b 50%, #111113 100%);
+    --gradient-card: linear-gradient(145deg, #18191b 0%, #1f2123 100%);
+    --gradient-glow: radial-gradient(ellipse at center, rgba(134, 239, 172, 0.15) 0%, transparent 70%);
   }
 }
 
@@ -363,6 +436,24 @@
   --shadow-2xl: 0 24px 48px rgba(12, 21, 0, 0.12), 0 12px 24px rgba(12, 21, 0, 0.08);
   --shadow-inner: inset 0 2px 4px rgba(12, 21, 0, 0.05);
   --shadow-focus: 0 0 0 3px rgba(0, 200, 5, 0.2);
+
+  /* Glassmorphism light */
+  --glass-bg: rgba(255, 255, 255, 0.7);
+  --glass-bg-strong: rgba(255, 255, 255, 0.85);
+  --glass-border: rgba(0, 0, 0, 0.06);
+  --glass-border-strong: rgba(0, 0, 0, 0.1);
+  --glass-shadow: 0 8px 32px rgba(12, 21, 0, 0.12);
+  --glass-blur: blur(20px);
+  --glass-blur-sm: blur(12px);
+  --glass-blur-lg: blur(40px);
+
+  /* Gradients light */
+  --gradient-brand: linear-gradient(135deg, #00c805 0%, #00b004 50%, #0096ff 100%);
+  --gradient-brand-subtle: linear-gradient(135deg, #e4f8e4 0%, rgba(0, 176, 4, 0.15) 100%);
+  --gradient-glass: linear-gradient(135deg, rgba(255,255,255,0.9) 0%, rgba(255,255,255,0.5) 100%);
+  --gradient-dark: linear-gradient(180deg, #f5f5f7 0%, #ffffff 50%, #f5f5f7 100%);
+  --gradient-card: linear-gradient(145deg, #ffffff 0%, #f0f1ed 100%);
+  --gradient-glow: radial-gradient(ellipse at center, rgba(0, 200, 5, 0.1) 0%, transparent 70%);
 }
 
 [data-theme="dark"] {
@@ -429,6 +520,24 @@
   --shadow-2xl: 0 24px 48px rgba(0, 0, 0, 0.8), 0 12px 24px rgba(0, 0, 0, 0.6);
   --shadow-inner: inset 0 2px 4px rgba(0, 0, 0, 0.5);
   --shadow-focus: 0 0 0 3px rgba(0, 255, 135, 0.25);
+
+  /* Glassmorphism dark */
+  --glass-bg: rgba(255, 255, 255, 0.04);
+  --glass-bg-strong: rgba(255, 255, 255, 0.08);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-strong: rgba(255, 255, 255, 0.14);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --glass-blur: blur(20px);
+  --glass-blur-sm: blur(12px);
+  --glass-blur-lg: blur(40px);
+
+  /* Gradients dark */
+  --gradient-brand: linear-gradient(135deg, #00ff87 0%, #00e67a 50%, #00ccff 100%);
+  --gradient-brand-subtle: linear-gradient(135deg, #002a1a 0%, rgba(0, 230, 122, 0.1) 100%);
+  --gradient-glass: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.01) 100%);
+  --gradient-dark: linear-gradient(180deg, #0a0a0a 0%, #111111 50%, #0a0a0a 100%);
+  --gradient-card: linear-gradient(145deg, #111111 0%, #1a1a1a 100%);
+  --gradient-glow: radial-gradient(ellipse at center, rgba(0, 255, 135, 0.15) 0%, transparent 70%);
 }
 
 /* ============================================
