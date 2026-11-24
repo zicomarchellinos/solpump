@@ -32,7 +32,7 @@ function getSystemTheme() {
   if (typeof window.matchMedia === 'function') {
     return window.matchMedia(THEME_MEDIA_QUERY).matches ? 'dark' : 'light';
   }
-  return 'light';
+  return 'dark';
 }
 
 function getEffectiveTheme() {
@@ -51,7 +51,7 @@ function applyTheme(theme) {
   // Update meta theme-color
   const metaTheme = document.querySelector('meta[name="theme-color"]');
   if (metaTheme) {
-    metaTheme.setAttribute('content', theme === 'dark' ? '#86efac' : '#00c805');
+    metaTheme.setAttribute('content', theme === 'dark' ? '#00ff87' : '#00c805');
   }
 }
 
