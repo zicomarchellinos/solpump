@@ -2188,6 +2188,20 @@ img {
   align-items: center;
   justify-items: center;
   margin: var(--space-2) 0;
+  position: relative;
+}
+
+/* Placeholder shown when no video stream is attached */
+.stream-stage:empty::before,
+.stream-video-wrap:empty::before {
+  content: attr(data-placeholder) || 'Menunggu stream...';
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  text-align: center;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .stream-video-wrap video,

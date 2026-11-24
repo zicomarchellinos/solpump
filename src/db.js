@@ -121,19 +121,36 @@ db.exec(`
   -- and trade pre-checks keep working (the pool ends up holding slightly
   -- more tokens than the curve accounts for).
   CREATE TABLE IF NOT EXISTS burns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    mint_address TEXT NOT NULL REFERENCES coins(mint_address),
-    wallet TEXT NOT NULL,
-    amount REAL NOT NULL,
-    price_after REAL NOT NULL,
-    tx_signature TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL
-  );
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+      wallet TEXT NOT NULL,
+      amount REAL NOT NULL,
+      price_after REAL NOT NULL,
+      tx_signature TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL
+    );
 
-  CREATE INDEX IF NOT EXISTS idx_burns_mint ON burns (mint_address, created_at);
-  CREATE INDEX IF NOT EXISTS idx_burns_wallet ON burns (wallet, created_at);
+    CREATE INDEX IF NOT EXISTS idx_burns_mint ON burns (mint_address, created_at);
+    CREATE INDEX IF NOT EXISTS idx_burns_wallet ON burns (wallet, created_at);
 
-  -- Transfers: real SPL transfers of a site coin between two user wallets
+    -- Supply additions: creator mints new tokens to the pool reserve, increasing
+    -- the curve's token_reserve and LOWERING the price (price = sol_reserve / token_reserve).
+    -- The creator authorizes this via a canonical signed message (Ed25519).
+    -- tx_signature is the pool's on-chain mint transaction signature (unique per addition).
+    CREATE TABLE IF NOT EXISTS supply_additions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mint_address TEXT NOT NULL REFERENCES coins(mint_address),
+      wallet TEXT NOT NULL,
+      amount REAL NOT NULL,
+      price_after REAL NOT NULL,
+      tx_signature TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_supply_additions_mint ON supply_additions (mint_address, created_at);
+    CREATE INDEX IF NOT EXISTS idx_supply_additions_wallet ON supply_additions (wallet, created_at);
+
+    -- Transfers: real SPL transfers of a site coin between two user wallets
   -- (the pool is not involved). Verified on-chain before recording.
   -- Transfers move tokens without touching the curve or the recorded PnL
   -- (PnL is computed from trades only) — the UI shows the live on-chain

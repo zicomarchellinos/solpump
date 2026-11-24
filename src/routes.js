@@ -465,6 +465,21 @@ function publicBurn(row, assetUsd = null) {
   };
 }
 
+function publicSupplyAddition(row, assetUsd = null) {
+  const priceAfterUsd =
+    Number.isFinite(assetUsd) && assetUsd > 0 ? row.price_after * assetUsd : null;
+  return {
+    id: row.id,
+    mintAddress: row.mint_address,
+    wallet: row.wallet,
+    amount: row.amount,
+    priceAfter: row.price_after,
+    priceAfterUsd,
+    txSignature: row.tx_signature,
+    createdAt: row.created_at,
+  };
+}
+
 function publicTransfer(row, coinMap) {
   const coin = coinMap ? coinMap.get(row.mint_address) : undefined;
   return {
@@ -2760,12 +2775,102 @@ router.post('/coins/:mint/dev-burn', async (req, res) => {
       coin: publicCoin(updated, coinTradesAsc(req.params.mint), ctx),
     });
   } catch (err) {
-    if (String(err.message).includes('UNIQUE constraint')) {
-      return res.status(409).json({ error: 'Burn ini sudah tercatat.' });
+      if (String(err.message).includes('UNIQUE constraint')) {
+        return res.status(409).json({ error: 'Burn ini sudah tercatat.' });
+      }
+      res.status(502).json({ error: `Gagal mencatat dev burn: ${err.message}` });
     }
-    res.status(502).json({ error: `Gagal mencatat dev burn: ${err.message}` });
-  }
-});
+  });
+
+  // ---- POST /api/coins/:mint/add-supply ----
+  // Creator-only add supply (mint tokens to pool reserve). Body:
+  //   { wallet, amount, message?, signature? }
+  // The creator mints new tokens to the pool's ATA, increasing the
+  // curve's token_reserve by the same amount. This LOWERS the price
+  // (price = sol_reserve / token_reserve). Creator-only: anyone else gets 403.
+  // The creator must prove authorization by signing the canonical add-supply
+  // message (Ed25519, same scheme as follows/profile edits).
+  // The new tokens appear in the pool's on-chain balance AND the curve's
+  // token_reserve increases by the same amount.
+  router.post('/coins/:mint/add-supply', async (req, res) => {
+    const row = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+    if (!row) return res.status(404).json({ error: 'Coin tidak ditemukan.' });
+    const { wallet, amount, message, signature } = req.body || {};
+    if (typeof wallet !== 'string' || !BASE58_RE.test(wallet)) {
+      return badRequest(res, 'Alamat dompet tidak valid.');
+    }
+    if (wallet !== row.creator_wallet) {
+      return res.status(403).json({ error: 'Hanya kreator coin ini yang bisa menambah supply.' });
+    }
+    const amountNum = Number(amount);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+      return badRequest(res, 'Jumlah supply harus lebih dari 0.');
+    }
+    const amountRaw = toRawTokens(amountNum);
+    if (amountRaw <= 0n) {
+      return badRequest(res, 'Jumlah terlalu kecil.');
+    }
+    // Creator must sign the canonical add-supply message.
+    const expected = addSupplyMessage({
+      wallet,
+      mint: req.params.mint,
+      amount: String(amountNum),
+    });
+    if (message !== expected) {
+      return res.status(401).json({ error: 'Pesan tanda tangan tidak sesuai dengan add supply ini.' });
+    }
+    if (!verifyWalletSignature({ walletAddress: wallet, message, signatureBase64: signature })) {
+      return res.status(401).json({ error: 'Tanda tangan tidak valid untuk dompet ini.' });
+    }
+    try {
+      const result = await withTradeLock(async () => {
+        const fresh = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+        // Mint new tokens to the pool's ATA.
+        let poolSignature = null;
+        try {
+          poolSignature = await pool.addSupplyTokens(req.params.mint, amountRaw);
+        } catch (err) {
+          return { status: 502, error: `Mint supply gagal on-chain: ${err.message}` };
+        }
+        const newReserve = fresh.token_reserve + amountNum;
+        const priceAfter = fresh.sol_reserve / newReserve;
+        const now = Date.now();
+        const addSupplyId = db.transaction(() => {
+          db.prepare('UPDATE coins SET token_reserve = ? WHERE mint_address = ?').run(
+            newReserve,
+            req.params.mint
+          );
+          return db
+            .prepare(
+              `INSERT INTO supply_additions
+                 (mint_address, wallet, amount, price_after, tx_signature, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)`
+            )
+            .run(
+              req.params.mint,
+              pool.getPoolAddress(),
+              amountNum,
+              priceAfter,
+              poolSignature,
+              now
+            ).lastInsertRowid;
+        })();
+        return { status: 200, addSupplyId, priceAfter };
+      });
+      if (result.status !== 200) {
+        return res.status(result.status).json({ error: result.error });
+      }
+      const ctx = await priceCtx();
+      const updated = db.prepare('SELECT * FROM coins WHERE mint_address = ?').get(req.params.mint);
+      const addSupplyRow = db.prepare('SELECT * FROM supply_additions WHERE id = ?').get(result.addSupplyId);
+      res.status(201).json({
+        addSupply: publicSupplyAddition(addSupplyRow, coinAssetUsd(updated, ctx)),
+        coin: publicCoin(updated, coinTradesAsc(req.params.mint), ctx),
+      });
+    } catch (err) {
+      res.status(502).json({ error: `Gagal mencatat add supply: ${err.message}` });
+    }
+  });
 
 // ---- POST /api/coins/register ----
 // Body: { mintAddress, name, ticker, description?, creatorWallet,

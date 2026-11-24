@@ -1200,9 +1200,19 @@ function devBurnMessage({ wallet, mint, amount, source }) {
     `amount:${amount}`,
     `source:${source}`,
   ].join('\n');
-}
+  }
 
-// Canonical buyback message — `amount` is the spend, or 'all' for a full
+  // Canonical add-supply message. The creator authorizes minting new tokens
+  // to the pool reserve. Must match src/signverify.js exactly.
+  function addSupplyMessage({ wallet, mint, amount }) {
+    return [
+      `solpump:add-supply:${wallet}`,
+      `mint:${mint}`,
+      `amount:${amount}`,
+    ].join('\n');
+  }
+
+  // Canonical buyback message — `amount` is the spend, or 'all' for a full
 // buyback of whatever is unclaimed at execution time. Must match
 // src/signverify.js exactly.
 function buybackMessage({ wallet, mint, amount }) {
@@ -3395,7 +3405,7 @@ async function renderCoin(mintAddress) {
     }
     card.innerHTML = `
       <h2 style="margin-top:0">🔴 ${translate('streamTitle')} <span class="badge badge-live-stream">● ${translate('liveBadge')}</span> <span class="small muted" id="streamViewerCount"></span></h2>
-      <div class="stream-stage" id="streamStage"></div>
+      <div class="stream-stage" id="streamStage" data-placeholder="${translate('streamWaiting')}"></div>
       <p class="small muted" id="streamStatus">${translate('streamConnecting')}</p>
       <div id="streamControls"></div>
       <div class="stream-chat">
@@ -4153,9 +4163,106 @@ async function renderCoin(mintAddress) {
         fail(translate('devBurnFailed', { msg: friendlyError(err) }));
       }
     });
-  }
+      }
 
-  function renderBurnHistory() {
+      // Creator add-supply: mint new tokens to pool reserve (opposite of burn).
+      // This LOWERS the price by increasing the token reserve.
+      function renderAddSupplyForm() {
+        const form = document.getElementById('addSupplyForm');
+        if (!form) return;
+        const calcEl = document.getElementById('addSupplyCalc');
+        const resultEl = document.getElementById('addSupplyResult');
+        form.innerHTML = `
+          <div class="field">
+            <label>${translate('addSupplyAmountLabel', { ticker: esc(coin.ticker) })}</label>
+            <div style="display:flex;gap:8px">
+              <input id="addSupplyAmount" type="number" min="0" step="any" placeholder="1000000" style="flex:1">
+            </div>
+          </div>
+          <button class="btn btn-buy" id="addSupplyBtn">${translate('addSupplyBtn')}</button>`;
+        const amountEl = document.getElementById('addSupplyAmount');
+        let calcTimer = null;
+        const updateCalc = () => {
+          clearTimeout(calcTimer);
+          calcTimer = setTimeout(async () => {
+            const amount = Number(amountEl.value);
+            if (!(amount > 0)) {
+              calcEl.innerHTML = '';
+              return;
+            }
+            try {
+              const prev = await apiGet(
+                `/api/coins/${coin.mintAddress}/add-supply-preview?amount=${encodeURIComponent(amount)}`
+              );
+              calcEl.innerHTML = `
+                <div class="table-wrap"><table>
+                  <thead><tr><th></th><th>${translate('addSupplyCurrent')}</th><th>${translate('addSupplyProjected')}</th></tr></thead>
+                  <tbody>
+                    <tr><td>${translate('thPrice')}</td><td>${fmtPriceBoth(prev.current.priceUsd, prev.current.price)}</td><td><strong>${fmtPriceBoth(prev.projected.priceUsd, prev.projected.price)}</strong></td></tr>
+                    <tr><td>${translate('addSupplySupply')}</td><td>${fmtTokens(prev.current.circulatingSupply)}</td><td><strong>${fmtTokens(prev.projected.circulatingSupply)}</strong></td></tr>
+                    <tr><td>${translate('cardMarketCap')}</td><td>${fmtUsd(prev.current.marketCapUsd)}</td><td><strong>${fmtUsd(prev.projected.marketCapUsd)}</strong></td></tr>
+                    <tr><td>${translate('addSupplyPctIncreased')}</td><td colspan="2"><strong>${prev.pctSupplyIncreased.toFixed(2)}%</strong></td></tr>
+                    <tr><td>${translate('addSupplyPriceDrop')}</td><td colspan="2"><strong class="loss">${fmtPct(prev.priceDecreasePct)}</strong></td></tr>
+                  </tbody>
+                </table></div>`;
+            } catch {
+              calcEl.innerHTML = '';
+            }
+          }, 300);
+        };
+        amountEl.addEventListener('input', updateCalc);
+        document.getElementById('addSupplyBtn').addEventListener('click', async () => {
+          const amount = Number(amountEl.value);
+          if (!(amount > 0)) return toast(translate('errAddSupplyEnterAmount'));
+          const btn = document.getElementById('addSupplyBtn');
+          btn.disabled = true;
+          const fail = (msg) => {
+            btn.disabled = false;
+            resultEl.innerHTML = `<div class="alert alert-error">${esc(msg)}</div>`;
+          };
+          try {
+            if (!solanaLibsReady()) throw new Error(translate('errSolanaLibsReload'));
+            const phantom = (await waitForPhantom(3000)) || getPhantom();
+            if (!phantom) throw new Error(translate('errPhantomShort'));
+            if (typeof phantom.signMessage !== 'function') {
+              throw new Error(translate('errNoSignMessage'));
+            }
+            if (!(await syncWalletAccount())) {
+              throw new Error(translate('errReadAccountShort'));
+            }
+            const message = addSupplyMessage({
+              wallet: state.wallet,
+              mint: coin.mintAddress,
+              amount: String(amount),
+            });
+            resultEl.innerHTML = `<p class="muted">${translate('addSupplySigning')}</p>`;
+            const signature = await signWalletMessage(phantom, message);
+            resultEl.innerHTML = `<p class="muted">${translate('addSupplySending')}</p>`;
+            const res = await apiPost(`/api/coins/${coin.mintAddress}/add-supply`, {
+              wallet: state.wallet,
+              amount,
+              message,
+              signature,
+            });
+            resultEl.innerHTML = `<div class="alert alert-success">${translate('addSupplySuccess', {
+              amount: fmtTokens(amount),
+              ticker: coin.ticker,
+              price: fmtPriceBoth(res.addSupply.priceAfterUsd, res.addSupply.priceAfter),
+              tx: txLink(res.addSupply.txSignature),
+            })}</div>`;
+            amountEl.value = '';
+            calcEl.innerHTML = '';
+            await refreshBalance();
+            renderHeader();
+            await refreshOnchainBalances();
+            setTimeout(() => renderCoin(mintAddress), 1200);
+          } catch (err) {
+            fail(translate('addSupplyFailed', { msg: friendlyError(err) }));
+          }
+        });
+      }
+
+      function renderBurnHistory() {
     const wrap = document.getElementById('burnHistory');
     const list = burns || [];
     if (!list.length) {
@@ -4618,7 +4725,33 @@ function handleStreamMessage(msg) {
   }
 }
 
+let streamReconnectTimer = null;
+let streamReconnectAttempts = 0;
+
+function streamReconnect(mint, onOpen) {
+  if (streamReconnectTimer) clearTimeout(streamReconnectTimer);
+  streamReconnectAttempts += 1;
+  const delay = Math.min(1000 * Math.pow(2, streamReconnectAttempts - 1), 30000);
+  setStreamStatus('streamReconnecting');
+  streamReconnectTimer = setTimeout(() => {
+    openStreamSocket(mint, () => {
+      streamReconnectAttempts = 0;
+      streamReconnectTimer = null;
+      onOpen();
+    });
+  }, delay);
+}
+
+function clearStreamReconnect() {
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = null;
+  }
+  streamReconnectAttempts = 0;
+}
+
 function openStreamSocket(mint, onOpen) {
+  clearStreamReconnect();
   const ws = new WebSocket(streamWsUrl(mint));
   streamState.ws = ws;
   ws.onopen = onOpen;
@@ -4639,6 +4772,13 @@ function openStreamSocket(mint, onOpen) {
         stopStream();
         setStreamStatus('streamError');
         toast(translate('streamError'));
+        return;
+      }
+      if (!streamState.ended) {
+        // Unexpected drop — try reconnecting with backoff instead of
+        // showing a dead screen. Render free tier sleeps the service,
+        // which drops the socket; reconnect once it wakes.
+        streamReconnect(mint, onOpen);
         return;
       }
       streamState.ended = true;
@@ -5916,10 +6056,10 @@ async function renderLiveStreaming(selectedMint) {
             <span class="badge badge-live-stream">● ${translate('liveBadge')} <span id="streamViewerCount">${selected.viewerCount || 0}</span></span>
           </div>
           <div id="streamCard" class="live-stream-card">
-            <div class="stream-stage" id="streamStage"></div>
-            <p class="small muted" id="streamStatus">${translate('streamConnecting')}</p>
-            <div id="streamControls"></div>
-          </div>
+                      <div class="stream-stage" id="streamStage" data-placeholder="${translate('streamWaiting')}"></div>
+                      <p class="small muted" id="streamStatus">${translate('streamConnecting')}</p>
+                      <div id="streamControls"></div>
+                    </div>
         </section>
         <aside class="live-stream-chat card">
           <h2>${translate('streamChatTitle')}</h2>
@@ -5978,13 +6118,13 @@ async function renderLiveStreamingCreator() {
             <div><h2>${esc(selected.name)}</h2><p class="muted">$${esc(selected.ticker)}</p></div>
           </div>
           <div id="streamCard" class="live-stream-card">
-            <div class="stream-stage" id="streamStage"></div>
-            <p class="small muted" id="streamStatus">${translate('streamNotLive')}</p>
-            <div id="streamControls">
-              <button class="btn btn-primary" id="streamStartBtn">${translate('streamGoLiveBtn')}</button>
-              <p class="small muted">${translate('streamCreatorNote')}</p>
-            </div>
-          </div>
+                      <div class="stream-stage" id="streamStage" data-placeholder="${translate('streamWaiting')}"></div>
+                      <p class="small muted" id="streamStatus">${translate('streamNotLive')}</p>
+                      <div id="streamControls">
+                        <button class="btn btn-primary" id="streamStartBtn">${translate('streamGoLiveBtn')}</button>
+                        <p class="small muted">${translate('streamCreatorNote')}</p>
+                      </div>
+                    </div>
         </section>
         <aside class="live-stream-chat card">
           <h2>${translate('streamChatTitle')}</h2>

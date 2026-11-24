@@ -84,6 +84,22 @@ function burnPriceEffect(coin, burnAmount) {
   return { newPrice, pctChange: ((newPrice - price) / price) * 100 };
 }
 
+// Mint/add supply price effect: adding tokens to the curve's token reserve
+// increases the reserve, so price = sol_reserve / token_reserve goes DOWN.
+// This is the opposite of burning. Returns null when amount is invalid.
+function priceAfterAddSupply(coin, addAmount) {
+  if (!(addAmount > 0)) return null;
+  const newReserve = coin.token_reserve + addAmount;
+  return coin.sol_reserve / newReserve;
+}
+
+function addSupplyPriceEffect(coin, addAmount) {
+  const newPrice = priceAfterAddSupply(coin, addAmount);
+  if (newPrice === null) return null;
+  const price = currentPrice(coin);
+  return { newPrice, pctChange: ((newPrice - price) / price) * 100 };
+}
+
 // Candlestick aggregation (OHLC per time bucket) from chart points
 // (launch point + trades + burns, chronological). `points` carry t (ms),
 // price, and amount (pair-asset volume of that event; 0 for the launch
@@ -351,6 +367,8 @@ module.exports = {
   fmtMarketCapUsd,
   priceAfterBurn,
   burnPriceEffect,
+  priceAfterAddSupply,
+  addSupplyPriceEffect,
   buildCandles,
   curveProgressPct,
   quoteBuy,

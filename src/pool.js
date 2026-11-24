@@ -220,6 +220,22 @@ async function burnTokens(mintAddress, amountRaw) {
   }, `burnTokens ${amountRaw.toString()} of ${mintAddress} (pool reserve)`);
 }
 
+// Mint/add supply: mint new tokens to the pool's ATA for a coin,
+// increasing the pool's on-chain token balance AND the curve's
+// token_reserve by the same amount. This LOWERS the price
+// (price = sol_reserve / token_reserve). Returns the confirmed signature.
+async function addSupplyTokens(mintAddress, amountRaw) {
+  const mint = new PublicKey(mintAddress);
+  const poolAta = await getPoolAta(mintAddress);
+  return sendPoolTransaction(async () => {
+    const tx = new Transaction();
+    tx.add(
+      createMintToInstruction(mint, poolAta, poolPubkey, amountRaw)
+    );
+    return tx;
+  }, `addSupplyTokens ${amountRaw.toString()} of ${mintAddress} (pool reserve)`);
+}
+
 module.exports = {
   getPoolAddress,
   getPoolSolBalance,
@@ -230,6 +246,7 @@ module.exports = {
   sendSol,
   sendTokens,
   burnTokens,
+  addSupplyTokens,
   TOKEN_DECIMALS,
   FEE_BUFFER_LAMPORTS,
   LAMPORTS_PER_SOL,

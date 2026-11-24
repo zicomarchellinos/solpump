@@ -82,14 +82,22 @@ function devBurnMessage({ wallet, mint, amount, source }) {
     `amount:${amount}`,
     `source:${source}`,
   ].join('\n');
-}
+  }
 
-// Canonical buyback message. `amount` is the exact amount string the
-// client sends — a number, or 'all' for a full buyback of whatever is
-// unclaimed at execution time.
-function buybackMessage({ wallet, mint, amount }) {
-  return [`solpump:buyback:${wallet}`, `mint:${mint}`, `amount:${amount}`].join('\n');
-}
+  function addSupplyMessage({ wallet, mint, amount }) {
+    return [
+      `solpump:add-supply:${wallet}`,
+      `mint:${mint}`,
+      `amount:${amount}`,
+    ].join('\n');
+  }
+
+  // Canonical buyback message. `amount` is the exact amount string the
+  // client sends — a number, or 'all' for a full buyback of whatever is
+  // unclaimed at execution time.
+  function buybackMessage({ wallet, mint, amount }) {
+    return [`solpump:buyback:${wallet}`, `mint:${mint}`, `amount:${amount}`].join('\n');
+  }
 
 // Canonical re-register message. The signer must be the wallet that
 // created the mint on-chain (verified separately — see verifyReRegister);
@@ -188,6 +196,7 @@ module.exports = {
   followMessage,
   profileMessage,
   devBurnMessage,
+  addSupplyMessage,
   buybackMessage,
   reRegisterMessage,
   rewardClaimMessage,
